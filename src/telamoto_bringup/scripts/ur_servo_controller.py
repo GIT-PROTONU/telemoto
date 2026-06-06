@@ -10,11 +10,17 @@ Start-up sequence (handled internally, no external auto-play node needed):
   4. 125 Hz control loop sends MODE_SERVOJ packets — robot holds position.
   5. If the robot disconnects for any reason, ext.urp is replayed after 3 s.
 
-Packet format (ur_client_library/control/reverse_interface.h):
-  8 × int32 big-endian:
-    [0]   control_mode  (MODE_SERVOJ = 1)
-    [1-6] joint positions × MULT_JOINTSTATE (1 000 000)
-    [7]   robot receive timeout in ms  (20 ms = 2.5 × step)
+Packet format — 8 × int32 big-endian (verified against external_control.urscript):
+  URScript reads:  params_mult = socket_read_binary_integer(8, "reverse_socket", ...)
+  params_mult[0]  = count (always 8 on success — added by URScript)
+  params_mult[1]  = timeout_ms   → robot sets read_timeout = params_mult[1] / 1000.0
+  params_mult[2]  = q[0] × MULT_JOINTSTATE
+  params_mult[3]  = q[1] × MULT_JOINTSTATE
+  params_mult[4]  = q[2] × MULT_JOINTSTATE
+  params_mult[5]  = q[3] × MULT_JOINTSTATE
+  params_mult[6]  = q[4] × MULT_JOINTSTATE
+  params_mult[7]  = q[5] × MULT_JOINTSTATE
+  params_mult[8]  = control_mode  ← MUST be the 8th (last) data integer
 """
 import asyncio
 import socket
@@ -39,15 +45,18 @@ REVERSE_PORT = 50001
 STEP_TIME    = 0.008       # 125 Hz
 MULT         = 1_000_000
 MODE_SERVOJ  = 1
-TIMEOUT_MS   = 20          # robot aborts if silent for 20 ms
+TIMEOUT_MS   = 200         # ms — robot stops if no packet received for this long
+                           # 200 ms = 25× step; matches ur_robot_driver default
 
 
 def _pack(q: list[float]) -> bytes:
+    # Layout must match external_control.urscript (see module docstring).
+    # timeout_ms FIRST, joint positions next, control_mode LAST.
     return struct.pack(">8i",
-        MODE_SERVOJ,
+        TIMEOUT_MS,
         int(q[0] * MULT), int(q[1] * MULT), int(q[2] * MULT),
         int(q[3] * MULT), int(q[4] * MULT), int(q[5] * MULT),
-        TIMEOUT_MS,
+        MODE_SERVOJ,
     )
 
 

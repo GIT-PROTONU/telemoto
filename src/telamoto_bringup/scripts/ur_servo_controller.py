@@ -214,12 +214,16 @@ class URServoController(Node):
                     self.get_logger().warn(f"Accept error: {exc}")
 
     def _drain_then_replay(self, conn: socket.socket) -> None:
-        """Drain robot keepalives; when connection drops, replay ext.urp."""
+        """Drain robot keepalives; when connection drops, replay ext.urp.
+
+        Uses blocking recv (no timeout) so a 1-second silence from the robot
+        is not mistaken for a disconnect — only an actual TCP close triggers replay.
+        """
         try:
-            conn.settimeout(1.0)
+            conn.settimeout(None)   # blocking: wait for real close, not timeout
             while True:
                 if not conn.recv(256):
-                    break
+                    break           # empty recv = peer closed the connection
         except Exception:
             pass
         with self._conn_lock:

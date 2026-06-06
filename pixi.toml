@@ -46,9 +46,10 @@ clang-format = "*"
 # Tasks
 # ---------------------------------------------------------------------------
 [tasks]
-# CB3: PolyScopeX owns speed_slider_mask as an RTDE input at boot, so the driver's default
-# recipe causes a permanent conflict. This task patches the installed recipe to drop those
-# two variables. Re-run after `pixi install` / environment updates.
+# CB3 3.15 PolyScopeX holds all RTDE input variables (speed_slider, I/O, bit registers).
+# Using an empty recipe lets setupInputs() get a valid recipe_id so the driver starts.
+# Motion goes through the reverse connection (port 50001), not RTDE inputs, so this is safe.
+# Re-run after `pixi install` / environment updates.
 patch-rtde = "cp src/telamoto_bringup/config/rtde_input_recipe_cb3.txt .pixi/envs/default/share/ur_robot_driver/resources/rtde_input_recipe.txt"
 
 # Build the workspace (incremental)
@@ -70,8 +71,9 @@ twin = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bring
 twin-real = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py use_mock_hardware:=false robot_ip:=192.168.10.2'", depends-on = ["build"] }
 calibrate = { cmd = "bash -c 'source install/setup.bash && ros2 launch ur_calibration calibration_correction.launch.py robot_ip:=192.168.10.2 target_filename:=$(pwd)/src/telamoto_bringup/config/ur10_calibration.yaml'" }
 
-# Launch the full bringup (real robot)
-bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup ur10_bringup.launch.py'", depends-on = ["build"] }
+# Full bringup: ur_robot_driver + ros2_control + MoveIt2 + RViz2 (real robot, motion enabled)
+# Robot must be: powered on, in Remote Control mode, not running a program.
+bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup ur10_bringup.launch.py'", depends-on = ["build", "patch-rtde"] }
 
 # Launch with fake hardware (no physical robot needed)
 bringup-fake = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup ur10_bringup.launch.py use_fake_hardware:=true'", depends-on = ["build"] }

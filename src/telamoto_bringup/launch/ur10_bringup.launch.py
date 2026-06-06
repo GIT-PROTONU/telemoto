@@ -1,12 +1,15 @@
-"""Top-level bringup for the UR10 CB3.1.
+"""Top-level bringup for the UR10 CB3.1 — full motion control via MoveIt2 + RViz2.
 
-Starts:
-  - ur_robot_driver (real or fake hardware)
-  - ros2_control joint-state broadcaster + joint-trajectory controller
-  - MoveIt2 move_group
-  - robot_state_publisher
+Real robot:    pixi run bringup          (robot_ip=192.168.10.2 by default)
+Fake robot:    pixi run bringup-fake
+
+Before running on the real robot:
+  1. pixi run patch-rtde   (already done automatically by `pixi run bringup`)
+  2. Robot must be powered on, in Remote Control mode, not running a program
+  3. ur_robot_driver sends the URScript automatically — do NOT load ext.urp manually
 """
 
+import os
 from pathlib import Path
 
 from launch import LaunchDescription
@@ -16,7 +19,7 @@ from launch.actions import (
     OpaqueFunction,
     TimerAction,
 )
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     LaunchConfiguration,
@@ -24,11 +27,27 @@ from launch.substitutions import (
 )
 from launch_ros.substitutions import FindPackageShare
 
+_CALIBRATION_FILE = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "config", "ur10_calibration.yaml")
+)
+_HAS_CALIBRATION = os.path.isfile(_CALIBRATION_FILE)
+
 
 def launch_setup(context, *args, **kwargs):
-    robot_ip         = LaunchConfiguration("robot_ip")
-    use_fake_hardware = LaunchConfiguration("use_fake_hardware")
-    launch_rviz      = LaunchConfiguration("launch_rviz")
+    robot_ip          = LaunchConfiguration("robot_ip")
+    use_mock_hardware = LaunchConfiguration("use_mock_hardware")
+    launch_rviz       = LaunchConfiguration("launch_rviz")
+
+    ur_control_args = {
+        "ur_type":                    "ur10",
+        "robot_ip":                   robot_ip,
+        "use_mock_hardware":          use_mock_hardware,
+        "launch_rviz":                "false",
+        "controller_spawner_timeout": "60",
+        "reverse_ip":                 "192.168.10.1",
+    }
+    if _HAS_CALIBRATION:
+        ur_control_args["kinematics_parameters_file"] = _CALIBRATION_FILE
 
     ur_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -37,23 +56,20 @@ def launch_setup(context, *args, **kwargs):
                 "launch", "ur_control.launch.py",
             ])
         ),
-        launch_arguments={
-            "ur_type":            "ur10",
-            "robot_ip":           robot_ip,
-            "use_fake_hardware":  use_fake_hardware,
-            "launch_rviz":        "false",
-            # CB3 kinematics calibration — replace with your robot's file
-            # "kinematics_params_file": "/path/to/calibration.yaml",
-        }.items(),
+        launch_arguments=ur_control_args.items(),
     )
 
     moveit = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
-                FindPackageShare("telamoto_bringup"),
-                "launch", "moveit.launch.py",
+                FindPackageShare("ur_moveit_config"),
+                "launch", "ur_moveit.launch.py",
             ])
         ),
+        launch_arguments={
+            "ur_type":     "ur10",
+            "launch_rviz": "false",
+        }.items(),
     )
 
     rviz = IncludeLaunchDescription(
@@ -66,10 +82,11 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(launch_rviz),
     )
 
-    # Give the driver ~3 s to come up before starting MoveIt2
-    moveit_delayed = TimerAction(period=3.0, actions=[moveit])
+    # Give the driver ~10 s to connect and spawn controllers before MoveIt2 starts
+    moveit_delayed = TimerAction(period=10.0, actions=[moveit])
+    rviz_delayed   = TimerAction(period=15.0, actions=[rviz])
 
-    return [ur_driver, moveit_delayed, rviz]
+    return [ur_driver, moveit_delayed, rviz_delayed]
 
 
 def generate_launch_description():
@@ -80,7 +97,7 @@ def generate_launch_description():
             description="IP address of the UR10 controller",
         ),
         DeclareLaunchArgument(
-            "use_fake_hardware",
+            "use_mock_hardware",
             default_value="false",
             description="Use mock hardware instead of the physical robot",
         ),

@@ -143,11 +143,12 @@ def generate_launch_description():
     # ═══════════════════════════════════════════════════════════════════════
     # RVIZ2 — separate instances per condition (reusing one object breaks launch)
     # ═══════════════════════════════════════════════════════════════════════
-    def _rviz():
+    def _rviz(fake: bool):
         return IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([
                 FindPackageShare("telamoto_bringup"), "launch", "moveit_rviz.launch.py",
             ])),
+            launch_arguments={"use_fake_hardware": "true" if fake else "false"}.items(),
         )
 
     return LaunchDescription(
@@ -155,12 +156,14 @@ def generate_launch_description():
             # Fake mode
             ur_control_fake,
             TimerAction(period=5.0, actions=[ur_moveit_fake], condition=IfCondition(use_mock_hardware)),
-            TimerAction(period=8.0, actions=[_rviz()],        condition=IfCondition(use_mock_hardware)),
+            TimerAction(period=8.0, actions=[_rviz(fake=True)],  condition=IfCondition(use_mock_hardware)),
             # Real mode
             ur_rsp_real,
             rtde_joint_pub,
             servo_controller,   # opens port 50001, plays ext.urp, replays on disconnect
-            TimerAction(period=3.0, actions=[ur_moveit_real], condition=UnlessCondition(use_mock_hardware)),
-            TimerAction(period=6.0, actions=[_rviz()],        condition=UnlessCondition(use_mock_hardware)),
+            TimerAction(period=3.0,  actions=[ur_moveit_real],     condition=UnlessCondition(use_mock_hardware)),
+            # 15 s gives move_group time to receive /joint_states and publish
+            # a populated planning scene so the goal marker starts at the real pose.
+            TimerAction(period=15.0, actions=[_rviz(fake=False)],  condition=UnlessCondition(use_mock_hardware)),
         ]
     )

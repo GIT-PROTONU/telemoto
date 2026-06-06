@@ -109,11 +109,27 @@ class URServoController(Node):
 
     # ── Dashboard auto-play ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _recv_line(s: socket.socket) -> str:
+        """Read bytes from *s* until '\\n', return decoded line (no trailing whitespace).
+
+        Uses byte-at-a-time reads so partial TCP segments never bleed into the
+        next command's response — the root cause of 'mangled' dashboard replies.
+        """
+        buf = bytearray()
+        while True:
+            ch = s.recv(1)
+            if not ch:
+                break
+            buf += ch
+            if ch == b"\n":
+                break
+        return buf.decode("utf-8", errors="replace").strip()
+
     def _dashboard_cmd(self, s: socket.socket, cmd: str) -> str:
-        s.sendall((cmd + "\n").encode())
-        time.sleep(0.4)
+        s.sendall((cmd + "\n").encode("utf-8"))
         try:
-            return s.recv(4096).decode().strip()
+            return self._recv_line(s)
         except socket.timeout:
             return ""
 
@@ -134,7 +150,7 @@ class URServoController(Node):
             try:
                 s = socket.create_connection((ip, 29999), timeout=10)
                 s.settimeout(5)
-                s.recv(4096)                              # welcome banner
+                self._recv_line(s)                        # welcome banner (consume fully)
 
                 mode = self._dashboard_cmd(s, "robotmode").upper()
                 self.get_logger().info(f"[dashboard] robotmode → {mode}")

@@ -22,22 +22,39 @@ def wait_for_driver(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
+def _recv_line(s: socket.socket) -> str:
+    """Read one LF-terminated line from *s*, byte-by-byte, decoded as UTF-8.
+
+    Prevents partial TCP segments from bleeding into the next command's response.
+    """
+    buf = bytearray()
+    while True:
+        ch = s.recv(1)
+        if not ch:
+            break
+        buf += ch
+        if ch == b"\n":
+            break
+    return buf.decode("utf-8", errors="replace").strip()
+
+
+def _send_cmd(s: socket.socket, cmd: str) -> str:
+    s.sendall((cmd + "\n").encode("utf-8"))
+    return _recv_line(s)
+
+
 def dashboard_play(ip: str, prog: str) -> None:
     s = socket.create_connection((ip, 29999), timeout=10)
     s.settimeout(5)
-    welcome = s.recv(1024)
-    print(f"[autoplay] connected: {welcome.decode().strip()}", flush=True)
+    welcome = _recv_line(s)
+    print(f"[autoplay] connected: {welcome}", flush=True)
 
-    s.sendall(f"load {prog}\n".encode())
-    time.sleep(0.3)
-    resp = s.recv(1024).decode().strip()
+    resp = _send_cmd(s, f"load {prog}")
     print(f"[autoplay] load → {resp}", flush=True)
     if "error" in resp.lower() or "failed" in resp.lower():
         raise RuntimeError(f"load failed: {resp}")
 
-    s.sendall(b"play\n")
-    time.sleep(0.3)
-    resp = s.recv(1024).decode().strip()
+    resp = _send_cmd(s, "play")
     print(f"[autoplay] play → {resp}", flush=True)
     s.close()
 

@@ -79,6 +79,7 @@ def launch_setup(context, *args, **kwargs):
                 "launch", "moveit_rviz.launch.py",
             ])
         ),
+        launch_arguments={"use_fake_hardware": use_mock_hardware}.items(),
         condition=IfCondition(launch_rviz),
     )
 

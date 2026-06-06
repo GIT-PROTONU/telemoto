@@ -33,11 +33,12 @@ _CALIBRATION_FILE = os.path.normpath(
 )
 _HAS_CALIBRATION = os.path.isfile(_CALIBRATION_FILE)
 
-# Resolved at import time — safe because install/ is in place before launch
-_AUTOPLAY_SCRIPT = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
-                 "lib", "telamoto_bringup", "ur_dashboard_autoplay.py")
-)
+# FindPackageShare resolves to install/telamoto_bringup/share/telamoto_bringup;
+# ../../lib/telamoto_bringup/ reaches the sibling lib directory at install time.
+_AUTOPLAY_SCRIPT = PathJoinSubstitution([
+    FindPackageShare("telamoto_bringup"),
+    "..", "..", "lib", "telamoto_bringup", "ur_dashboard_autoplay.py",
+])
 
 
 def generate_launch_description():

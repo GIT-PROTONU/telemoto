@@ -56,7 +56,7 @@ def generate_launch_description():
         Command([
             FindExecutable(name="xacro"), " ",
             PathJoinSubstitution([
-                FindPackageShare("ur_moveit_config"), "config", "ur.srdf.xacro",
+                FindPackageShare("ur_moveit_config"), "srdf", "ur.srdf.xacro",
             ]),
             " name:=ur",
             " prefix:=", prefix,

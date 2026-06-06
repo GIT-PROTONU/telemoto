@@ -109,25 +109,79 @@ class URServoController(Node):
 
     # ── Dashboard auto-play ───────────────────────────────────────────────────
 
-    def _play_ext_program(self) -> None:
-        """Tell the robot's Dashboard Server to load and play ext_program."""
-        ip, prog = self._robot_ip, self._ext_prog
+    def _dashboard_cmd(self, s: socket.socket, cmd: str) -> str:
+        s.sendall((cmd + "\n").encode())
+        time.sleep(0.4)
         try:
-            self.get_logger().info(
-                f"Dashboard: connecting to {ip}:29999 to play {prog} ..."
-            )
-            s = socket.create_connection((ip, 29999), timeout=10)
-            s.settimeout(5)
-            s.recv(1024)                          # welcome banner
-            s.sendall(f"load {prog}\n".encode()); time.sleep(0.3)
-            r = s.recv(1024).decode().strip()
-            self.get_logger().info(f"Dashboard load → {r}")
-            s.sendall(b"play\n");                 time.sleep(0.3)
-            r = s.recv(1024).decode().strip()
-            self.get_logger().info(f"Dashboard play → {r}")
-            s.close()
-        except Exception as exc:
-            self.get_logger().warn(f"Dashboard play failed: {exc} (will retry on next disconnect)")
+            return s.recv(4096).decode().strip()
+        except socket.timeout:
+            return ""
+
+    def _play_ext_program(self) -> None:
+        """Robustly load and play ext_program via the Dashboard Server.
+
+        Retries up to 20 times (≈60 s) handling:
+          - robot not yet in RUNNING mode (still booting / protective stop)
+          - "Failed to execute: play" / "please wait" responses
+        Issues a stop before each play attempt so prior program state is cleared.
+        """
+        ip, prog = self._robot_ip, self._ext_prog
+        self.get_logger().info(f"[dashboard] will play {prog} on {ip}:29999")
+
+        for attempt in range(20):
+            if not rclpy.ok():
+                return
+            try:
+                s = socket.create_connection((ip, 29999), timeout=10)
+                s.settimeout(5)
+                s.recv(4096)                              # welcome banner
+
+                mode = self._dashboard_cmd(s, "robotmode").upper()
+                self.get_logger().info(f"[dashboard] robotmode → {mode}")
+
+                if "RUNNING" not in mode:
+                    self.get_logger().warn(
+                        f"[dashboard] robot not in RUNNING mode ({mode}), "
+                        "waiting 3 s ..."
+                    )
+                    s.close(); time.sleep(3.0); continue
+
+                # Stop any currently running program, then load + play
+                self._dashboard_cmd(s, "stop")
+
+                load_r = self._dashboard_cmd(s, f"load {prog}")
+                self.get_logger().info(f"[dashboard] load → {load_r}")
+                if "error" in load_r.lower():
+                    self.get_logger().error(
+                        f"[dashboard] load failed: {load_r}  "
+                        "(check that {prog} exists on the robot)"
+                    )
+                    s.close(); return          # file not found — no point retrying
+
+                play_r = self._dashboard_cmd(s, "play")
+                self.get_logger().info(f"[dashboard] play → {play_r}")
+                s.close()
+
+                if "failed" in play_r.lower() or "please wait" in play_r.lower():
+                    self.get_logger().warn(
+                        f"[dashboard] play not ready ({play_r}), retry in 2 s ..."
+                    )
+                    time.sleep(2.0); continue
+
+                self.get_logger().info(f"[dashboard] {prog} started")
+                return
+
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"[dashboard] attempt {attempt + 1}/20: {exc} — retry in 2 s"
+                )
+                try: s.close()
+                except Exception: pass
+                time.sleep(2.0)
+
+        self.get_logger().error(
+            f"[dashboard] gave up starting {prog} after 20 attempts"
+        )
 
     # ── TCP server ────────────────────────────────────────────────────────────
 

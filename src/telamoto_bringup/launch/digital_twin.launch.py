@@ -126,22 +126,25 @@ def generate_launch_description():
     )
 
     # ── RVIZ2 ─────────────────────────────────────────────────────────────────
-    rviz = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([
-                FindPackageShare("telamoto_bringup"), "launch", "moveit_rviz.launch.py",
-            ])
-        ),
-    )
+    # Each TimerAction needs its own IncludeLaunchDescription instance —
+    # reusing one object across multiple actions breaks ROS2 launch.
+    def _rviz():
+        return IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare("telamoto_bringup"), "launch", "moveit_rviz.launch.py",
+                ])
+            ),
+        )
 
     rviz_delayed_fake = TimerAction(
         period=8.0,
-        actions=[rviz],
+        actions=[_rviz()],
         condition=IfCondition(use_mock_hardware),
     )
     rviz_delayed_real = TimerAction(
         period=16.0,
-        actions=[rviz],
+        actions=[_rviz()],
         condition=UnlessCondition(use_mock_hardware),
     )
 

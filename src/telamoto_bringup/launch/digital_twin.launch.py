@@ -38,11 +38,6 @@ _CALIBRATION_FILE = os.path.normpath(
 )
 _HAS_CALIBRATION = os.path.isfile(_CALIBRATION_FILE)
 
-_AUTOPLAY_SCRIPT = PathJoinSubstitution([
-    FindPackageShare("telamoto_bringup"),
-    "..", "..", "lib", "telamoto_bringup", "ur_dashboard_autoplay.py",
-])
-
 
 def generate_launch_description():
     declared_args = [
@@ -127,23 +122,14 @@ def generate_launch_description():
         condition=UnlessCondition(use_mock_hardware),
     )
 
-    # Reverse-interface server on port 50001 — robot connects after ext.urp plays
+    # Reverse-interface server on port 50001.
+    # Handles auto-play of ext.urp internally and replays it on disconnect.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",
         name="ur_servo_controller",
         output="screen",
-        parameters=[{"robot_ip": robot_ip}],
-        condition=UnlessCondition(use_mock_hardware),
-    )
-
-    # Auto-play ext.urp via Dashboard Server once port 50001 is open
-    auto_play = Node(
-        package="telamoto_bringup",
-        executable="ur_dashboard_autoplay.py",
-        name="ur_dashboard_autoplay",
-        output="screen",
-        arguments=[robot_ip, ext_program],
+        parameters=[{"robot_ip": robot_ip, "ext_program": ext_program}],
         condition=UnlessCondition(use_mock_hardware),
     )
 
@@ -173,8 +159,7 @@ def generate_launch_description():
             # Real mode
             ur_rsp_real,
             rtde_joint_pub,
-            servo_controller,
-            auto_play,          # waits internally for port 50001, then plays ext.urp
+            servo_controller,   # opens port 50001, plays ext.urp, replays on disconnect
             TimerAction(period=3.0, actions=[ur_moveit_real], condition=UnlessCondition(use_mock_hardware)),
             TimerAction(period=6.0, actions=[_rviz()],        condition=UnlessCondition(use_mock_hardware)),
         ]

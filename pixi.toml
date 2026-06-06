@@ -67,8 +67,9 @@ shell = "bash --rcfile <(echo 'source $CONDA_PREFIX/setup.bash && source install
 # Digital twin — UR10 with fake hardware + MoveIt2 + RViz2 (no robot needed)
 twin = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py'", depends-on = ["build"] }
 
-# Digital twin connected to the real robot (read-only: RTDE outputs only, no driver RTDE inputs)
-twin-real = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py use_mock_hardware:=false robot_ip:=192.168.10.2'", depends-on = ["build"] }
+# Real robot: full motion control + RViz2. Applies empty RTDE input recipe so
+# ur_robot_driver starts on CB3 3.15. ext.urp is auto-played via Dashboard Server.
+twin-real = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py use_mock_hardware:=false robot_ip:=192.168.10.2'", depends-on = ["build", "patch-rtde"] }
 calibrate = { cmd = "bash -c 'source install/setup.bash && ros2 launch ur_calibration calibration_correction.launch.py robot_ip:=192.168.10.2 target_filename:=$(pwd)/src/telamoto_bringup/config/ur10_calibration.yaml'" }
 
 # Full bringup: ur_robot_driver + ros2_control + MoveIt2 + RViz2 (real robot, motion enabled)

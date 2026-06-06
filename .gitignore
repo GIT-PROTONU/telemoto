@@ -1,0 +1,22 @@
+# Colcon build artefacts
+build/
+install/
+log/
+
+# Pixi environment
+.pixi/
+
+# Editor / OS
+.vscode/settings.json
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Claude Code local config
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

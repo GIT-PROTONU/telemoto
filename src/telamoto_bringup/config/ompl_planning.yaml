@@ -1,0 +1,81 @@
+# OMPL planning pipeline for the UR10.
+# RRTConnect is the default planner — good all-rounder for 6-DOF arms.
+# Swap to RRTstar for asymptotically optimal paths at the cost of planning time.
+planning_plugin: ompl_interface/OMPLPlanner
+
+request_adapters:
+  - default_planning_request_adapters/ResolveConstraintFrames
+  - default_planning_request_adapters/ValidateWorkspaceBounds
+  - default_planning_request_adapters/CheckStartStateBounds
+  - default_planning_request_adapters/CheckStartStateCollision
+
+response_adapters:
+  - default_planning_response_adapters/AddTimeOptimalParameterization
+  - default_planning_response_adapters/ValidateSolution
+  - default_planning_response_adapters/DisplayMotionPath
+
+start_state_max_bounds_error: 0.1
+
+ompl:
+  planning_plugin: ompl_interface/OMPLPlanner
+
+  manipulator:
+    default_planner_config: RRTConnect
+    projection_evaluator: joints(shoulder_pan_joint,shoulder_lift_joint)
+    planner_configs:
+      - RRTConnect
+      - RRT
+      - RRTstar
+      - TRRT
+      - EST
+      - PRM
+      - PRMstar
+      - LBTRRT
+
+  planner_configs:
+    RRTConnectkConfigDefault:
+      type: geometric::RRTConnect
+      range: 0.0       # auto-set from state space
+
+    RRTkConfigDefault:
+      type: geometric::RRT
+      range: 0.0
+      goal_bias: 0.05
+
+    RRTstarkConfigDefault:
+      type: geometric::RRTstar
+      range: 0.0
+      goal_bias: 0.05
+      delay_collision_checking: 1
+
+    TRRTkConfigDefault:
+      type: geometric::TRRT
+      range: 0.0
+      goal_bias: 0.05
+      T_motions: 10
+      k_constant: 0.0
+      init_temperature: 0.0001
+      temp_change_factor: 2.0
+      min_temperature: 1.0e-10
+      max_temperature: 1000.0
+      frountierThreshold: 0.0
+      frountier_node_ratio: 0.1
+      cost_threshold: 1.0e+300
+
+    ESTkConfigDefault:
+      type: geometric::EST
+      range: 0.0
+      goal_bias: 0.05
+
+    PRMkConfigDefault:
+      type: geometric::PRM
+      max_nearest_neighbors: 10
+
+    PRMstarkConfigDefault:
+      type: geometric::PRMstar
+
+    LBTRRTkConfigDefault:
+      type: geometric::LBTRRT
+      range: 0.0
+      goal_bias: 0.05
+      epsilon: 0.4

@@ -1,0 +1,7 @@
+string pose_name        # named pose from the SRDF / config
+float64 velocity_scale  # 0.0–1.0
+float64 accel_scale     # 0.0–1.0
+---
+bool success
+string message
+float64 execution_time  # seconds

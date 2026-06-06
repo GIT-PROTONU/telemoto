@@ -1,0 +1,7 @@
+<library path="telamoto_hardware">
+  <class name="telamoto_hardware/UR10HardwareExtension"
+         type="telamoto_hardware::UR10HardwareExtension"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>Custom hardware interface extension for the UR10 CB3.1</description>
+  </class>
+</library>

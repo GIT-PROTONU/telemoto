@@ -1,0 +1,83 @@
+[workspace]
+name = "telamoto"
+version = "0.1.0"
+description = "ROS2 Jazzy workspace for UR10 CB3.1"
+channels = [
+    "robostack-jazzy",
+    "robostack-staging",
+    "conda-forge",
+]
+platforms = ["linux-64"]
+
+# ---------------------------------------------------------------------------
+# Core ROS2 + robot stack
+# ---------------------------------------------------------------------------
+[dependencies]
+ros-jazzy-desktop           = "*"
+ros-jazzy-ur-robot-driver   = "*"
+ros-jazzy-ur-description    = "*"
+ros-jazzy-ur-moveit-config  = "*"
+ros-jazzy-ur-calibration    = "*"
+ros-jazzy-moveit             = "*"
+ros-jazzy-moveit-planners-ompl = "*"
+ros-jazzy-ros2-control       = "*"
+ros-jazzy-ros2-controllers   = "*"
+ros-jazzy-joint-state-publisher-gui = "*"
+ros-jazzy-xacro              = "*"
+ros-jazzy-rviz2              = "*"
+colcon-common-extensions     = "*"
+colcon-mixin                 = "*"
+
+# ---------------------------------------------------------------------------
+# Build tools
+# ---------------------------------------------------------------------------
+cmake        = ">=3.22"
+ninja        = "*"
+compilers    = "*"
+pkg-config   = "*"
+
+# ---------------------------------------------------------------------------
+# Dev helpers
+# ---------------------------------------------------------------------------
+pre-commit   = "*"
+clang-format = "*"
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+[tasks]
+# CB3: PolyScopeX owns speed_slider_mask as an RTDE input at boot, so the driver's default
+# recipe causes a permanent conflict. This task patches the installed recipe to drop those
+# two variables. Re-run after `pixi install` / environment updates.
+patch-rtde = "cp src/telamoto_bringup/config/rtde_input_recipe_cb3.txt .pixi/envs/default/share/ur_robot_driver/resources/rtde_input_recipe.txt"
+
+# Build the workspace (incremental)
+build = "colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -GNinja"
+
+# Build a single package  (usage: pixi run build-pkg PKG=telamoto_hardware)
+build-pkg = "colcon build --symlink-install --cmake-args -GNinja --packages-select $PKG"
+
+# Clean build artefacts
+clean = "rm -rf build install log"
+
+# Source the install overlay and drop into a shell
+shell = "bash --rcfile <(echo 'source $CONDA_PREFIX/setup.bash && source install/setup.bash 2>/dev/null || true')"
+
+# Digital twin — UR10 with fake hardware + MoveIt2 + RViz2 (no robot needed)
+twin = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py'", depends-on = ["build"] }
+
+# Digital twin connected to the real robot (read-only: RTDE outputs only, no driver RTDE inputs)
+twin-real = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup digital_twin.launch.py use_mock_hardware:=false robot_ip:=192.168.10.2'", depends-on = ["build"] }
+calibrate = { cmd = "bash -c 'source install/setup.bash && ros2 launch ur_calibration calibration_correction.launch.py robot_ip:=192.168.10.2 target_filename:=$(pwd)/src/telamoto_bringup/config/ur10_calibration.yaml'" }
+
+# Launch the full bringup (real robot)
+bringup = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup ur10_bringup.launch.py'", depends-on = ["build"] }
+
+# Launch with fake hardware (no physical robot needed)
+bringup-fake = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup ur10_bringup.launch.py use_fake_hardware:=true'", depends-on = ["build"] }
+
+# Open RViz with MoveIt2 only (controllers must already be running)
+rviz = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup moveit_rviz.launch.py'"
+
+# List available ROS2 nodes
+nodes = "ros2 node list"

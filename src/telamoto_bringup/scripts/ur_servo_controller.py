@@ -48,7 +48,7 @@ WEB_PORT     = 8080
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (jogging)
-SPEEDJ_ACCEL = 8.0         # rad/s^2 — how fast speedj ramps to the commanded velocity
+SPEEDJ_ACCEL = 15.0        # rad/s^2 — how fast speedj ramps to the commanded velocity
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
 _ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
@@ -64,7 +64,7 @@ JOG_ANGULAR = 0.5           # rad/s at full axis
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
 JOG_DEADMAN = 0.3           # s — stop if no jog command arrives within this
-JOG_MIN_TIME = 0.2          # s — keep jogging at least this long after a press so
+JOG_MIN_TIME = 0.3          # s — keep jogging at least this long after a press so
                             # a quick tap still produces a step (speedj/Servo need
                             # time to ramp). Bigger = larger tap step.
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
@@ -150,6 +150,7 @@ _WEB_PAGE = """<!doctype html>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
  const ids=["speed","gain","lookahead"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
+ let jseq=0;
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
  async function refreshStatus(){try{const s=await(await fetch("/api/state")).json();
@@ -167,7 +168,7 @@ _WEB_PAGE = """<!doctype html>
  function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
    ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
  function sendJog(){const v=jogVec();
-   fetch("/api/jog?lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
+   fetch("/api/jog?seq="+(++jseq)+"&lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
  function stopJog(){held.clear();if(hb){clearInterval(hb);hb=null;}sendJog();}
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
    fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(!jogOn)stopJog();});
@@ -247,6 +248,9 @@ class URServoController(Node):
         self._jog_mode = False                         # web toggle: stay in velocity mode
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
+        self._dbg_last_seq = None                       # diagnostics: detect missed POSTs
+        self._dbg_pub_nz = False
+        self._dbg_servo_nz = False
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
@@ -289,6 +293,18 @@ class URServoController(Node):
         ax = lambda k: _clamp(-1.0, 1.0, float(q.get(k, ["0"])[0]))
         twist = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
                  JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
+        # Diagnostics: every POST is logged with its seq; a jump in seq = a
+        # dropped/lost web command.
+        try:
+            seq = int(q.get("seq", ["-1"])[0])
+        except ValueError:
+            seq = -1
+        gap = ""
+        if self._dbg_last_seq is not None and seq != self._dbg_last_seq + 1:
+            gap = f"  <-- GAP (missed {seq - self._dbg_last_seq - 1})"
+        self._dbg_last_seq = seq
+        self.get_logger().info(
+            f"[jog] rx seq={seq} dir=({twist[0]:+.2f},{twist[1]:+.2f},{twist[2]:+.2f}){gap}")
         now = time.monotonic()
         self._jog_deadline = now + JOG_DEADMAN          # crash deadman
         if any(twist):                                  # key down / held heartbeat
@@ -325,6 +341,10 @@ class URServoController(Node):
         with self._tgt_lock:
             self._qd_target = qd
         self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
+        nz = any(abs(v) > 1e-4 for v in qd)                  # diagnostics
+        if nz != self._dbg_servo_nz:
+            self._dbg_servo_nz = nz
+            self.get_logger().info(f"[jog] servo velocity output {'ON' if nz else 'off'}")
 
     def _arm_servo(self) -> None:
         # Put MoveIt Servo in TWIST mode up front so even a quick tap is acted on
@@ -350,6 +370,10 @@ class URServoController(Node):
                 self._jog = _ZERO6                            # min-window done / crash deadman
             if not self._jog_mode:
                 continue                                      # velocity mode off
+            pub_nz = any(self._jog)                           # diagnostics
+            if pub_nz != self._dbg_pub_nz:
+                self._dbg_pub_nz = pub_nz
+                self.get_logger().info(f"[jog] publishing twist {'ON' if pub_nz else 'off'}")
             # Stream the twist (zero when idle, active on a key) the WHOLE time
             # jog mode is on, so Servo + speedj stay warm and taps are instant.
             m = TwistStamped()

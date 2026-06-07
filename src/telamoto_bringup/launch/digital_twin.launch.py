@@ -30,7 +30,6 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 _CALIBRATION_FILE = os.path.normpath(
@@ -53,18 +52,11 @@ def generate_launch_description():
             "initial_joint_controller",
             default_value="scaled_joint_trajectory_controller",
         ),
-        DeclareLaunchArgument(
-            "auto_play", default_value="false",
-            description="true = dashboard auto-plays ext.urp (uses URCap's cached "
-                        "script); false = press Play on the pendant (recompiles, so "
-                        "the URCap fetches a fresh script from this PC).",
-        ),
     ]
 
     robot_ip           = LaunchConfiguration("robot_ip")
     use_mock_hardware  = LaunchConfiguration("use_mock_hardware")
     initial_joint_ctrl = LaunchConfiguration("initial_joint_controller")
-    auto_play          = LaunchConfiguration("auto_play")
 
     # ═══════════════════════════════════════════════════════════════════════
     # FAKE MODE
@@ -124,16 +116,15 @@ def generate_launch_description():
         condition=UnlessCondition(use_mock_hardware),
     )
 
-    # External Control URCap driver: serves the servoj script on port 50002
-    # (request_program), streams 125 Hz packets on the reverse socket 50001,
-    # and auto-plays ext.urp via the Dashboard Server.
+    # External Control URCap driver: serves the servoj script on request_program
+    # (ports 50002 and 50001) and streams packets on the reverse socket 50001.
+    # Start it by pressing Play on the pendant's External Control program.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",
         name="ur_servo_controller",
         output="screen",
-        parameters=[{"robot_ip": robot_ip,
-                     "auto_play": ParameterValue(auto_play, value_type=bool)}],
+        parameters=[{"robot_ip": robot_ip}],
         condition=UnlessCondition(use_mock_hardware),
     )
 

@@ -13,8 +13,7 @@ Real mode — no ur_robot_driver (CB3 3.15 PolyScopeX holds all RTDE inputs,
   ur_rsp.launch.py          robot_state_publisher only
   ur_rtde_joint_pub.py      /joint_states via RTDE outputs (read-only, no conflict)
   ur_servo_controller.py    TCP server port 50001, 125 Hz servoj via reverse-
-                            interface protocol; auto-play waits for it to open
-  ur_dashboard_autoplay.py  plays ext.urp once port 50001 is open
+                            interface; uploads URScript with auto-detected IP
   moveit_real.launch.py     MoveIt2 → joint_trajectory_controller action server
   rviz2
 """
@@ -53,16 +52,11 @@ def generate_launch_description():
             "initial_joint_controller",
             default_value="scaled_joint_trajectory_controller",
         ),
-        DeclareLaunchArgument(
-            "ext_program", default_value="ext.urp",
-            description="URCap program to auto-play (real mode only)",
-        ),
     ]
 
     robot_ip           = LaunchConfiguration("robot_ip")
     use_mock_hardware  = LaunchConfiguration("use_mock_hardware")
     initial_joint_ctrl = LaunchConfiguration("initial_joint_controller")
-    ext_program        = LaunchConfiguration("ext_program")
 
     # ═══════════════════════════════════════════════════════════════════════
     # FAKE MODE
@@ -123,13 +117,13 @@ def generate_launch_description():
     )
 
     # Reverse-interface server on port 50001.
-    # Handles auto-play of ext.urp internally and replays it on disconnect.
+    # Uploads URScript with auto-detected PC IP; replays on disconnect.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",
         name="ur_servo_controller",
         output="screen",
-        parameters=[{"robot_ip": robot_ip, "ext_program": ext_program}],
+        parameters=[{"robot_ip": robot_ip}],
         condition=UnlessCondition(use_mock_hardware),
     )
 

@@ -169,7 +169,8 @@ _WEB_PAGE = """<!doctype html>
  function sendJog(){const v=jogVec();
    fetch("/api/jog?lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
  function stopJog(){held.clear();if(hb){clearInterval(hb);hb=null;}sendJog();}
- document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;if(!jogOn)stopJog();});
+ document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
+   fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(!jogOn)stopJog();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
    if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();if(!hb)hb=setInterval(sendJog,100);}});
  document.addEventListener("keyup",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
@@ -243,6 +244,7 @@ class URServoController(Node):
         self._jog_deadline = 0.0
         self._press_start = None
         self._stop_at = 0.0
+        self._jog_mode = False                         # web toggle: stay in velocity mode
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
 
@@ -300,6 +302,12 @@ class URServoController(Node):
             self._stop_at = max(now, self._press_start + JOG_MIN_TIME)
             self._press_start = None
 
+    def _web_jogmode(self, q: dict) -> None:
+        self._jog_mode = q.get("on", ["0"])[0] in ("1", "true", "on")
+        if not self._jog_mode:
+            self._jog = _ZERO6
+        self.get_logger().info(f"[jog] velocity mode {'ON' if self._jog_mode else 'OFF'}")
+
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
     def _servo_cb(self, msg: JointTrajectory) -> None:
@@ -338,10 +346,12 @@ class URServoController(Node):
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
             now = time.monotonic()
-            if now >= self._stop_at:                          # min-jog window elapsed
-                self._jog = _ZERO6
-            if now >= self._jog_deadline or not any(self._jog):
-                continue
+            if now >= self._stop_at or now >= self._jog_deadline:
+                self._jog = _ZERO6                            # min-window done / crash deadman
+            if not self._jog_mode:
+                continue                                      # velocity mode off
+            # Stream the twist (zero when idle, active on a key) the WHOLE time
+            # jog mode is on, so Servo + speedj stay warm and taps are instant.
             m = TwistStamped()
             m.header.stamp = self.get_clock().now().to_msg()
             m.header.frame_id = JOG_FRAME
@@ -377,6 +387,8 @@ class URServoController(Node):
                 try:
                     if self.path.startswith("/api/set"):
                         node._web_set(q)
+                    elif self.path.startswith("/api/jogmode"):
+                        node._web_jogmode(q)
                     elif self.path.startswith("/api/jog"):
                         node._web_jog(q)
                 except (ValueError, KeyError):

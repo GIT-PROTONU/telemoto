@@ -64,7 +64,7 @@ JOG_ANGULAR = 0.5           # rad/s at full axis
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
 JOG_DEADMAN = 0.3           # s — stop if no jog command arrives within this
-JOG_MIN_TIME = 0.15         # s — keep jogging at least this long after a press so
+JOG_MIN_TIME = 0.2          # s — keep jogging at least this long after a press so
                             # a quick tap still produces a step (speedj/Servo need
                             # time to ramp). Bigger = larger tap step.
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
@@ -243,7 +243,6 @@ class URServoController(Node):
         self._jog_deadline = 0.0
         self._press_start = None
         self._stop_at = 0.0
-        self._servo_started = False
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
 
@@ -319,8 +318,23 @@ class URServoController(Node):
             self._qd_target = qd
         self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
 
+    def _arm_servo(self) -> None:
+        # Put MoveIt Servo in TWIST mode up front so even a quick tap is acted on
+        # immediately (it ignores twists until the command type is selected).
+        deadline = time.monotonic() + 20.0
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self._servo_cli.service_is_ready():
+                req = ServoCommandType.Request()
+                req.command_type = ServoCommandType.Request.TWIST
+                self._servo_cli.call_async(req)
+                self.get_logger().info("[jog] MoveIt Servo armed (TWIST mode)")
+                return
+            time.sleep(0.2)
+        self.get_logger().warn("[jog] servo_node not available — jog will be delayed")
+
     def _jog_loop(self) -> None:
         self._js_ready.wait()
+        self._arm_servo()
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
             now = time.monotonic()
@@ -328,14 +342,6 @@ class URServoController(Node):
                 self._jog = _ZERO6
             if now >= self._jog_deadline or not any(self._jog):
                 continue
-            if not self._servo_started:                       # one-time: select TWIST mode
-                if not self._servo_cli.service_is_ready():
-                    continue
-                req = ServoCommandType.Request()
-                req.command_type = ServoCommandType.Request.TWIST
-                self._servo_cli.call_async(req)
-                self._servo_started = True
-                self.get_logger().info("[jog] MoveIt Servo command type → TWIST")
             m = TwistStamped()
             m.header.stamp = self.get_clock().now().to_msg()
             m.header.frame_id = JOG_FRAME

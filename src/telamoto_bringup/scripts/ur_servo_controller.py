@@ -50,6 +50,7 @@ MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (jogging)
 SPEEDJ_ACCEL = 8.0         # rad/s^2 — how fast speedj ramps to the commanded velocity
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
+_ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
 GAIN_MIN, GAIN_MAX           = 100, 2000
 LOOKAHEAD_MIN, LOOKAHEAD_MAX = 0.03, 0.2
@@ -224,7 +225,6 @@ class URServoController(Node):
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
-        self._q_target = [0.0] * 6                    # held pose when idle
         self._tgt_lock = threading.Lock()
         self._traj = None                             # (waypoints, total_time, t_start)
         self._traj_lock = threading.Lock()
@@ -232,15 +232,13 @@ class URServoController(Node):
         self._conn: socket.socket | None = None       # live reverse socket
         self._conn_lock = threading.Lock()
 
-        # WASD jog (MoveIt Servo): _jog is the desired twist, valid until _jog_deadline.
+        # WASD jog (MoveIt Servo): _jog is the desired twist, valid until _jog_deadline;
+        # _qd_target is Servo's joint velocity, streamed as speedj while jogging.
         self._jog = [0.0] * 6
         self._jog_deadline = 0.0
         self._servo_started = False
-        # While Servo is publishing (jogging) the control loop sends speedj with
-        # _qd_target (joint velocities); otherwise servoj with _q_target.
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
-        self._q_actual = [0.0] * 6                     # latest measured joint pose
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
@@ -366,21 +364,14 @@ class URServoController(Node):
         self.get_logger().info(f"[web] tuning UI at http://{self._pc_ip()}:{self._web_port}")
         srv.serve_forever()
 
-    # ── Joint states: track the measured pose so the speedj→servoj jog handoff
-    #    holds where the robot ACTUALLY is (Servo's commanded pose drifts) ────────
+    # ── Joint states: only gate startup (the robot holds its own pose via speedj
+    #    when idle, so we don't track positions here) ──────────────────────────────
 
     def _js_cb(self, msg: JointState) -> None:
-        ntp = dict(zip(msg.name, msg.position))
-        try:
-            q = [ntp[j] for j in UR_JOINT_ORDER]
-        except KeyError:
-            return
-        self._q_actual = q                            # atomic rebind; read lock-free
         if not self._js_ready.is_set():
-            with self._tgt_lock:
-                self._q_target = list(q)
             self._js_ready.set()
             self.get_logger().info("[ctrl] first joint states received")
+            self.destroy_subscription(self._js_sub)
 
     # ── Reverse server: serves the script on request, then hands the socket to
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
@@ -473,24 +464,20 @@ class URServoController(Node):
         h00, h10, h01, h11 = 2*s3 - 3*s2 + 1, s3 - 2*s2 + s, -2*s3 + 3*s2, s3 - s2
         return [h00*q0[j] + h10*h*v0[j] + h01*q1[j] + h11*h*v1[j] for j in range(6)]
 
-    def _next_target(self, now: float) -> list[float]:
+    def _traj_target(self, now: float):
+        """servoj position for an active planned move, or None if none active."""
         with self._traj_lock:
             traj = self._traj
         if traj is None:
-            with self._tgt_lock:
-                return list(self._q_target)
+            return None
         waypoints, total_time, t_start = traj
         if now - t_start >= total_time:
-            q = list(waypoints[-1][1])
             with self._traj_lock:
                 if self._traj is traj:
                     self._traj = None
             self._traj_done.set()
-        else:
-            q = self._interp(waypoints, now - t_start)
-        with self._tgt_lock:
-            self._q_target = q
-        return q
+            return list(waypoints[-1][1])
+        return self._interp(waypoints, now - t_start)
 
     def _control_loop(self) -> None:
         self._js_ready.wait()
@@ -527,21 +514,19 @@ class URServoController(Node):
             # step duration = real cycle time so velocity == planned/commanded
             # (clamp only extreme outliers; never below dt, which would spike it).
             step_t = _clamp(0.002, 0.5, dt)
-            with self._traj_lock:
-                jogging = self._traj is None and now < self._servo_active_until
-            if jogging:
-                # speedj velocity control from MoveIt Servo (smooth, direct jog).
-                # Keep the hold target pinned to the MEASURED pose so that when
-                # jogging stops, servoj holds where the robot actually is — no
-                # snap-back to a stale commanded position.
+            q_traj = self._traj_target(now)
+            if q_traj is not None:
+                # planned move: servoj to the interpolated position.
+                pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
+            elif now < self._servo_active_until:
+                # jogging: speedj to MoveIt Servo's joint velocity.
                 with self._tgt_lock:
                     qd = list(self._qd_target)
-                    self._q_target = list(self._q_actual)
                 pkt = _pack(qd, MODE_SPEEDJ, self._gain, self._lookahead, step_t)
             else:
-                # servoj position control for planned moves and hold.
-                pkt = _pack(self._next_target(now), MODE_SERVOJ,
-                            self._gain, self._lookahead, step_t)
+                # idle: speedj(0) — the robot holds its own position, so there's
+                # no commanded target to snap back to after a jog.
+                pkt = _pack(_ZERO6, MODE_SPEEDJ, self._gain, self._lookahead, step_t)
             try:
                 conn.sendall(pkt)
                 if first:

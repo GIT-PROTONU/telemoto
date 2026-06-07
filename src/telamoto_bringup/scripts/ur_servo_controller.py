@@ -25,7 +25,8 @@ So this node:
      (50002) and, because this robot's URCap Custom Port is set to the reverse
      port, also on REVERSE_PORT (50001) via a first-bytes peek.
   2. Reverse server on REVERSE_PORT — the running URScript connects back here
-     and we stream 8×int32 packets that the robot feeds to servoj().
+     and pulls one target per servoj cycle (it requests, we reply) so motion
+     is gap-free (no vibration) with no backlog.
   3. Start it by pressing Play on the pendant. A real GUI compile makes the
      URCap re-fetch our script; a dashboard "play" would reuse its cached copy,
      so dashboard auto-play is intentionally not implemented.
@@ -75,16 +76,17 @@ SCRIPT_SENDER_PORT = 50002   # External Control URCap requests the script here
 MULT               = 1_000_000
 MODE_SERVOJ        = 1
 TIMEOUT_MS         = 200      # robot counts a missed read if no packet for this long
-STEP_TIME          = 0.010   # 100 Hz send — deliberately a touch SLOWER than the
-                             # robot's servoj consume rate so packets never back up
-                             # in the TCP buffer (a backlog caused growing lag and
-                             # the robot "stopping" until the program was re-played).
 
 # Control URScript served on request_program. The "# HEADER_*" anchors are
 # mandatory: the URCap splits global definitions (header) from the body it
 # injects at the program node; we keep the header empty and the body
-# self-contained. A single missed read is NOT a disconnect (the non-realtime
-# sender can stall briefly) — the body only exits after ~10 s of real silence.
+# self-contained.
+#
+# ROBOT-PACED protocol: each cycle the robot SENDS a 4-byte request, then reads
+# the reply and servoj()s to it. The PC replies with the freshest target only
+# when asked. This keeps servoj running back-to-back (no stop-start gap = no
+# vibration) and guarantees one reply per cycle (no TCP backlog/lag). A single
+# missed read is tolerated; the body exits after ~10 s of real silence.
 _URSCRIPT = """\
 # HEADER_BEGIN
 # telamoto external control — no global definitions required
@@ -95,6 +97,7 @@ read_timeout = 0
 misses = 0
 keep_going = True
 while keep_going:
+  socket_send_int(1, "reverse_socket")
   p = socket_read_binary_integer(10, "reverse_socket", read_timeout)
   if p[0] > 0:
     misses = 0
@@ -193,10 +196,9 @@ class URServoController(Node):
         self.declare_parameter("robot_ip",          "192.168.10.2")
         self.declare_parameter("reverse_port",       REVERSE_PORT)
         self.declare_parameter("script_sender_port", SCRIPT_SENDER_PORT)
-        # servoj_time is baked into the served script (it's coupled to the
-        # STEP_TIME send rate — keep it below STEP_TIME so the robot never backs
-        # up). Changing it takes effect on the next Play.
-        self.declare_parameter("servoj_time", 0.008)
+        # servoj_time = how long each servoj runs (and thus the robot's pull
+        # cadence). Baked into the served script, so changing it needs a re-Play.
+        self.declare_parameter("servoj_time", 0.010)
         # gain (stiffness) and lookahead (smoothness) are streamed in every
         # packet — tune them LIVE from the web UI (http://<pc>:8080, or
         # `pixi run tune`); effect on the next servoj cycle.
@@ -429,9 +431,9 @@ class URServoController(Node):
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
                 # This robot's URCap Custom Port == the reverse port, so a
-                # request_program may arrive here too. Peek: a script request is
-                # text; the robot's reverse connection sends nothing first (it
-                # waits to read), so the peek times out.
+                # request_program (text) may arrive here too. Peek the first
+                # bytes: the URCap sends "request_program"; the robot's control
+                # script sends a binary request int. Disambiguate by content.
                 is_request = False
                 try:
                     conn.settimeout(2.0)
@@ -449,31 +451,33 @@ class URServoController(Node):
                         self.get_logger().warn(f"[script] serve on reverse port failed: {exc}")
                     continue
 
-                conn.settimeout(None)
                 self.get_logger().info(f"[server] robot connected from {addr[0]}")
                 with self._conn_lock:
                     old, self._conn = self._conn, conn
                 if old:
                     try: old.close()
                     except Exception: pass
-                threading.Thread(target=self._watch_connection, args=(conn,), daemon=True).start()
+                # The control loop owns this socket now (reads requests, replies).
             except Exception as exc:
                 if rclpy.ok():
                     self.get_logger().warn(f"[server] accept error: {exc}")
 
-    def _watch_connection(self, conn: socket.socket) -> None:
-        """Block until the robot closes the reverse socket, then mark it gone.
-        The program ends when the URScript exits, so recovery is a manual Play
-        on the pendant (which re-fetches a fresh script)."""
-        try:
-            conn.settimeout(None)
-            while conn.recv(256):
-                pass
-        except Exception:
-            pass
+    @staticmethod
+    def _recvall(conn: socket.socket, n: int) -> bytes | None:
+        buf = b""
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _drop(self, conn: socket.socket) -> None:
         with self._conn_lock:
             if self._conn is conn:
                 self._conn = None
+        try: conn.close()
+        except Exception: pass
         self.get_logger().warn("[server] robot disconnected — press Play on the pendant to resume")
 
     # ── 125 Hz control loop (single timing authority) ───────────────────────────
@@ -505,34 +509,48 @@ class URServoController(Node):
                 for j in range(6)]
 
     def _control_loop(self) -> None:
+        """Robot-paced: wait for the robot's 4-byte request, then reply with the
+        freshest target. One reply per request → servoj runs back-to-back (no
+        vibration) and the TCP buffer never backs up (no lag)."""
         self._js_ready.wait()
         first_packet = True
-        next_t = time.monotonic()
-        # Loop-health diagnostics: report cadence every 5 s (healthy ≈ 500
-        # ticks/5s at 100 Hz, 0 late, max gap ≈ STEP_TIME).
-        last_tick = next_t
-        health_t  = next_t
-        ticks = overruns = 0
+        health_t = last_req = time.monotonic()
+        cycles = 0
         max_gap = 0.0
         while rclpy.ok():
+            with self._conn_lock:
+                conn = self._conn
+            if conn is None:
+                first_packet = True
+                time.sleep(0.01)
+                continue
+
+            # Block until the robot asks for the next target.
+            try:
+                conn.settimeout(1.0)
+                req = self._recvall(conn, 4)
+            except socket.timeout:
+                continue
+            except Exception:
+                self._drop(conn)
+                continue
+            if req is None:
+                self._drop(conn)
+                continue
+
             now = time.monotonic()
-            gap = now - last_tick
-            last_tick = now
-            ticks += 1
-            max_gap = max(max_gap, gap)
-            if gap > STEP_TIME * 1.5:
-                overruns += 1
+            cycles += 1
+            max_gap = max(max_gap, now - last_req)
+            last_req = now
             if now - health_t >= 5.0:
                 self.get_logger().info(
-                    f"[ctrl] rate health: {ticks} ticks/5s, {overruns} late, "
-                    f"max gap {max_gap * 1000:.1f}ms"
+                    f"[ctrl] rate health: {cycles} cycles/5s, max gap {max_gap * 1000:.1f}ms"
                 )
-                ticks = overruns = 0
+                cycles = 0
                 max_gap = 0.0
                 health_t = now
 
-            # Interpolate the active trajectory here (not in a second loop) so
-            # timing stays uniform; otherwise hold the last target.
+            # Compute the target for this exact wall-clock moment.
             with self._traj_lock:
                 traj = self._traj
             if traj is not None:
@@ -553,27 +571,13 @@ class URServoController(Node):
                 with self._tgt_lock:
                     q = list(self._q_target)
 
-            with self._conn_lock:
-                conn = self._conn
-            if conn is not None:
-                try:
-                    conn.sendall(_pack(q, self._servoj_gain, self._servoj_lookahead))
-                    if first_packet:
-                        first_packet = False
-                        self.get_logger().info("[ctrl] first packet sent to robot")
-                except Exception:
-                    with self._conn_lock:
-                        if self._conn is conn:
-                            self._conn = None
-                    first_packet = True
-                    self.get_logger().warn("[ctrl] send failed — connection lost")
-
-            next_t += STEP_TIME
-            delay = next_t - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_t = time.monotonic()
+            try:
+                conn.sendall(_pack(q, self._servoj_gain, self._servoj_lookahead))
+                if first_packet:
+                    first_packet = False
+                    self.get_logger().info("[ctrl] streaming to robot")
+            except Exception:
+                self._drop(conn)
 
     # ── FollowJointTrajectory action ────────────────────────────────────────────
 
@@ -626,8 +630,15 @@ class URServoController(Node):
         self.get_logger().info(
             f"[exec] {len(waypoints)}-pt traj, {total_time:.2f} s, robot connected={connected}"
         )
+        # The control loop only advances the trajectory while the robot is
+        # connected and pulling, so refuse a move we can't actually execute
+        # rather than hang the action.
         if not connected:
             self.get_logger().warn("[exec] robot not connected — press Play on the pendant")
+            goal_handle.abort()
+            r = FollowJointTrajectory.Result()
+            r.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+            return r
 
         # Hand the trajectory to the control loop and wait for it to finish.
         self._traj_done.clear()
@@ -641,6 +652,16 @@ class URServoController(Node):
                 goal_handle.canceled()
                 self.get_logger().info("[exec] trajectory canceled")
                 return FollowJointTrajectory.Result()
+            with self._conn_lock:
+                still_connected = self._conn is not None
+            if not still_connected:
+                with self._traj_lock:
+                    self._traj = None
+                self.get_logger().warn("[exec] robot disconnected mid-move — aborting")
+                goal_handle.abort()
+                r = FollowJointTrajectory.Result()
+                r.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+                return r
             if not rclpy.ok():
                 return FollowJointTrajectory.Result()
 

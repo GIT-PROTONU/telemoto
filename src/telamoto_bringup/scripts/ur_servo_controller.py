@@ -247,9 +247,10 @@ class URServoController(Node):
         self._jog_mode = False                         # web toggle: stay in velocity mode
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
-        self._dbg_last_seq = None                       # diagnostics: detect missed POSTs
-        self._dbg_pub_nz = False
-        self._dbg_servo_nz = False
+        self._last_seq = -1                             # ordering: ignore stale POSTs
+        self._dbg_pub_nz = False                        # diagnostics
+        self._dbg_rx = self._dbg_gaps = self._dbg_stale = 0
+        self._dbg_log_t = 0.0
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
@@ -292,18 +293,21 @@ class URServoController(Node):
         ax = lambda k: _clamp(-1.0, 1.0, float(q.get(k, ["0"])[0]))
         twist = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
                  JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
-        # Diagnostics: every POST is logged with its seq; a jump in seq = a
-        # dropped/lost web command.
         try:
             seq = int(q.get("seq", ["-1"])[0])
         except ValueError:
             seq = -1
-        gap = ""
-        if self._dbg_last_seq is not None and seq != self._dbg_last_seq + 1:
-            gap = f"  <-- GAP (missed {seq - self._dbg_last_seq - 1})"
-        self._dbg_last_seq = seq
-        self.get_logger().info(
-            f"[jog] rx seq={seq} dir=({twist[0]:+.2f},{twist[1]:+.2f},{twist[2]:+.2f}){gap}")
+        # Per-fetch POSTs can race and arrive out of order. Apply only newer
+        # commands (latest intent wins); ignore stale ones so a non-zero never
+        # lands after the zero from a key release. A big backwards jump = page
+        # reload, so accept it.
+        if 0 <= seq <= self._last_seq and seq > self._last_seq - 50:
+            self._dbg_stale += 1
+            return
+        if self._last_seq >= 0 and seq > self._last_seq + 1:
+            self._dbg_gaps += seq - self._last_seq - 1
+        self._last_seq = seq
+        self._dbg_rx += 1
         # Lease model: this command sets the twist and is valid for JOG_LEASE.
         # A zero command (key release) stops instantly; if commands stop arriving
         # (latency/drop/crash) the lease expires and the jog loop zeroes it.
@@ -333,10 +337,6 @@ class URServoController(Node):
         with self._tgt_lock:
             self._qd_target = qd
         self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
-        nz = any(abs(v) > 1e-4 for v in qd)                  # diagnostics
-        if nz != self._dbg_servo_nz:
-            self._dbg_servo_nz = nz
-            self.get_logger().info(f"[jog] servo velocity output {'ON' if nz else 'off'}")
 
     def _arm_servo(self) -> None:
         # Put MoveIt Servo in TWIST mode up front so even a quick tap is acted on
@@ -357,14 +357,24 @@ class URServoController(Node):
         self._arm_servo()
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
-            if time.monotonic() >= self._jog_lease:           # lease expired → stop
+            now = time.monotonic()
+            if now >= self._jog_lease:                        # lease expired → stop
                 self._jog = _ZERO6
-            if not self._jog_mode:
-                continue                                      # velocity mode off
-            pub_nz = any(self._jog)                           # diagnostics
+            # Lightweight diagnostics: a sparse on/off line + a 2 s summary, so
+            # the realtime control loop isn't starved by per-command logging.
+            pub_nz = any(self._jog)
             if pub_nz != self._dbg_pub_nz:
                 self._dbg_pub_nz = pub_nz
-                self.get_logger().info(f"[jog] publishing twist {'ON' if pub_nz else 'off'}")
+                self.get_logger().info(f"[jog] {'moving' if pub_nz else 'stopped'}")
+            if now - self._dbg_log_t >= 2.0:
+                if self._dbg_rx or self._dbg_stale or self._dbg_gaps:
+                    self.get_logger().info(
+                        f"[jog] 2s: {self._dbg_rx} cmds, {self._dbg_gaps} dropped, "
+                        f"{self._dbg_stale} out-of-order")
+                self._dbg_rx = self._dbg_gaps = self._dbg_stale = 0
+                self._dbg_log_t = now
+            if not self._jog_mode:
+                continue                                      # velocity mode off
             # Stream the twist (zero when idle, active on a key) the WHOLE time
             # jog mode is on, so Servo + speedj stay warm and taps are instant.
             m = TwistStamped()

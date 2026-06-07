@@ -56,17 +56,16 @@ GAIN_MIN, GAIN_MAX           = 100, 2000
 LOOKAHEAD_MIN, LOOKAHEAD_MAX = 0.03, 0.2
 SPEED_MIN, SPEED_MAX         = 0.25, 3.0
 
-# WASD jogging via MoveIt Servo. Web sends per-axis direction in [-1,1]; we
-# scale to these speeds and publish a TwistStamped in JOG_FRAME. The robot
-# stops if no jog command arrives within JOG_DEADMAN (browser-crash safety).
+# WASD jogging via MoveIt Servo. The web streams per-axis direction in [-1,1]
+# at ~30 Hz while a key is held; we scale to these speeds and publish a
+# TwistStamped in JOG_FRAME. Each command leases the twist for JOG_LEASE.
 JOG_LINEAR  = 0.12          # m/s at full axis
 JOG_ANGULAR = 0.5           # rad/s at full axis
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
-JOG_DEADMAN = 0.3           # s — stop if no jog command arrives within this
-JOG_MIN_TIME = 0.3          # s — keep jogging at least this long after a press so
-                            # a quick tap still produces a step (speedj/Servo need
-                            # time to ramp). Bigger = larger tap step.
+JOG_LEASE   = 0.1           # s — each jog command is a lease; if no new command
+                            # arrives within this the robot stops (latency/drop
+                            # safety + instant stop on key release)
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -162,21 +161,23 @@ _WEB_PAGE = """<!doctype html>
    refreshStatus();setInterval(refreshStatus,2000);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
- // WASD jog
- let jogOn=false; const held=new Set(); let hb=null;
+ // WASD jog: stream the twist at 30 Hz while a key is held, zero on release.
+ let jogOn=false; const held=new Set(); let stream=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
  function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
    ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
  function sendJog(){const v=jogVec();
    fetch("/api/jog?seq="+(++jseq)+"&lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
- function stopJog(){held.clear();if(hb){clearInterval(hb);hb=null;}sendJog();}
+ function startStream(){if(!stream)stream=setInterval(sendJog,33);}   // ~30 Hz
+ function stopAll(){held.clear();if(stream){clearInterval(stream);stream=null;}sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
-   fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(!jogOn)stopJog();});
+   fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(!jogOn)stopAll();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
-   if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();if(!hb)hb=setInterval(sendJog,100);}});
+   if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
  document.addEventListener("keyup",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
-   if(held.has(k)){held.delete(k);sendJog();if(held.size===0&&hb){clearInterval(hb);hb=null;}}});
- window.addEventListener("blur",()=>{if(jogOn)stopJog();});
+   if(held.has(k)){held.delete(k);
+     if(held.size===0){clearInterval(stream);stream=null;sendJog();}else sendJog();}});
+ window.addEventListener("blur",()=>{if(jogOn)stopAll();});
  init();
 </script>
 </body></html>
@@ -237,14 +238,12 @@ class URServoController(Node):
         self._conn: socket.socket | None = None       # live reverse socket
         self._conn_lock = threading.Lock()
 
-        # WASD jog (MoveIt Servo): _jog is the desired twist sent to Servo.
-        # _jog_deadline = crash deadman; _press_start/_stop_at enforce a minimum
-        # jog time so a quick tap still moves. _qd_target is Servo's joint
+        # WASD jog (MoveIt Servo): the web streams the desired twist at ~30 Hz
+        # while a key is held; each command leases the twist for JOG_LEASE, so it
+        # zeroes itself on release / latency / drop. _qd_target is Servo's joint
         # velocity, streamed as speedj while jogging.
         self._jog = [0.0] * 6
-        self._jog_deadline = 0.0
-        self._press_start = None
-        self._stop_at = 0.0
+        self._jog_lease = 0.0                          # twist valid until this time
         self._jog_mode = False                         # web toggle: stay in velocity mode
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
@@ -305,18 +304,11 @@ class URServoController(Node):
         self._dbg_last_seq = seq
         self.get_logger().info(
             f"[jog] rx seq={seq} dir=({twist[0]:+.2f},{twist[1]:+.2f},{twist[2]:+.2f}){gap}")
-        now = time.monotonic()
-        self._jog_deadline = now + JOG_DEADMAN          # crash deadman
-        if any(twist):                                  # key down / held heartbeat
-            if self._press_start is None:
-                self._press_start = now
-            self._jog = twist
-            self._stop_at = float("inf")
-        elif self._press_start is not None:             # release
-            # keep moving until at least JOG_MIN_TIME after the press began, so a
-            # quick tap still steps (no-op extension if the key was held longer).
-            self._stop_at = max(now, self._press_start + JOG_MIN_TIME)
-            self._press_start = None
+        # Lease model: this command sets the twist and is valid for JOG_LEASE.
+        # A zero command (key release) stops instantly; if commands stop arriving
+        # (latency/drop/crash) the lease expires and the jog loop zeroes it.
+        self._jog = twist
+        self._jog_lease = time.monotonic() + JOG_LEASE
 
     def _web_jogmode(self, q: dict) -> None:
         self._jog_mode = q.get("on", ["0"])[0] in ("1", "true", "on")
@@ -365,9 +357,8 @@ class URServoController(Node):
         self._arm_servo()
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
-            now = time.monotonic()
-            if now >= self._stop_at or now >= self._jog_deadline:
-                self._jog = _ZERO6                            # min-window done / crash deadman
+            if time.monotonic() >= self._jog_lease:           # lease expired → stop
+                self._jog = _ZERO6
             if not self._jog_mode:
                 continue                                      # velocity mode off
             pub_nz = any(self._jog)                           # diagnostics

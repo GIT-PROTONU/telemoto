@@ -63,7 +63,10 @@ JOG_LINEAR  = 0.12          # m/s at full axis
 JOG_ANGULAR = 0.5           # rad/s at full axis
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
-JOG_DEADMAN = 0.3           # s
+JOG_DEADMAN = 0.3           # s — stop if no jog command arrives within this
+JOG_MIN_TIME = 0.15         # s — keep jogging at least this long after a press so
+                            # a quick tap still produces a step (speedj/Servo need
+                            # time to ramp). Bigger = larger tap step.
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -232,10 +235,14 @@ class URServoController(Node):
         self._conn: socket.socket | None = None       # live reverse socket
         self._conn_lock = threading.Lock()
 
-        # WASD jog (MoveIt Servo): _jog is the desired twist, valid until _jog_deadline;
-        # _qd_target is Servo's joint velocity, streamed as speedj while jogging.
+        # WASD jog (MoveIt Servo): _jog is the desired twist sent to Servo.
+        # _jog_deadline = crash deadman; _press_start/_stop_at enforce a minimum
+        # jog time so a quick tap still moves. _qd_target is Servo's joint
+        # velocity, streamed as speedj while jogging.
         self._jog = [0.0] * 6
         self._jog_deadline = 0.0
+        self._press_start = None
+        self._stop_at = 0.0
         self._servo_started = False
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
@@ -279,9 +286,20 @@ class URServoController(Node):
 
     def _web_jog(self, q: dict) -> None:
         ax = lambda k: _clamp(-1.0, 1.0, float(q.get(k, ["0"])[0]))
-        self._jog = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
-                     JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
-        self._jog_deadline = time.monotonic() + JOG_DEADMAN
+        twist = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
+                 JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
+        now = time.monotonic()
+        self._jog_deadline = now + JOG_DEADMAN          # crash deadman
+        if any(twist):                                  # key down / held heartbeat
+            if self._press_start is None:
+                self._press_start = now
+            self._jog = twist
+            self._stop_at = float("inf")
+        elif self._press_start is not None:             # release
+            # keep moving until at least JOG_MIN_TIME after the press began, so a
+            # quick tap still steps (no-op extension if the key was held longer).
+            self._stop_at = max(now, self._press_start + JOG_MIN_TIME)
+            self._press_start = None
 
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
@@ -305,7 +323,10 @@ class URServoController(Node):
         self._js_ready.wait()
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
-            if time.monotonic() >= self._jog_deadline or not any(self._jog):
+            now = time.monotonic()
+            if now >= self._stop_at:                          # min-jog window elapsed
+                self._jog = _ZERO6
+            if now >= self._jog_deadline or not any(self._jog):
                 continue
             if not self._servo_started:                       # one-time: select TWIST mode
                 if not self._servo_cli.service_is_ready():

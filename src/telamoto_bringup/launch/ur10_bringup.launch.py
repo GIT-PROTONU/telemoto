@@ -69,6 +69,11 @@ def launch_setup(context, *args, **kwargs):
         launch_arguments={
             "ur_type":     "ur10",
             "launch_rviz": "false",
+            # ur_moveit.launch.py references this LaunchConfiguration from an
+            # OpaqueFunction; its DeclareLaunchArgument default is not applied
+            # when included, so pass it explicitly or the include throws
+            # "launch configuration 'warehouse_sqlite_path' does not exist".
+            "warehouse_sqlite_path": os.path.expanduser("~/.ros/warehouse_ros.sqlite"),
         }.items(),
     )
 

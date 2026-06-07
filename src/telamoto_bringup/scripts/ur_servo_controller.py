@@ -29,6 +29,8 @@ So this node:
   3. Start it by pressing Play on the pendant. A real GUI compile makes the
      URCap re-fetch our script; a dashboard "play" would reuse its cached copy,
      so dashboard auto-play is intentionally not implemented.
+  4. Serves a tiny web UI (port 8080) to tune motion live — Speed (trajectory
+     time-scale), Stiffness (servoj gain) and Smoothness (servoj lookahead).
 
 Packet format — 10 × int32 big-endian
   params[0]      count          always 10 (prepended by the URScript runtime)
@@ -38,10 +40,13 @@ Packet format — 10 × int32 big-endian
   params[9]      servoj gain               live-tunable (rqt_reconfigure)
   params[10]     servoj lookahead × 1000   live-tunable, milliseconds
 """
+import json
 import socket
 import struct
 import threading
 import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -54,9 +59,11 @@ from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
 )
 
-# servoj safe ranges (UR servoj limits) used for clamping + rqt_reconfigure sliders.
+# servoj safe ranges (UR servoj limits) used for clamping + the web sliders.
 GAIN_MIN, GAIN_MAX           = 100, 2000
 LOOKAHEAD_MIN, LOOKAHEAD_MAX = 0.03, 0.2
+SPEED_MIN, SPEED_MAX         = 0.25, 3.0   # time-scale of executed trajectories
+WEB_PORT                     = 8080
 
 UR_JOINT_ORDER = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
@@ -110,6 +117,64 @@ textmsg("telamoto: external control stopped")
 """
 
 
+_WEB_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telamoto motion tuning</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:1.2rem;max-width:560px;margin:auto}
+ h1{font-size:1.25rem;font-weight:600}
+ #status{font-size:.85rem;padding:.3rem .6rem;border-radius:.4rem;display:inline-block;margin-bottom:.5rem}
+ .ok{background:#13391b;color:#6ee787}.bad{background:#3a1414;color:#ff7b72}
+ .row{margin:1.5rem 0}
+ .row label{display:flex;justify-content:space-between;font-size:1.05rem;margin-bottom:.45rem}
+ .val{color:#4ea1ff;font-variant-numeric:tabular-nums}
+ input[type=range]{width:100%;height:2.2rem}
+ .hint{color:#888;font-size:.8rem;margin-top:.25rem}
+ button{background:#222;color:#eee;border:1px solid #444;border-radius:.5rem;padding:.6rem 1.1rem;font-size:.9rem;margin-top:.6rem}
+</style></head>
+<body>
+ <h1>Telamoto &mdash; motion tuning</h1>
+ <div id="status" class="bad">connecting&hellip;</div>
+ <div class="row">
+   <label>Speed <span class="val" id="speedv"></span></label>
+   <input type="range" id="speed" min="0.25" max="3" step="0.05">
+   <div class="hint">Overall move speed (also scales acceleration). Takes effect on the next move.</div>
+ </div>
+ <div class="row">
+   <label>Stiffness <span class="val" id="gainv"></span></label>
+   <input type="range" id="gain" min="100" max="2000" step="25">
+   <div class="hint">Higher = crisper/stiffer tracking, lower = softer. Live.</div>
+ </div>
+ <div class="row">
+   <label>Smoothness <span class="val" id="lookaheadv"></span></label>
+   <input type="range" id="lookahead" min="0.03" max="0.2" step="0.005">
+   <div class="hint">Higher = smoother but more lag; raise this if it buzzes. Live.</div>
+ </div>
+ <button onclick="reset()">Reset to defaults</button>
+<script>
+ const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
+ const ids=["speed","gain","lookahead"];
+ function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
+ function send(k){const v=document.getElementById(k).value;
+   document.getElementById(k+"v").textContent=fmt[k](v);
+   fetch("/api/set?"+k+"="+v,{method:"POST"});}
+ async function refreshStatus(){try{const s=await(await fetch("/api/state")).json();
+   const st=document.getElementById("status");
+   st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
+   st.className=s.connected?"ok":"bad";}catch(e){}}
+ async function init(){try{const s=await(await fetch("/api/state")).json();
+   ids.forEach(k=>show(k,s[k]));}catch(e){}
+   ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
+   refreshStatus(); setInterval(refreshStatus,2000);}
+ function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
+   fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
+ init();
+</script>
+</body></html>
+"""
+
+
 def _pack(q: list[float], gain: int, lookahead_s: float) -> bytes:
     return struct.pack(">10i",
         TIMEOUT_MS,
@@ -133,8 +198,8 @@ class URServoController(Node):
         # up). Changing it takes effect on the next Play.
         self.declare_parameter("servoj_time", 0.008)
         # gain (stiffness) and lookahead (smoothness) are streamed in every
-        # packet — tune them LIVE with `ros2 run rqt_reconfigure rqt_reconfigure`
-        # (sliders) or `ros2 param set`, effect on the next servoj cycle.
+        # packet — tune them LIVE from the web UI (http://<pc>:8080, or
+        # `pixi run tune`); effect on the next servoj cycle.
         self.declare_parameter(
             "servoj_gain", 300,
             ParameterDescriptor(
@@ -151,12 +216,19 @@ class URServoController(Node):
             ),
         )
 
+        # Overall speed: time-scale applied to executed trajectories (1.0 = as
+        # MoveIt planned). Lives in the controller so it works with RViz planning.
+        self.declare_parameter("speed_scale", 1.0)
+        self.declare_parameter("web_port", WEB_PORT)
+
         self._robot_ip    = self.get_parameter("robot_ip").get_parameter_value().string_value
         self._port        = self.get_parameter("reverse_port").get_parameter_value().integer_value
         self._sender_port = self.get_parameter("script_sender_port").get_parameter_value().integer_value
         self._servoj_time      = self.get_parameter("servoj_time").get_parameter_value().double_value
         self._servoj_gain      = self.get_parameter("servoj_gain").get_parameter_value().integer_value
         self._servoj_lookahead = self.get_parameter("servoj_lookahead").get_parameter_value().double_value
+        self._speed_scale      = self.get_parameter("speed_scale").get_parameter_value().double_value
+        self._web_port         = self.get_parameter("web_port").get_parameter_value().integer_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         # Gate: set when the first JointState arrives; the control loop waits on it.
@@ -190,6 +262,7 @@ class URServoController(Node):
         threading.Thread(target=self._script_sender_loop,  daemon=True, name="ri-script").start()
         threading.Thread(target=self._reverse_server_loop, daemon=True, name="ri-server").start()
         threading.Thread(target=self._control_loop,        daemon=True, name="ri-ctrl").start()
+        threading.Thread(target=self._web_loop,            daemon=True, name="ri-web").start()
 
         self.get_logger().info(
             f"URServoController: script sender :{self._sender_port}, reverse :{self._port}, "
@@ -200,16 +273,78 @@ class URServoController(Node):
 
     def _on_set_params(self, params) -> SetParametersResult:
         """gain/lookahead apply on the next servoj cycle (streamed in packets);
-        servoj_time only on the next Play (baked into the script)."""
+        speed on the next move; servoj_time on the next Play (baked into script)."""
         for p in params:
             if p.name == "servoj_gain":
                 self._servoj_gain = int(max(GAIN_MIN, min(GAIN_MAX, p.value)))
             elif p.name == "servoj_lookahead":
                 self._servoj_lookahead = float(max(LOOKAHEAD_MIN, min(LOOKAHEAD_MAX, p.value)))
+            elif p.name == "speed_scale":
+                self._speed_scale = float(max(SPEED_MIN, min(SPEED_MAX, p.value)))
             elif p.name == "servoj_time":
                 self._servoj_time = float(p.value)
                 self.get_logger().info("[tune] servoj_time set — re-Play to apply")
         return SetParametersResult(successful=True)
+
+    # ── Web tuning UI ───────────────────────────────────────────────────────────
+
+    def _web_state(self) -> dict:
+        with self._conn_lock:
+            connected = self._conn is not None
+        return {
+            "speed":     round(self._speed_scale, 2),
+            "gain":      self._servoj_gain,
+            "lookahead": round(self._servoj_lookahead, 3),
+            "connected": connected,
+        }
+
+    def _web_set(self, q: dict) -> None:
+        if "speed" in q:
+            self._speed_scale = max(SPEED_MIN, min(SPEED_MAX, float(q["speed"][0])))
+        if "gain" in q:
+            self._servoj_gain = int(max(GAIN_MIN, min(GAIN_MAX, float(q["gain"][0]))))
+        if "lookahead" in q:
+            self._servoj_lookahead = max(LOOKAHEAD_MIN, min(LOOKAHEAD_MAX, float(q["lookahead"][0])))
+
+    def _web_loop(self) -> None:
+        node = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def _send(self, code, body, ctype):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/api/state"):
+                    self._send(200, json.dumps(node._web_state()).encode(), "application/json")
+                else:
+                    self._send(200, _WEB_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+
+            def do_POST(self):
+                if self.path.startswith("/api/set"):
+                    try:
+                        node._web_set(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+                    except (ValueError, KeyError):
+                        pass
+                    self._send(200, b"ok", "text/plain")
+                else:
+                    self._send(404, b"not found", "text/plain")
+
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", self._web_port), Handler)
+        except Exception as exc:
+            self.get_logger().warn(f"[web] could not start on :{self._web_port}: {exc}")
+            return
+        self.get_logger().info(
+            f"[web] tuning UI at http://{self._pc_ip()}:{self._web_port}  (or http://localhost:{self._web_port})"
+        )
+        srv.serve_forever()
 
     # ── Joint states ───────────────────────────────────────────────────────────
 
@@ -475,6 +610,15 @@ class URServoController(Node):
             r = FollowJointTrajectory.Result()
             r.error_code = FollowJointTrajectory.Result.INVALID_JOINTS
             return r
+
+        # Apply the web "Speed" knob by time-scaling: compress time by `speed`
+        # and scale velocities by `speed` so the cubic interp stays consistent.
+        speed = max(SPEED_MIN, min(SPEED_MAX, self._speed_scale))
+        if abs(speed - 1.0) > 1e-3:
+            waypoints = [
+                (t / speed, q, [vi * speed for vi in v] if v else None)
+                for (t, q, v) in waypoints
+            ]
 
         total_time = waypoints[-1][0]
         with self._conn_lock:

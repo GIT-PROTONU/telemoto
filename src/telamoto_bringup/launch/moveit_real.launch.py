@@ -104,6 +104,10 @@ def generate_launch_description():
                 },
                 "publish_robot_description_semantic": True,
                 "use_sim_time": False,
+                # The web tuning UI time-scales executed trajectories (Speed
+                # slider). Don't abort when a slowed-down move takes longer than
+                # MoveIt planned.
+                "trajectory_execution.execution_duration_monitoring": False,
             },
         ],
     )

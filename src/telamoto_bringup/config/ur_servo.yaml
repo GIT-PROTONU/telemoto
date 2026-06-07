@@ -14,8 +14,8 @@ scale:                          # only used when command_in_type == unitless
 
 command_out_type: trajectory_msgs/JointTrajectory
 command_out_topic: /telamoto/servo_command
-publish_joint_positions: true
-publish_joint_velocities: false
+publish_joint_positions: true    # used to hold position when jogging stops
+publish_joint_velocities: true   # used as the speedj command while jogging
 publish_joint_accelerations: false
 
 # Smoothing needs a configured plugin; keep off for now (enable once verified).

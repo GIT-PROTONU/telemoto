@@ -46,7 +46,9 @@ UR_JOINT_ORDER = [
 REVERSE_PORT = 50001        # URCap requests the script here AND robot connects back
 WEB_PORT     = 8080
 MULT         = 1_000_000
-MODE_SERVOJ  = 1
+MODE_SERVOJ  = 1            # position control (planned moves, hold)
+MODE_SPEEDJ  = 2            # joint-velocity control (jogging)
+SPEEDJ_ACCEL = 8.0         # rad/s^2 — how fast speedj ramps to the commanded velocity
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
 GAIN_MIN, GAIN_MAX           = 100, 2000
@@ -75,6 +77,7 @@ textmsg("telamoto: external control active")
 socket_open("{host}", {port}, "reverse_socket")
 read_timeout = 0
 misses = 0
+last_mode = 0
 keep_going = True
 while keep_going:
   socket_send_int(1, "reverse_socket")
@@ -82,12 +85,20 @@ while keep_going:
   if p[0] > 0:
     misses = 0
     read_timeout = p[1] / 1000.0
+    last_mode = p[8]
     if p[8] == 1:
       q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
       servoj(q, t=p[11]/1000000.0, lookahead_time=p[10]/1000.0, gain=p[9])
+    elif p[8] == 2:
+      qd = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
+      speedj(qd, {accel}, p[11]/1000000.0)
     end
   else:
     misses = misses + 1
+    if last_mode == 2:
+      stopj(4.0)
+      last_mode = 0
+    end
     if misses > 50:
       keep_going = False
     end
@@ -166,11 +177,12 @@ _WEB_PAGE = """<!doctype html>
 """
 
 
-def _pack(q, gain, lookahead_s, t_s) -> bytes:
+def _pack(values, mode, gain, lookahead_s, t_s) -> bytes:
+    # `values` are joint positions (servoj) or joint velocities (speedj).
     return struct.pack(">11i",
         TIMEOUT_MS,
-        *[int(x * MULT) for x in q],
-        MODE_SERVOJ, int(gain),
+        *[int(x * MULT) for x in values],
+        mode, int(gain),
         int(round(lookahead_s * 1000)), int(round(t_s * 1_000_000)),
     )
 
@@ -224,6 +236,10 @@ class URServoController(Node):
         self._jog = [0.0] * 6
         self._jog_deadline = 0.0
         self._servo_started = False
+        # While Servo is publishing (jogging) the control loop sends speedj with
+        # _qd_target (joint velocities); otherwise servoj with _q_target.
+        self._qd_target = [0.0] * 6
+        self._servo_active_until = 0.0
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
@@ -271,19 +287,25 @@ class URServoController(Node):
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
     def _servo_cb(self, msg: JointTrajectory) -> None:
-        # Servo's joint command becomes our target — but only while jogging and
-        # not during a planned move (which the control loop prioritises anyway).
+        # Servo's joint command drives the jog — velocities for speedj, positions
+        # to seed the hold target when jogging stops. Ignored during planned
+        # moves (the control loop prioritises the trajectory anyway).
         with self._traj_lock:
             if self._traj is not None:
                 return
         if not msg.points:
             return
+        pt = msg.points[0]
+        names = list(msg.joint_names)
         try:
-            q = self._reorder(list(msg.joint_names), list(msg.points[0].positions))
+            q = self._reorder(names, list(pt.positions))
         except ValueError:
             return
+        qd = self._reorder(names, list(pt.velocities)) if pt.velocities else [0.0] * 6
         with self._tgt_lock:
             self._q_target = q
+            self._qd_target = qd
+        self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
 
     def _jog_loop(self) -> None:
         self._js_ready.wait()
@@ -373,7 +395,7 @@ class URServoController(Node):
 
     def _serve_script(self, conn, addr) -> None:
         host = self._pc_ip()
-        conn.sendall(_URSCRIPT.format(host=host, port=self._port).encode())
+        conn.sendall(_URSCRIPT.format(host=host, port=self._port, accel=SPEEDJ_ACCEL).encode())
         self.get_logger().info(f"[script] served to {addr[0]} (connect-back {host}:{self._port})")
 
     def _server_loop(self) -> None:
@@ -505,11 +527,22 @@ class URServoController(Node):
                     f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms")
                 cycles = 0; max_gap = 0.0; health_t = now
 
-            q = self._next_target(now)
-            # servoj duration = real cycle time → commanded velocity == planned
+            # step duration = real cycle time so velocity == planned/commanded
             # (clamp only extreme outliers; never below dt, which would spike it).
+            step_t = _clamp(0.002, 0.5, dt)
+            with self._traj_lock:
+                jogging = self._traj is None and now < self._servo_active_until
+            if jogging:
+                # speedj velocity control from MoveIt Servo (smooth, direct jog).
+                with self._tgt_lock:
+                    qd = list(self._qd_target)
+                pkt = _pack(qd, MODE_SPEEDJ, self._gain, self._lookahead, step_t)
+            else:
+                # servoj position control for planned moves and hold.
+                pkt = _pack(self._next_target(now), MODE_SERVOJ,
+                            self._gain, self._lookahead, step_t)
             try:
-                conn.sendall(_pack(q, self._gain, self._lookahead, _clamp(0.002, 0.5, dt)))
+                conn.sendall(pkt)
                 if first:
                     first = False
                     self.get_logger().info("[ctrl] streaming to robot")

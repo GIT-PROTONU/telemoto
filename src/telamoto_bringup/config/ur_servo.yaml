@@ -3,8 +3,8 @@
 # Drives WASD jogging: servo_node receives TwistStamped on ~/delta_twist_cmds
 # and publishes a JointTrajectory the ur_servo_controller feeds into its stream.
 
-publish_period: 0.01            # servo output rate [s]
-max_expected_latency: 0.1
+publish_period: 0.004           # servo output rate [s] — faster = lower latency
+max_expected_latency: 0.03
 
 command_in_type: "speed_units"  # twist values are m/s and rad/s
 scale:                          # only used when command_in_type == unitless

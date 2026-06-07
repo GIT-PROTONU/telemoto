@@ -250,6 +250,7 @@ class URServoController(Node):
         self._jog = [0.0] * 6
         self._jog_lease = 0.0                          # twist valid until this time
         self._jog_mode = False                         # web toggle: stay in velocity mode
+        self._pub_lock = threading.Lock()              # serialise twist publishes
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
         self._dbg_pub_nz = False                        # diagnostics
@@ -307,6 +308,18 @@ class URServoController(Node):
                      JOG_LINEAR * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
         self._jog_lease = time.monotonic() + JOG_LEASE
         self._dbg_rx += 1
+        self._publish_twist()                       # publish NOW, don't wait for the loop
+
+    def _publish_twist(self) -> None:
+        if not self._jog_mode:
+            return
+        m = TwistStamped()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = JOG_FRAME
+        m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog[0:3]
+        m.twist.angular.x, m.twist.angular.y, m.twist.angular.z = self._jog[3:6]
+        with self._pub_lock:
+            self._twist_pub.publish(m)
 
     def _web_jogmode(self, q: dict) -> None:
         self._jog_mode = q.get("on", ["0"])[0] in ("1", "true", "on")
@@ -365,16 +378,10 @@ class URServoController(Node):
                     self.get_logger().info(f"[jog] 2s: {self._dbg_rx} ws cmds")
                 self._dbg_rx = 0
                 self._dbg_log_t = now
-            if not self._jog_mode:
-                continue                                      # velocity mode off
-            # Stream the twist (zero when idle, active on a key) the WHOLE time
-            # jog mode is on, so Servo + speedj stay warm and taps are instant.
-            m = TwistStamped()
-            m.header.stamp = self.get_clock().now().to_msg()
-            m.header.frame_id = JOG_FRAME
-            m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog[0:3]
-            m.twist.angular.x, m.twist.angular.y, m.twist.angular.z = self._jog[3:6]
-            self._twist_pub.publish(m)
+            # Background publisher: keeps Servo warm when idle and re-publishes
+            # the zero on lease expiry. Active commands are published instantly in
+            # _apply_jog, so this is just the steady fallback stream.
+            self._publish_twist()
 
     def _web_loop(self) -> None:
         node = self

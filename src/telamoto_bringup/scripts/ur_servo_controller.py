@@ -30,11 +30,13 @@ So this node:
      URCap re-fetch our script; a dashboard "play" would reuse its cached copy,
      so dashboard auto-play is intentionally not implemented.
 
-Packet format — 8 × int32 big-endian
-  params[0]     count          always 8 (prepended by the URScript runtime)
-  params[1]     timeout_ms     robot sets read_timeout = this / 1000.0
-  params[2..7]  q[0..5] × MULT
-  params[8]     control_mode   1 == MODE_SERVOJ
+Packet format — 10 × int32 big-endian
+  params[0]      count          always 10 (prepended by the URScript runtime)
+  params[1]      timeout_ms     robot sets read_timeout = this / 1000.0
+  params[2..7]   q[0..5] × MULT
+  params[8]      control_mode   1 == MODE_SERVOJ
+  params[9]      servoj gain               live-tunable (rqt_reconfigure)
+  params[10]     servoj lookahead × 1000   live-tunable, milliseconds
 """
 import socket
 import struct
@@ -48,6 +50,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
+from rcl_interfaces.msg import (
+    FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
+)
+
+# servoj safe ranges (UR servoj limits) used for clamping + rqt_reconfigure sliders.
+GAIN_MIN, GAIN_MAX           = 100, 2000
+LOOKAHEAD_MIN, LOOKAHEAD_MAX = 0.03, 0.2
 
 UR_JOINT_ORDER = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
@@ -79,13 +88,15 @@ read_timeout = 0
 misses = 0
 keep_going = True
 while keep_going:
-  p = socket_read_binary_integer(8, "reverse_socket", read_timeout)
+  p = socket_read_binary_integer(10, "reverse_socket", read_timeout)
   if p[0] > 0:
     misses = 0
     read_timeout = p[1] / 1000.0
     if p[8] == 1:
       q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
-      servoj(q, t={servoj_time}, lookahead_time={lookahead}, gain={gain})
+      # gain (p[9]) and lookahead (p[10] ms) are streamed live so they can be
+      # tuned from the PC without re-playing the program.
+      servoj(q, t={servoj_time}, lookahead_time=p[10]/1000.0, gain=p[9])
     end
   else:
     misses = misses + 1
@@ -99,12 +110,14 @@ textmsg("telamoto: external control stopped")
 """
 
 
-def _pack(q: list[float]) -> bytes:
-    return struct.pack(">8i",
+def _pack(q: list[float], gain: int, lookahead_s: float) -> bytes:
+    return struct.pack(">10i",
         TIMEOUT_MS,
         int(q[0] * MULT), int(q[1] * MULT), int(q[2] * MULT),
         int(q[3] * MULT), int(q[4] * MULT), int(q[5] * MULT),
         MODE_SERVOJ,
+        int(gain),
+        int(round(lookahead_s * 1000)),
     )
 
 
@@ -115,20 +128,36 @@ class URServoController(Node):
         self.declare_parameter("robot_ip",          "192.168.10.2")
         self.declare_parameter("reverse_port",       REVERSE_PORT)
         self.declare_parameter("script_sender_port", SCRIPT_SENDER_PORT)
-        # servoj tuning, baked into the served script. Keep servoj_time below the
-        # STEP_TIME send interval so the robot consumes at least as fast as we
-        # send (no backlog). Higher gain = crisper tracking; higher lookahead =
-        # smoother but laggier.
-        self.declare_parameter("servoj_time",      0.008)
-        self.declare_parameter("servoj_lookahead", 0.1)
-        self.declare_parameter("servoj_gain",      300)
+        # servoj_time is baked into the served script (it's coupled to the
+        # STEP_TIME send rate — keep it below STEP_TIME so the robot never backs
+        # up). Changing it takes effect on the next Play.
+        self.declare_parameter("servoj_time", 0.008)
+        # gain (stiffness) and lookahead (smoothness) are streamed in every
+        # packet — tune them LIVE with `ros2 run rqt_reconfigure rqt_reconfigure`
+        # (sliders) or `ros2 param set`, effect on the next servoj cycle.
+        self.declare_parameter(
+            "servoj_gain", 300,
+            ParameterDescriptor(
+                description="servoj proportional gain / stiffness (live)",
+                integer_range=[IntegerRange(from_value=GAIN_MIN, to_value=GAIN_MAX, step=10)],
+            ),
+        )
+        self.declare_parameter(
+            "servoj_lookahead", 0.1,
+            ParameterDescriptor(
+                description="servoj lookahead time, seconds; higher = smoother/laggier (live)",
+                floating_point_range=[FloatingPointRange(
+                    from_value=LOOKAHEAD_MIN, to_value=LOOKAHEAD_MAX, step=0.005)],
+            ),
+        )
 
         self._robot_ip    = self.get_parameter("robot_ip").get_parameter_value().string_value
         self._port        = self.get_parameter("reverse_port").get_parameter_value().integer_value
         self._sender_port = self.get_parameter("script_sender_port").get_parameter_value().integer_value
         self._servoj_time      = self.get_parameter("servoj_time").get_parameter_value().double_value
-        self._servoj_lookahead = self.get_parameter("servoj_lookahead").get_parameter_value().double_value
         self._servoj_gain      = self.get_parameter("servoj_gain").get_parameter_value().integer_value
+        self._servoj_lookahead = self.get_parameter("servoj_lookahead").get_parameter_value().double_value
+        self.add_on_set_parameters_callback(self._on_set_params)
 
         # Gate: set when the first JointState arrives; the control loop waits on it.
         self._js_ready = threading.Event()
@@ -166,6 +195,21 @@ class URServoController(Node):
             f"URServoController: script sender :{self._sender_port}, reverse :{self._port}, "
             f"robot at {self._robot_ip} — press Play on the pendant to start"
         )
+
+    # ── Live tuning ─────────────────────────────────────────────────────────────
+
+    def _on_set_params(self, params) -> SetParametersResult:
+        """gain/lookahead apply on the next servoj cycle (streamed in packets);
+        servoj_time only on the next Play (baked into the script)."""
+        for p in params:
+            if p.name == "servoj_gain":
+                self._servoj_gain = int(max(GAIN_MIN, min(GAIN_MAX, p.value)))
+            elif p.name == "servoj_lookahead":
+                self._servoj_lookahead = float(max(LOOKAHEAD_MIN, min(LOOKAHEAD_MAX, p.value)))
+            elif p.name == "servoj_time":
+                self._servoj_time = float(p.value)
+                self.get_logger().info("[tune] servoj_time set — re-Play to apply")
+        return SetParametersResult(successful=True)
 
     # ── Joint states ───────────────────────────────────────────────────────────
 
@@ -205,13 +249,10 @@ class URServoController(Node):
             return s.getsockname()[0]
 
     def _serve_script(self, conn: socket.socket, addr) -> None:
+        # gain/lookahead are streamed per-packet (live), so only servoj_time is
+        # baked into the script here.
         host   = self._pc_ip()
-        script = _URSCRIPT.format(
-            host=host, port=self._port,
-            servoj_time=self._servoj_time,
-            lookahead=self._servoj_lookahead,
-            gain=self._servoj_gain,
-        )
+        script = _URSCRIPT.format(host=host, port=self._port, servoj_time=self._servoj_time)
         conn.sendall(script.encode("utf-8"))
         self.get_logger().info(
             f"[script] served control script to {addr[0]} (connect-back {host}:{self._port})"
@@ -381,7 +422,7 @@ class URServoController(Node):
                 conn = self._conn
             if conn is not None:
                 try:
-                    conn.sendall(_pack(q))
+                    conn.sendall(_pack(q, self._servoj_gain, self._servoj_lookahead))
                     if first_packet:
                         first_packet = False
                         self.get_logger().info("[ctrl] first packet sent to robot")

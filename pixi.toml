@@ -76,5 +76,9 @@ bringup-fake = { cmd = "bash -c 'source install/setup.bash && ros2 launch telamo
 # Open RViz with MoveIt2 only (controllers must already be running)
 rviz = "bash -c 'source install/setup.bash && ros2 launch telamoto_bringup moveit_rviz.launch.py'"
 
+# Live servo tuning: sliders for ur_servo_controller's servoj_gain / servoj_lookahead
+# (and other params). Run alongside twin-real; changes apply on the next servoj cycle.
+tune = "bash -c 'source install/setup.bash && ros2 run rqt_reconfigure rqt_reconfigure'"
+
 # List available ROS2 nodes
 nodes = "ros2 node list"

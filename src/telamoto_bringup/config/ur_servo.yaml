@@ -27,9 +27,13 @@ check_octomap_collisions: false
 
 move_group_name: ur_manipulator
 
-# Singularity handling (condition number). Decelerate near, hard-stop at.
-lower_singularity_threshold: 17.0
-hard_stop_singularity_threshold: 30.0
+# Singularity handling (Jacobian condition number). A 6-DOF UR has higher
+# condition numbers than a 7-DOF arm, so these are looser than the panda
+# defaults: decelerate from 30, hard-stop at 60. Raise further if it still
+# halts in dexterous regions; lower if it drives too aggressively near
+# singularities.
+lower_singularity_threshold: 30.0
+hard_stop_singularity_threshold: 60.0
 leaving_singularity_threshold_multiplier: 2.0
 joint_limit_margins: [0.1]
 

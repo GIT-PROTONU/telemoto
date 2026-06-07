@@ -117,8 +117,8 @@ def generate_launch_description():
     )
 
     # External Control URCap driver: serves the servoj script on request_program
-    # (ports 50002 and 50001) and streams packets on the reverse socket 50001.
-    # Start it by pressing Play on the pendant's External Control program.
+    # and streams packets, both on the reverse socket (50001). Start it by
+    # pressing Play on the pendant's External Control program.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",

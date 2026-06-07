@@ -240,6 +240,7 @@ class URServoController(Node):
         # _qd_target (joint velocities); otherwise servoj with _q_target.
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
+        self._q_actual = [0.0] * 6                     # latest measured joint pose
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
@@ -287,23 +288,18 @@ class URServoController(Node):
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
     def _servo_cb(self, msg: JointTrajectory) -> None:
-        # Servo's joint command drives the jog — velocities for speedj, positions
-        # to seed the hold target when jogging stops. Ignored during planned
+        # Servo's joint velocities drive the speedj jog. Ignored during planned
         # moves (the control loop prioritises the trajectory anyway).
         with self._traj_lock:
             if self._traj is not None:
                 return
-        if not msg.points:
+        if not msg.points or not msg.points[0].velocities:
             return
-        pt = msg.points[0]
-        names = list(msg.joint_names)
         try:
-            q = self._reorder(names, list(pt.positions))
+            qd = self._reorder(list(msg.joint_names), list(msg.points[0].velocities))
         except ValueError:
             return
-        qd = self._reorder(names, list(pt.velocities)) if pt.velocities else [0.0] * 6
         with self._tgt_lock:
-            self._q_target = q
             self._qd_target = qd
         self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
 
@@ -370,7 +366,8 @@ class URServoController(Node):
         self.get_logger().info(f"[web] tuning UI at http://{self._pc_ip()}:{self._web_port}")
         srv.serve_forever()
 
-    # ── Joint states (only the first sample is needed to seed the hold pose) ─────
+    # ── Joint states: track the measured pose so the speedj→servoj jog handoff
+    #    holds where the robot ACTUALLY is (Servo's commanded pose drifts) ────────
 
     def _js_cb(self, msg: JointState) -> None:
         ntp = dict(zip(msg.name, msg.position))
@@ -378,12 +375,12 @@ class URServoController(Node):
             q = [ntp[j] for j in UR_JOINT_ORDER]
         except KeyError:
             return
-        with self._tgt_lock:
-            self._q_target = list(q)
+        self._q_actual = q                            # atomic rebind; read lock-free
         if not self._js_ready.is_set():
+            with self._tgt_lock:
+                self._q_target = list(q)
             self._js_ready.set()
             self.get_logger().info("[ctrl] first joint states received")
-            self.destroy_subscription(self._js_sub)   # avoid 125 Hz GIL contention
 
     # ── Reverse server: serves the script on request, then hands the socket to
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
@@ -534,8 +531,12 @@ class URServoController(Node):
                 jogging = self._traj is None and now < self._servo_active_until
             if jogging:
                 # speedj velocity control from MoveIt Servo (smooth, direct jog).
+                # Keep the hold target pinned to the MEASURED pose so that when
+                # jogging stops, servoj holds where the robot actually is — no
+                # snap-back to a stale commanded position.
                 with self._tgt_lock:
                     qd = list(self._qd_target)
+                    self._q_target = list(self._q_actual)
                 pkt = _pack(qd, MODE_SPEEDJ, self._gain, self._lookahead, step_t)
             else:
                 # servoj position control for planned moves and hold.

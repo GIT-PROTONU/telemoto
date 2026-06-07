@@ -58,7 +58,8 @@ SPEED_MIN, SPEED_MAX         = 0.25, 3.0
 # stops if no jog command arrives within JOG_DEADMAN (browser-crash safety).
 JOG_LINEAR  = 0.12          # m/s at full axis
 JOG_ANGULAR = 0.5           # rad/s at full axis
-JOG_FRAME   = "base_link"
+JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
+                            # use "base_link" for base-frame jogging instead
 JOG_DEADMAN = 0.3           # s
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
@@ -127,8 +128,8 @@ _WEB_PAGE = """<!doctype html>
  <button onclick="reset()">Reset to defaults</button>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
    <label>Jog (WASD) <span><input type="checkbox" id="jogon"> enable</span></label>
-   <div class="hint"><b>W/S</b> forward/back &middot; <b>A/D</b> left/right &middot;
-     <b>Q/E</b> up/down (base frame). Hold to move, release to stop. Robot must be connected.</div>
+   <div class="hint"><b>W/S</b> forward/back along the tool &middot; <b>A/D</b> across &middot;
+     <b>Q/E</b> across (tool frame). Hold to move, release to stop. Robot must be connected.</div>
  </div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
@@ -147,8 +148,9 @@ _WEB_PAGE = """<!doctype html>
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
  // WASD jog
  let jogOn=false; const held=new Set(); let hb=null;
- function jogVec(){return {lx:(held.has("w")?1:0)-(held.has("s")?1:0),
-   ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("q")?1:0)-(held.has("e")?1:0)};}
+ // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
+ function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
+   ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
  function sendJog(){const v=jogVec();
    fetch("/api/jog?lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
  function stopJog(){held.clear();if(hb){clearInterval(hb);hb=null;}sendJog();}

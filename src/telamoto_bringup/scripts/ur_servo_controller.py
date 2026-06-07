@@ -17,6 +17,8 @@ Reply packet — 11 × int32 big-endian, read as p[1..11]:
   p[1] timeout_ms · p[2..7] q×MULT · p[8] mode(1=servoj) · p[9] gain ·
   p[10] lookahead×1000 (ms) · p[11] servoj duration×1e6 (µs)
 """
+import base64
+import hashlib
 import json
 import socket
 import struct
@@ -24,6 +26,8 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 handshake magic
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -149,7 +153,6 @@ _WEB_PAGE = """<!doctype html>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
  const ids=["speed","gain","lookahead"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
- let jseq=0;
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
  async function refreshStatus(){try{const s=await(await fetch("/api/state")).json();
@@ -161,13 +164,15 @@ _WEB_PAGE = """<!doctype html>
    refreshStatus();setInterval(refreshStatus,2000);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
- // WASD jog: stream the twist at 30 Hz while a key is held, zero on release.
- let jogOn=false; const held=new Set(); let stream=null;
+ // WASD jog: stream the twist at 30 Hz over a WebSocket while a key is held,
+ // zero on release. WS is ordered + low-overhead (no per-command HTTP).
+ let jogOn=false; const held=new Set(); let stream=null, ws=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
  function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
    ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
- function sendJog(){const v=jogVec();
-   fetch("/api/jog?seq="+(++jseq)+"&lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
+ function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
+   ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
+ function sendJog(){if(ws&&ws.readyState===1){const v=jogVec();ws.send(v.lx+","+v.ly+","+v.lz);}}
  function startStream(){if(!stream)stream=setInterval(sendJog,33);}   // ~30 Hz
  function stopAll(){held.clear();if(stream){clearInterval(stream);stream=null;}sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
@@ -178,7 +183,7 @@ _WEB_PAGE = """<!doctype html>
    if(held.has(k)){held.delete(k);
      if(held.size===0){clearInterval(stream);stream=null;sendJog();}else sendJog();}});
  window.addEventListener("blur",()=>{if(jogOn)stopAll();});
- init();
+ wsOpen(); init();
 </script>
 </body></html>
 """
@@ -247,9 +252,8 @@ class URServoController(Node):
         self._jog_mode = False                         # web toggle: stay in velocity mode
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
-        self._last_seq = -1                             # ordering: ignore stale POSTs
         self._dbg_pub_nz = False                        # diagnostics
-        self._dbg_rx = self._dbg_gaps = self._dbg_stale = 0
+        self._dbg_rx = 0
         self._dbg_log_t = 0.0
 
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
@@ -289,30 +293,20 @@ class URServoController(Node):
         if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
 
-    def _web_jog(self, q: dict) -> None:
-        ax = lambda k: _clamp(-1.0, 1.0, float(q.get(k, ["0"])[0]))
-        twist = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
-                 JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
+    def _apply_jog(self, msg: str) -> None:
+        # WebSocket payload "lx,ly,lz" with each axis in [-1,1] (tool frame).
+        # Lease model: each message renews the twist for JOG_LEASE; a zero msg
+        # (key release) stops instantly, and a stalled/closed socket lets the
+        # lease expire so the robot stops on its own.
         try:
-            seq = int(q.get("seq", ["-1"])[0])
-        except ValueError:
-            seq = -1
-        # Per-fetch POSTs can race and arrive out of order. Apply only newer
-        # commands (latest intent wins); ignore stale ones so a non-zero never
-        # lands after the zero from a key release. A big backwards jump = page
-        # reload, so accept it.
-        if 0 <= seq <= self._last_seq and seq > self._last_seq - 50:
-            self._dbg_stale += 1
+            lx, ly, lz = (float(x) for x in msg.split(",")[:3])
+        except (ValueError, TypeError):
             return
-        if self._last_seq >= 0 and seq > self._last_seq + 1:
-            self._dbg_gaps += seq - self._last_seq - 1
-        self._last_seq = seq
-        self._dbg_rx += 1
-        # Lease model: this command sets the twist and is valid for JOG_LEASE.
-        # A zero command (key release) stops instantly; if commands stop arriving
-        # (latency/drop/crash) the lease expires and the jog loop zeroes it.
-        self._jog = twist
+        self._jog = [JOG_LINEAR * _clamp(-1.0, 1.0, lx),
+                     JOG_LINEAR * _clamp(-1.0, 1.0, ly),
+                     JOG_LINEAR * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
         self._jog_lease = time.monotonic() + JOG_LEASE
+        self._dbg_rx += 1
 
     def _web_jogmode(self, q: dict) -> None:
         self._jog_mode = q.get("on", ["0"])[0] in ("1", "true", "on")
@@ -367,11 +361,9 @@ class URServoController(Node):
                 self._dbg_pub_nz = pub_nz
                 self.get_logger().info(f"[jog] {'moving' if pub_nz else 'stopped'}")
             if now - self._dbg_log_t >= 2.0:
-                if self._dbg_rx or self._dbg_stale or self._dbg_gaps:
-                    self.get_logger().info(
-                        f"[jog] 2s: {self._dbg_rx} cmds, {self._dbg_gaps} dropped, "
-                        f"{self._dbg_stale} out-of-order")
-                self._dbg_rx = self._dbg_gaps = self._dbg_stale = 0
+                if self._dbg_rx:
+                    self.get_logger().info(f"[jog] 2s: {self._dbg_rx} ws cmds")
+                self._dbg_rx = 0
                 self._dbg_log_t = now
             if not self._jog_mode:
                 continue                                      # velocity mode off
@@ -388,6 +380,7 @@ class URServoController(Node):
         node = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"              # required for the WS 101 upgrade
             def log_message(self, *_): pass
 
             def _send(self, body, ctype="text/plain"):
@@ -398,9 +391,12 @@ class URServoController(Node):
                 self.wfile.write(body)
 
             def do_GET(self):
-                with node._conn_lock:
-                    connected = node._conn is not None
+                if self.path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                    self._serve_ws()
+                    return
                 if self.path.startswith("/api/state"):
+                    with node._conn_lock:
+                        connected = node._conn is not None
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3), "connected": connected}).encode(),
                         "application/json")
@@ -414,11 +410,45 @@ class URServoController(Node):
                         node._web_set(q)
                     elif self.path.startswith("/api/jogmode"):
                         node._web_jogmode(q)
-                    elif self.path.startswith("/api/jog"):
-                        node._web_jog(q)
                 except (ValueError, KeyError):
                     pass
                 self._send(b"ok")
+
+            # ── WebSocket: ordered, low-overhead jog stream ────────────────────
+            def _serve_ws(self):
+                self.close_connection = True               # this socket is now a WS
+                key = self.headers.get("Sec-WebSocket-Key", "")
+                accept = base64.b64encode(
+                    hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept)
+                self.end_headers()
+                try:
+                    while True:
+                        op, data = self._ws_read()
+                        if op is None or op == 0x8:        # closed
+                            break
+                        if op == 0x1:                      # text frame = jog cmd
+                            node._apply_jog(data.decode("utf-8", "replace"))
+                except Exception:
+                    pass
+                node._apply_jog("0,0,0")                    # stop on disconnect
+
+            def _ws_read(self):
+                rd = self.rfile
+                hdr = rd.read(2)
+                if len(hdr) < 2:
+                    return None, b""
+                ln = hdr[1] & 0x7f
+                if ln == 126:
+                    ln = struct.unpack(">H", rd.read(2))[0]
+                elif ln == 127:
+                    ln = struct.unpack(">Q", rd.read(8))[0]
+                mask = rd.read(4) if hdr[1] & 0x80 else b"\x00\x00\x00\x00"
+                data = rd.read(ln) if ln else b""
+                return hdr[0] & 0x0f, bytes(c ^ mask[i & 3] for i, c in enumerate(data))
 
         try:
             srv = ThreadingHTTPServer(("0.0.0.0", self._web_port), Handler)

@@ -32,6 +32,9 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import TwistStamped
+from trajectory_msgs.msg import JointTrajectory
+from moveit_msgs.srv import ServoCommandType
 from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
 )
@@ -49,6 +52,17 @@ TIMEOUT_MS   = 200          # robot counts a missed read after this long
 GAIN_MIN, GAIN_MAX           = 100, 2000
 LOOKAHEAD_MIN, LOOKAHEAD_MAX = 0.03, 0.2
 SPEED_MIN, SPEED_MAX         = 0.25, 3.0
+
+# WASD jogging via MoveIt Servo. Web sends per-axis direction in [-1,1]; we
+# scale to these speeds and publish a TwistStamped in JOG_FRAME. The robot
+# stops if no jog command arrives within JOG_DEADMAN (browser-crash safety).
+JOG_LINEAR  = 0.12          # m/s at full axis
+JOG_ANGULAR = 0.5           # rad/s at full axis
+JOG_FRAME   = "base_link"
+JOG_DEADMAN = 0.3           # s
+SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
+SERVO_OUT_TOPIC   = "/telamoto/servo_command"
+SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
 
 # Served on request_program. The "# HEADER_*" anchors are mandatory (the URCap
 # splits header/body); we keep the header empty. A single missed read is
@@ -111,6 +125,11 @@ _WEB_PAGE = """<!doctype html>
    <input type="range" id="lookahead" min="0.03" max="0.2" step="0.005">
    <div class="hint">Higher = smoother but more lag; raise if it buzzes. Live.</div></div>
  <button onclick="reset()">Reset to defaults</button>
+ <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
+   <label>Jog (WASD) <span><input type="checkbox" id="jogon"> enable</span></label>
+   <div class="hint"><b>W/S</b> forward/back &middot; <b>A/D</b> left/right &middot;
+     <b>Q/E</b> up/down (base frame). Hold to move, release to stop. Robot must be connected.</div>
+ </div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
  const ids=["speed","gain","lookahead"];
@@ -126,6 +145,19 @@ _WEB_PAGE = """<!doctype html>
    refreshStatus();setInterval(refreshStatus,2000);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
+ // WASD jog
+ let jogOn=false; const held=new Set(); let hb=null;
+ function jogVec(){return {lx:(held.has("w")?1:0)-(held.has("s")?1:0),
+   ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("q")?1:0)-(held.has("e")?1:0)};}
+ function sendJog(){const v=jogVec();
+   fetch("/api/jog?lx="+v.lx+"&ly="+v.ly+"&lz="+v.lz,{method:"POST"});}
+ function stopJog(){held.clear();if(hb){clearInterval(hb);hb=null;}sendJog();}
+ document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;if(!jogOn)stopJog();});
+ document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
+   if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();if(!hb)hb=setInterval(sendJog,100);}});
+ document.addEventListener("keyup",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
+   if(held.has(k)){held.delete(k);sendJog();if(held.size===0&&hb){clearInterval(hb);hb=null;}}});
+ window.addEventListener("blur",()=>{if(jogOn)stopJog();});
  init();
 </script>
 </body></html>
@@ -186,7 +218,16 @@ class URServoController(Node):
         self._conn: socket.socket | None = None       # live reverse socket
         self._conn_lock = threading.Lock()
 
+        # WASD jog (MoveIt Servo): _jog is the desired twist, valid until _jog_deadline.
+        self._jog = [0.0] * 6
+        self._jog_deadline = 0.0
+        self._servo_started = False
+
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
+        # MoveIt Servo's JointTrajectory output → our stream (during jog).
+        self.create_subscription(JointTrajectory, SERVO_OUT_TOPIC, self._servo_cb, 10)
+        self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, 10)
+        self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
             self, FollowJointTrajectory,
             "joint_trajectory_controller/follow_joint_trajectory",
@@ -196,7 +237,7 @@ class URServoController(Node):
             callback_group=ReentrantCallbackGroup(),
         )
         for fn, name in ((self._server_loop, "srv"), (self._control_loop, "ctrl"),
-                         (self._web_loop, "web")):
+                         (self._web_loop, "web"), (self._jog_loop, "jog")):
             threading.Thread(target=fn, daemon=True, name="ri-" + name).start()
         self.get_logger().info(
             f"URServoController: reverse :{self._port}, robot {self._robot_ip} "
@@ -218,6 +259,50 @@ class URServoController(Node):
         if "speed" in q:     self._speed = _clamp(SPEED_MIN, SPEED_MAX, float(q["speed"][0]))
         if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
+
+    def _web_jog(self, q: dict) -> None:
+        ax = lambda k: _clamp(-1.0, 1.0, float(q.get(k, ["0"])[0]))
+        self._jog = [JOG_LINEAR * ax("lx"), JOG_LINEAR * ax("ly"), JOG_LINEAR * ax("lz"),
+                     JOG_ANGULAR * ax("ax"), JOG_ANGULAR * ax("ay"), JOG_ANGULAR * ax("az")]
+        self._jog_deadline = time.monotonic() + JOG_DEADMAN
+
+    # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
+
+    def _servo_cb(self, msg: JointTrajectory) -> None:
+        # Servo's joint command becomes our target — but only while jogging and
+        # not during a planned move (which the control loop prioritises anyway).
+        with self._traj_lock:
+            if self._traj is not None:
+                return
+        if not msg.points:
+            return
+        try:
+            q = self._reorder(list(msg.joint_names), list(msg.points[0].positions))
+        except ValueError:
+            return
+        with self._tgt_lock:
+            self._q_target = q
+
+    def _jog_loop(self) -> None:
+        self._js_ready.wait()
+        while rclpy.ok():
+            time.sleep(0.02)                                  # 50 Hz
+            if time.monotonic() >= self._jog_deadline or not any(self._jog):
+                continue
+            if not self._servo_started:                       # one-time: select TWIST mode
+                if not self._servo_cli.service_is_ready():
+                    continue
+                req = ServoCommandType.Request()
+                req.command_type = ServoCommandType.Request.TWIST
+                self._servo_cli.call_async(req)
+                self._servo_started = True
+                self.get_logger().info("[jog] MoveIt Servo command type → TWIST")
+            m = TwistStamped()
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.header.frame_id = JOG_FRAME
+            m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog[0:3]
+            m.twist.angular.x, m.twist.angular.y, m.twist.angular.z = self._jog[3:6]
+            self._twist_pub.publish(m)
 
     def _web_loop(self) -> None:
         node = self
@@ -243,11 +328,14 @@ class URServoController(Node):
                     self._send(_WEB_PAGE.encode(), "text/html; charset=utf-8")
 
             def do_POST(self):
-                if self.path.startswith("/api/set"):
-                    try:
-                        node._web_set(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
-                    except (ValueError, KeyError):
-                        pass
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    if self.path.startswith("/api/set"):
+                        node._web_set(q)
+                    elif self.path.startswith("/api/jog"):
+                        node._web_jog(q)
+                except (ValueError, KeyError):
+                    pass
                 self._send(b"ok")
 
         try:

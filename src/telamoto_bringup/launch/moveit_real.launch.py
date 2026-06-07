@@ -20,6 +20,7 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from launch_param_builder import ParameterBuilder
 from moveit_configs_utils import MoveItConfigsBuilder
 
 _CALIBRATION_FILE = os.path.normpath(
@@ -112,4 +113,27 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription(declared_args + [move_group])
+    # MoveIt Servo for WASD jogging. Receives TwistStamped on
+    # /servo_node/delta_twist_cmds and publishes a JointTrajectory on
+    # /telamoto/servo_command, which ur_servo_controller streams to the robot.
+    servo_params = {
+        "moveit_servo": ParameterBuilder("telamoto_bringup")
+        .yaml("config/ur_servo.yaml").to_dict()
+    }
+    servo_node = Node(
+        package="moveit_servo",
+        executable="servo_node",
+        name="servo_node",
+        output="screen",
+        parameters=[
+            servo_params,
+            {"planning_group_name": "ur_manipulator"},
+            {"robot_description":          robot_description_content},
+            {"robot_description_semantic": robot_description_semantic_content},
+            _moveit_cfg.robot_description_kinematics,
+            _moveit_cfg.joint_limits,
+            {"use_sim_time": False},
+        ],
+    )
+
+    return LaunchDescription(declared_args + [move_group, servo_node])

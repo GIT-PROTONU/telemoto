@@ -1,0 +1,45 @@
+# MoveIt Servo config for the UR10 (Jazzy moveit_servo 2.12, new param schema).
+# Loaded under the "moveit_servo" namespace via launch_param_builder.
+# Drives WASD jogging: servo_node receives TwistStamped on ~/delta_twist_cmds
+# and publishes a JointTrajectory the ur_servo_controller feeds into its stream.
+
+publish_period: 0.01            # servo output rate [s]
+max_expected_latency: 0.1
+
+command_in_type: "speed_units"  # twist values are m/s and rad/s
+scale:                          # only used when command_in_type == unitless
+  linear: 0.2
+  rotational: 0.5
+  joint: 0.5
+
+command_out_type: trajectory_msgs/JointTrajectory
+command_out_topic: /telamoto/servo_command
+publish_joint_positions: true
+publish_joint_velocities: false
+publish_joint_accelerations: false
+
+# Smoothing needs a configured plugin; keep off for now (enable once verified).
+use_smoothing: false
+
+# move_group owns the planning scene; servo just reads it.
+is_primary_planning_scene_monitor: false
+check_octomap_collisions: false
+
+move_group_name: ur_manipulator
+
+# Singularity handling (condition number). Decelerate near, hard-stop at.
+lower_singularity_threshold: 17.0
+hard_stop_singularity_threshold: 30.0
+leaving_singularity_threshold_multiplier: 2.0
+joint_limit_margins: [0.1]
+
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /joint_states
+status_topic: ~/status
+
+# Collision checking off for v1 (operator-supervised jogging); enable later.
+check_collisions: false
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02

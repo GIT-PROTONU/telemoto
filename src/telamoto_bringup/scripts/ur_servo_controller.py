@@ -33,13 +33,17 @@ So this node:
   4. Serves a tiny web UI (port 8080) to tune motion live — Speed (trajectory
      time-scale), Stiffness (servoj gain) and Smoothness (servoj lookahead).
 
-Packet format — 10 × int32 big-endian
-  params[0]      count          always 10 (prepended by the URScript runtime)
+Packet format — 11 × int32 big-endian
+  params[0]      count          always 11 (prepended by the URScript runtime)
   params[1]      timeout_ms     robot sets read_timeout = this / 1000.0
   params[2..7]   q[0..5] × MULT
   params[8]      control_mode   1 == MODE_SERVOJ
-  params[9]      servoj gain               live-tunable (rqt_reconfigure)
+  params[9]      servoj gain               live-tunable (web UI)
   params[10]     servoj lookahead × 1000   live-tunable, milliseconds
+  params[11]     servoj t × 1e6 (µs)       the MEASURED time since the last
+                 request — using it as servoj's duration keeps commanded
+                 velocity == planned velocity despite pull-rate jitter (else
+                 a slow cycle demands a velocity spike → protective stop).
 """
 import json
 import socket
@@ -98,15 +102,15 @@ misses = 0
 keep_going = True
 while keep_going:
   socket_send_int(1, "reverse_socket")
-  p = socket_read_binary_integer(10, "reverse_socket", read_timeout)
+  p = socket_read_binary_integer(11, "reverse_socket", read_timeout)
   if p[0] > 0:
     misses = 0
     read_timeout = p[1] / 1000.0
     if p[8] == 1:
       q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
-      # gain (p[9]) and lookahead (p[10] ms) are streamed live so they can be
-      # tuned from the PC without re-playing the program.
-      servoj(q, t={servoj_time}, lookahead_time=p[10]/1000.0, gain=p[9])
+      # gain (p[9]), lookahead (p[10] ms) and the servoj duration (p[11] µs,
+      # the PC-measured cycle time) are all streamed live.
+      servoj(q, t=p[11]/1000000.0, lookahead_time=p[10]/1000.0, gain=p[9])
     end
   else:
     misses = misses + 1
@@ -178,14 +182,15 @@ _WEB_PAGE = """<!doctype html>
 """
 
 
-def _pack(q: list[float], gain: int, lookahead_s: float) -> bytes:
-    return struct.pack(">10i",
+def _pack(q: list[float], gain: int, lookahead_s: float, t_s: float) -> bytes:
+    return struct.pack(">11i",
         TIMEOUT_MS,
         int(q[0] * MULT), int(q[1] * MULT), int(q[2] * MULT),
         int(q[3] * MULT), int(q[4] * MULT), int(q[5] * MULT),
         MODE_SERVOJ,
         int(gain),
         int(round(lookahead_s * 1000)),
+        int(round(t_s * 1_000_000)),
     )
 
 
@@ -196,9 +201,6 @@ class URServoController(Node):
         self.declare_parameter("robot_ip",          "192.168.10.2")
         self.declare_parameter("reverse_port",       REVERSE_PORT)
         self.declare_parameter("script_sender_port", SCRIPT_SENDER_PORT)
-        # servoj_time = how long each servoj runs (and thus the robot's pull
-        # cadence). Baked into the served script, so changing it needs a re-Play.
-        self.declare_parameter("servoj_time", 0.010)
         # gain (stiffness) and lookahead (smoothness) are streamed in every
         # packet — tune them LIVE from the web UI (http://<pc>:8080, or
         # `pixi run tune`); effect on the next servoj cycle.
@@ -226,7 +228,6 @@ class URServoController(Node):
         self._robot_ip    = self.get_parameter("robot_ip").get_parameter_value().string_value
         self._port        = self.get_parameter("reverse_port").get_parameter_value().integer_value
         self._sender_port = self.get_parameter("script_sender_port").get_parameter_value().integer_value
-        self._servoj_time      = self.get_parameter("servoj_time").get_parameter_value().double_value
         self._servoj_gain      = self.get_parameter("servoj_gain").get_parameter_value().integer_value
         self._servoj_lookahead = self.get_parameter("servoj_lookahead").get_parameter_value().double_value
         self._speed_scale      = self.get_parameter("speed_scale").get_parameter_value().double_value
@@ -275,7 +276,7 @@ class URServoController(Node):
 
     def _on_set_params(self, params) -> SetParametersResult:
         """gain/lookahead apply on the next servoj cycle (streamed in packets);
-        speed on the next move; servoj_time on the next Play (baked into script)."""
+        speed applies on the next move."""
         for p in params:
             if p.name == "servoj_gain":
                 self._servoj_gain = int(max(GAIN_MIN, min(GAIN_MAX, p.value)))
@@ -283,9 +284,6 @@ class URServoController(Node):
                 self._servoj_lookahead = float(max(LOOKAHEAD_MIN, min(LOOKAHEAD_MAX, p.value)))
             elif p.name == "speed_scale":
                 self._speed_scale = float(max(SPEED_MIN, min(SPEED_MAX, p.value)))
-            elif p.name == "servoj_time":
-                self._servoj_time = float(p.value)
-                self.get_logger().info("[tune] servoj_time set — re-Play to apply")
         return SetParametersResult(successful=True)
 
     # ── Web tuning UI ───────────────────────────────────────────────────────────
@@ -386,10 +384,10 @@ class URServoController(Node):
             return s.getsockname()[0]
 
     def _serve_script(self, conn: socket.socket, addr) -> None:
-        # gain/lookahead are streamed per-packet (live), so only servoj_time is
-        # baked into the script here.
+        # gain, lookahead and servoj duration are all streamed per-packet, so
+        # the served script only needs the connect-back host/port.
         host   = self._pc_ip()
-        script = _URSCRIPT.format(host=host, port=self._port, servoj_time=self._servoj_time)
+        script = _URSCRIPT.format(host=host, port=self._port)
         conn.sendall(script.encode("utf-8"))
         self.get_logger().info(
             f"[script] served control script to {addr[0]} (connect-back {host}:{self._port})"
@@ -539,9 +537,10 @@ class URServoController(Node):
                 continue
 
             now = time.monotonic()
-            cycles += 1
-            max_gap = max(max_gap, now - last_req)
+            dt = now - last_req            # measured cycle time → servoj duration
             last_req = now
+            cycles += 1
+            max_gap = max(max_gap, dt)
             if now - health_t >= 5.0:
                 self.get_logger().info(
                     f"[ctrl] rate health: {cycles} cycles/5s, max gap {max_gap * 1000:.1f}ms"
@@ -571,8 +570,13 @@ class URServoController(Node):
                 with self._tgt_lock:
                     q = list(self._q_target)
 
+            # servoj duration = the measured cycle time so velocity == planned
+            # velocity. Using the REAL dt is always safe (servoj just takes that
+            # long); only clamp extreme outliers. Never clamp below dt for a
+            # normal cycle — that would demand a velocity spike (protective stop).
+            step_t = max(0.002, min(0.5, dt))
             try:
-                conn.sendall(_pack(q, self._servoj_gain, self._servoj_lookahead))
+                conn.sendall(_pack(q, self._servoj_gain, self._servoj_lookahead, step_t))
                 if first_packet:
                     first_packet = False
                     self.get_logger().info("[ctrl] streaming to robot")

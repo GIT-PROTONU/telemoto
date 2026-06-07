@@ -52,7 +52,8 @@ WEB_PORT     = 8080
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (jogging)
-SPEEDJ_ACCEL = 15.0        # rad/s^2 — how fast speedj ramps to the commanded velocity
+JOG_SPEED_DEF = 0.12       # m/s at full axis (default)
+JOG_ACCEL_DEF = 15.0       # rad/s^2 speedj ramp (default)
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
 _ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
@@ -63,13 +64,13 @@ SPEED_MIN, SPEED_MAX         = 0.25, 3.0
 # WASD jogging via MoveIt Servo. The web streams per-axis direction in [-1,1]
 # at ~30 Hz while a key is held; we scale to these speeds and publish a
 # TwistStamped in JOG_FRAME. Each command leases the twist for JOG_LEASE.
-JOG_LINEAR  = 0.12          # m/s at full axis
-JOG_ANGULAR = 0.5           # rad/s at full axis
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
 JOG_LEASE   = 0.1           # s — each jog command is a lease; if no new command
                             # arrives within this the robot stops (latency/drop
                             # safety + instant stop on key release)
+JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.02, 0.5    # m/s at full axis (web slider)
+JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 2.0,  40.0   # rad/s^2 speedj ramp (web slider)
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -98,7 +99,8 @@ while keep_going:
       servoj(q, t=p[11]/1000000.0, lookahead_time=p[10]/1000.0, gain=p[9])
     elif p[8] == 2:
       qd = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
-      speedj(qd, {accel}, p[11]/1000000.0)
+      # speedj acceleration is streamed live in p[9] (×100), so it's tunable.
+      speedj(qd, p[9]/100.0, p[11]/1000000.0)
     end
   else:
     misses = misses + 1
@@ -149,9 +151,16 @@ _WEB_PAGE = """<!doctype html>
    <div class="hint"><b>W/S</b> forward/back along the tool &middot; <b>A/D</b> across &middot;
      <b>Q/E</b> across (tool frame). Hold to move, release to stop. Robot must be connected.</div>
  </div>
+ <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
+   <input type="range" id="jspeed" min="0.02" max="0.5" step="0.01">
+   <div class="hint">Cartesian jog velocity. Live.</div></div>
+ <div class="row"><label>Jog acceleration <span class="val" id="jaccelv"></span></label>
+   <input type="range" id="jaccel" min="2" max="40" step="1">
+   <div class="hint">How sharply the jog ramps (speedj). Higher = snappier. Live.</div></div>
 <script>
- const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s"};
- const ids=["speed","gain","lookahead"];
+ const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
+   jspeed:v=>(+v).toFixed(2)+" m/s",jaccel:v=>Math.round(v)+" rad/s\\u00b2"};
+ const ids=["speed","gain","lookahead","jspeed","jaccel"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -225,6 +234,15 @@ class URServoController(Node):
             floating_point_range=[FloatingPointRange(
                 from_value=LOOKAHEAD_MIN, to_value=LOOKAHEAD_MAX, step=0.005)]))
         self.declare_parameter("speed_scale", 1.0)   # trajectory time-scale (next move)
+        # WASD jog tuning (live): linear speed and speedj acceleration.
+        self.declare_parameter("jog_speed", JOG_SPEED_DEF, ParameterDescriptor(
+            description="WASD jog linear speed m/s (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=JOG_SPEED_MIN, to_value=JOG_SPEED_MAX, step=0.01)]))
+        self.declare_parameter("jog_accel", JOG_ACCEL_DEF, ParameterDescriptor(
+            description="WASD jog speedj acceleration rad/s^2 (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=JOG_ACCEL_MIN, to_value=JOG_ACCEL_MAX, step=1.0)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -233,6 +251,8 @@ class URServoController(Node):
         self._gain      = g("servoj_gain").get_parameter_value().integer_value
         self._lookahead = g("servoj_lookahead").get_parameter_value().double_value
         self._speed     = g("speed_scale").get_parameter_value().double_value
+        self._jog_speed = g("jog_speed").get_parameter_value().double_value
+        self._jog_accel = g("jog_accel").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -287,12 +307,18 @@ class URServoController(Node):
                 self._lookahead = float(_clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, p.value))
             elif p.name == "speed_scale":
                 self._speed = float(_clamp(SPEED_MIN, SPEED_MAX, p.value))
+            elif p.name == "jog_speed":
+                self._jog_speed = float(_clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, p.value))
+            elif p.name == "jog_accel":
+                self._jog_accel = float(_clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, p.value))
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
         if "speed" in q:     self._speed = _clamp(SPEED_MIN, SPEED_MAX, float(q["speed"][0]))
         if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
+        if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
+        if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
 
     def _apply_jog(self, msg: str) -> None:
         # WebSocket payload "lx,ly,lz" with each axis in [-1,1] (tool frame).
@@ -303,9 +329,10 @@ class URServoController(Node):
             lx, ly, lz = (float(x) for x in msg.split(",")[:3])
         except (ValueError, TypeError):
             return
-        self._jog = [JOG_LINEAR * _clamp(-1.0, 1.0, lx),
-                     JOG_LINEAR * _clamp(-1.0, 1.0, ly),
-                     JOG_LINEAR * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
+        sp = self._jog_speed
+        self._jog = [sp * _clamp(-1.0, 1.0, lx),
+                     sp * _clamp(-1.0, 1.0, ly),
+                     sp * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
         self._jog_lease = time.monotonic() + JOG_LEASE
         self._dbg_rx += 1
         self._publish_twist()                       # publish NOW, don't wait for the loop
@@ -405,7 +432,9 @@ class URServoController(Node):
                     with node._conn_lock:
                         connected = node._conn is not None
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
-                        "lookahead": round(node._lookahead, 3), "connected": connected}).encode(),
+                        "lookahead": round(node._lookahead, 3),
+                        "jspeed": round(node._jog_speed, 2), "jaccel": round(node._jog_accel, 0),
+                        "connected": connected}).encode(),
                         "application/json")
                 else:
                     self._send(_WEB_PAGE.encode(), "text/html; charset=utf-8")
@@ -484,7 +513,7 @@ class URServoController(Node):
 
     def _serve_script(self, conn, addr) -> None:
         host = self._pc_ip()
-        conn.sendall(_URSCRIPT.format(host=host, port=self._port, accel=SPEEDJ_ACCEL).encode())
+        conn.sendall(_URSCRIPT.format(host=host, port=self._port).encode())
         self.get_logger().info(f"[script] served to {addr[0]} (connect-back {host}:{self._port})")
 
     def _server_loop(self) -> None:
@@ -620,10 +649,12 @@ class URServoController(Node):
                 # planned move: servoj to the interpolated position.
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             elif now < self._servo_active_until:
-                # jogging: speedj to MoveIt Servo's joint velocity.
+                # jogging: speedj to MoveIt Servo's joint velocity. The gain
+                # field carries the speedj acceleration (×100) for speedj mode.
                 with self._tgt_lock:
                     qd = list(self._qd_target)
-                pkt = _pack(qd, MODE_SPEEDJ, self._gain, self._lookahead, step_t)
+                pkt = _pack(qd, MODE_SPEEDJ, int(self._jog_accel * 100),
+                            self._lookahead, step_t)
             else:
                 # idle: speedj(0) — the robot holds its own position, so there's
                 # no commanded target to snap back to after a jog.

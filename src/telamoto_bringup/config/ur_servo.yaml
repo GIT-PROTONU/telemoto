@@ -18,8 +18,8 @@ scale:
 
 command_out_type: trajectory_msgs/JointTrajectory
 command_out_topic: /telamoto/servo_command
-publish_joint_positions: true    # servoj'd directly: closed-loop position jog
-publish_joint_velocities: false  # unused — jog is position, not velocity (speedj)
+publish_joint_positions: true    # used to seed the servoj hold when jogging stops
+publish_joint_velocities: true   # the speedj command stream while jogging
 publish_joint_accelerations: false
 
 # Smoothing needs a configured plugin; keep off for now (enable once verified).

@@ -21,7 +21,6 @@ import base64
 import gc
 import hashlib
 import json
-import math
 import socket
 import struct
 import threading
@@ -56,10 +55,7 @@ MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (WASD jog + idle self-hold)
 JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
-JOG_RAMP_DEF  = 0.07       # s — jog acceleration build-up time (default); see _jerk_step
-JOG_ACCEL_CAP = 6.0        # rad/s^2 — jog acceleration limit (briskness ceiling)
-SPEEDJ_ACCEL  = 12.0       # rad/s^2 — speedj's accel arg; modest, just enough to
-                           # track our jerk-shaped velocity (defence in depth)
+JOG_ACCEL_DEF = 1.0        # rad/s^2 — speedj acceleration (default; gentle ramp)
 MAX_JOG_QD    = 0.5        # rad/s — HARD per-joint speed cap during jogging. The
                            # arm CANNOT exceed this no matter what Servo emits
                            # (singularity amplification, glitches). Safety net.
@@ -80,8 +76,8 @@ JOG_LEASE   = 0.1           # s — each jog command is a lease; if no new comma
                             # safety + instant stop on key release)
 JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
                                               # 5 mm/s floor → sub-mm taps for fine work
-JOG_RAMP_MIN,   JOG_RAMP_MAX   = 0.0,  0.2    # s — accel build-up (web slider);
-                                              # 0 = instant/snappy, higher = smoother
+JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # rad/s^2 speedj accel (web slider);
+                                              # lower = gentler start/stop
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -165,14 +161,13 @@ _WEB_PAGE = """<!doctype html>
  <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
    <input type="range" id="jspeed" min="0.005" max="0.5" step="0.005">
    <div class="hint">Cartesian jog velocity &mdash; lower for mm-precise work. Live.</div></div>
- <div class="row"><label>Jog ramp <span class="val" id="jrampv"></span></label>
-   <input type="range" id="jramp" min="0" max="0.2" step="0.005">
-   <div class="hint">Start/stop smoothing (jerk-limited) &mdash; how gradually the push
-     engages. Higher = smoother, lower = snappier. 0 = instant. Live.</div></div>
+ <div class="row"><label>Jog acceleration <span class="val" id="jaccelv"></span></label>
+   <input type="range" id="jaccel" min="0.3" max="20" step="0.1">
+   <div class="hint">speedj ramp rate &mdash; lower = gentler start/stop. Live.</div></div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
-   jspeed:v=>Math.round(+v*1000)+" mm/s",jramp:v=>Math.round(+v*1000)+" ms"};
- const ids=["speed","gain","lookahead","jspeed","jramp"];
+   jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" rad/s\\u00b2"};
+ const ids=["speed","gain","lookahead","jspeed","jaccel"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -240,20 +235,6 @@ def _cap_speed(qd, lim):
     return qd
 
 
-def _jerk_step(v, a, vt, a_max, j_max, dt):
-    """Advance velocity `v` (with current accel `a`) one step toward target
-    velocity `vt`, limited to `a_max` accel and `j_max` jerk and arriving with
-    a≈0 (an S-curve). Bounded jerk → no jolt on start or stop; finite-time →
-    none of a low-pass's laggy exponential tail. Returns (v, a)."""
-    dv = vt - v
-    # The accel which, ramped down to 0 at j_max starting now, lands exactly on
-    # vt (so we begin braking the accel in time and don't overshoot):
-    a_tgt = math.copysign(math.sqrt(2.0 * j_max * abs(dv)), dv) if dv else 0.0
-    a_tgt = _clamp(-a_max, a_max, a_tgt)
-    a = _clamp(a - j_max * dt, a + j_max * dt, a_tgt)    # jerk-limit the accel change
-    return v + a * dt, a
-
-
 def _cbor_decode(buf, i=0):
     """Minimal RFC 8949 decoder for the jog frame: ints and arrays (major
     types 0, 1, 4). Returns (value, next_index)."""
@@ -305,15 +286,15 @@ class URServoController(Node):
             floating_point_range=[FloatingPointRange(
                 from_value=LOOKAHEAD_MIN, to_value=LOOKAHEAD_MAX, step=0.005)]))
         self.declare_parameter("speed_scale", 1.0)   # trajectory time-scale (next move)
-        # WASD jog tuning (live): Cartesian linear speed and velocity-ramp time.
+        # WASD jog tuning (live): Cartesian linear speed and speedj acceleration.
         self.declare_parameter("jog_speed", JOG_SPEED_DEF, ParameterDescriptor(
             description="WASD jog linear speed m/s (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=JOG_SPEED_MIN, to_value=JOG_SPEED_MAX, step=0.005)]))
-        self.declare_parameter("jog_ramp", JOG_RAMP_DEF, ParameterDescriptor(
-            description="WASD jog accel build-up time s (jerk limit); higher = smoother (live)",
+        self.declare_parameter("jog_accel", JOG_ACCEL_DEF, ParameterDescriptor(
+            description="WASD jog speedj acceleration rad/s^2; lower = gentler (live)",
             floating_point_range=[FloatingPointRange(
-                from_value=JOG_RAMP_MIN, to_value=JOG_RAMP_MAX, step=0.005)]))
+                from_value=JOG_ACCEL_MIN, to_value=JOG_ACCEL_MAX, step=0.1)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -323,7 +304,7 @@ class URServoController(Node):
         self._lookahead = g("servoj_lookahead").get_parameter_value().double_value
         self._speed     = g("speed_scale").get_parameter_value().double_value
         self._jog_speed = g("jog_speed").get_parameter_value().double_value
-        self._jog_ramp = g("jog_ramp").get_parameter_value().double_value
+        self._jog_accel = g("jog_accel").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -345,8 +326,6 @@ class URServoController(Node):
         self._jog_mode = False                         # web toggle: stay in jog mode
         self._pub_lock = threading.Lock()              # serialise twist publishes
         self._qd_target = [0.0] * 6
-        self._jog_v = _ZERO6                            # jerk-limited jog profiler:
-        self._jog_a = _ZERO6                            # commanded velocity + accel
         self._servo_active_until = 0.0
         self._dbg_pub_nz = False                        # diagnostics
         self._dbg_rx = 0
@@ -389,8 +368,8 @@ class URServoController(Node):
                 self._speed = float(_clamp(SPEED_MIN, SPEED_MAX, p.value))
             elif p.name == "jog_speed":
                 self._jog_speed = float(_clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, p.value))
-            elif p.name == "jog_ramp":
-                self._jog_ramp = float(_clamp(JOG_RAMP_MIN, JOG_RAMP_MAX, p.value))
+            elif p.name == "jog_accel":
+                self._jog_accel = float(_clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, p.value))
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
@@ -398,7 +377,7 @@ class URServoController(Node):
         if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
         if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
-        if "jramp" in q:     self._jog_ramp = _clamp(JOG_RAMP_MIN, JOG_RAMP_MAX, float(q["jramp"][0]))
+        if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
@@ -509,7 +488,7 @@ class URServoController(Node):
                         connected = node._conn is not None
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
-                        "jspeed": round(node._jog_speed, 3), "jramp": round(node._jog_ramp, 2),
+                        "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -726,30 +705,18 @@ class URServoController(Node):
             step_t = _clamp(0.002, 0.5, dt)
             q_traj = self._traj_target(now)
             if q_traj is not None:
-                # planned move: servoj to the interpolated position. Reset the jog
-                # profiler so the next jog starts cleanly from rest.
-                self._jog_v = self._jog_a = _ZERO6
+                # planned move: servoj to the interpolated position.
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             else:
-                # jog / hold: speedj to a jerk-limited joint velocity. Target is
-                # Servo's velocity while jogging, else zero (also the idle hold).
-                # _jerk_step ramps the acceleration smoothly, so start/stop are
-                # jolt-free yet finite and crisp. jog_ramp = accel build-up time.
-                # SAFETY: hard-cap the joint speed both BEFORE and AFTER the
-                # profiler — near a singularity Servo can emit huge joint
-                # velocities for a small twist, and speedj would execute them.
+                # jog / hold: speedj to Servo's joint velocity while jogging, else
+                # zero (which also gives the idle self-hold). speedj's own
+                # acceleration (jog_accel) shapes the ramp — lower it for a gentler
+                # start/stop. SAFETY: _cap_speed hard-limits the joint speed so a
+                # singularity-amplified Servo output can never make the arm shoot.
                 with self._tgt_lock:
-                    qd_t = list(self._qd_target) if now < self._servo_active_until else _ZERO6
-                qd_t = _cap_speed(qd_t, MAX_JOG_QD)
-                jerk = JOG_ACCEL_CAP / max(self._jog_ramp, 1e-3)
-                v, acc = self._jog_v, self._jog_a
-                nv, na = [0.0] * 6, [0.0] * 6
-                for i in range(6):
-                    nv[i], na[i] = _jerk_step(v[i], acc[i], qd_t[i],
-                                              JOG_ACCEL_CAP, jerk, step_t)
-                nv = _cap_speed(nv, MAX_JOG_QD)            # final hard guard
-                self._jog_v, self._jog_a = nv, na
-                pkt = _pack(nv, MODE_SPEEDJ, int(SPEEDJ_ACCEL * 100),
+                    qd = self._qd_target if now < self._servo_active_until else _ZERO6
+                qd = _cap_speed(qd, MAX_JOG_QD)
+                pkt = _pack(qd, MODE_SPEEDJ, int(self._jog_accel * 100),
                             self._lookahead, step_t)
             try:
                 conn.sendall(pkt)

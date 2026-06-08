@@ -173,15 +173,19 @@ _WEB_PAGE = """<!doctype html>
    refreshStatus();setInterval(refreshStatus,2000);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
- // WASD jog: stream the twist at 30 Hz over a WebSocket while a key is held,
- // zero on release. WS is ordered + low-overhead (no per-command HTTP).
+ // WASD jog: stream the direction as a CBOR binary frame at 30 Hz over a
+ // WebSocket while a key is held, zero on release. WS is ordered + low-overhead.
  let jogOn=false; const held=new Set(); let stream=null, ws=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
  function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
    ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
  function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
- function sendJog(){if(ws&&ws.readyState===1){const v=jogVec();ws.send(v.lx+","+v.ly+","+v.lz);}}
+ // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
+ function cborInt(n){n=Math.round(n);const m=n<0?0x20:0x00,u=n<0?-1-n:n;
+   if(u<24)return[m|u];if(u<256)return[m|24,u];return[m|25,(u>>8)&0xff,u&0xff];}
+ function cborJog(v){return new Uint8Array([0x83].concat(cborInt(v.lx),cborInt(v.ly),cborInt(v.lz)));}
+ function sendJog(){if(ws&&ws.readyState===1)ws.send(cborJog(jogVec()));}
  function startStream(){if(!stream)stream=setInterval(sendJog,33);}   // ~30 Hz
  function stopAll(){held.clear();if(stream){clearInterval(stream);stream=null;}sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
@@ -210,6 +214,35 @@ def _pack(values, mode, gain, lookahead_s, t_s) -> bytes:
 
 def _clamp(lo, hi, v):
     return max(lo, min(hi, v))
+
+
+def _cbor_decode(buf, i=0):
+    """Minimal RFC 8949 decoder for the jog frame: ints and arrays (major
+    types 0, 1, 4). Returns (value, next_index)."""
+    head = buf[i]; major, minor = head >> 5, head & 0x1f; i += 1
+    if minor < 24:
+        val = minor
+    elif minor == 24:
+        val = buf[i]; i += 1
+    elif minor == 25:
+        val = int.from_bytes(buf[i:i + 2], "big"); i += 2
+    elif minor == 26:
+        val = int.from_bytes(buf[i:i + 4], "big"); i += 4
+    elif minor == 27:
+        val = int.from_bytes(buf[i:i + 8], "big"); i += 8
+    else:
+        raise ValueError("cbor: reserved length")
+    if major == 0:
+        return val, i
+    if major == 1:
+        return -1 - val, i
+    if major == 4:
+        out = []
+        for _ in range(val):
+            item, i = _cbor_decode(buf, i)
+            out.append(item)
+        return out, i
+    raise ValueError(f"cbor: unsupported major type {major}")
 
 
 def _result(code):
@@ -320,15 +353,11 @@ class URServoController(Node):
         if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
         if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
 
-    def _apply_jog(self, msg: str) -> None:
-        # WebSocket payload "lx,ly,lz" with each axis in [-1,1] (tool frame).
+    def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
+        # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
         # Lease model: each message renews the twist for JOG_LEASE; a zero msg
         # (key release) stops instantly, and a stalled/closed socket lets the
         # lease expire so the robot stops on its own.
-        try:
-            lx, ly, lz = (float(x) for x in msg.split(",")[:3])
-        except (ValueError, TypeError):
-            return
         sp = self._jog_speed
         self._jog = [sp * _clamp(-1.0, 1.0, lx),
                      sp * _clamp(-1.0, 1.0, ly),
@@ -466,11 +495,15 @@ class URServoController(Node):
                         op, data = self._ws_read()
                         if op is None or op == 0x8:        # closed
                             break
-                        if op == 0x1:                      # text frame = jog cmd
-                            node._apply_jog(data.decode("utf-8", "replace"))
+                        if op == 0x2:                      # binary frame = CBOR jog cmd
+                            try:
+                                v, _ = _cbor_decode(data)
+                                node._apply_jog(float(v[0]), float(v[1]), float(v[2]))
+                            except (ValueError, IndexError, TypeError):
+                                pass
                 except Exception:
                     pass
-                node._apply_jog("0,0,0")                    # stop on disconnect
+                node._apply_jog(0.0, 0.0, 0.0)             # stop on disconnect
 
             def _ws_read(self):
                 rd = self.rfile

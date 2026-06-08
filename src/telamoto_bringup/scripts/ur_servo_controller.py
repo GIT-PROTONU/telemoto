@@ -57,9 +57,12 @@ MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (WASD jog + idle self-hold)
 JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
 JOG_RAMP_DEF  = 0.07       # s — jog acceleration build-up time (default); see _jerk_step
-JOG_ACCEL_CAP = 10.0       # rad/s^2 — jog acceleration limit (briskness ceiling)
-SPEEDJ_ACCEL  = 40.0       # rad/s^2 — speedj's accel arg; high so the robot
-                           # faithfully follows our already jerk-shaped velocity
+JOG_ACCEL_CAP = 6.0        # rad/s^2 — jog acceleration limit (briskness ceiling)
+SPEEDJ_ACCEL  = 12.0       # rad/s^2 — speedj's accel arg; modest, just enough to
+                           # track our jerk-shaped velocity (defence in depth)
+MAX_JOG_QD    = 0.5        # rad/s — HARD per-joint speed cap during jogging. The
+                           # arm CANNOT exceed this no matter what Servo emits
+                           # (singularity amplification, glitches). Safety net.
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
 _ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
@@ -223,6 +226,18 @@ def _pack(values, mode, gain, lookahead_s, t_s) -> bytes:
 
 def _clamp(lo, hi, v):
     return max(lo, min(hi, v))
+
+
+def _cap_speed(qd, lim):
+    """Hard-cap a joint-velocity vector to `lim` (rad/s) on its fastest joint,
+    scaling the whole vector so direction is preserved. Safety guard against
+    singularity amplification — the robot can never be told to move faster than
+    `lim` per joint during a jog."""
+    m = max((abs(x) for x in qd), default=0.0)
+    if m > lim:
+        s = lim / m
+        return [x * s for x in qd]
+    return qd
 
 
 def _jerk_step(v, a, vt, a_max, j_max, dt):
@@ -717,18 +732,22 @@ class URServoController(Node):
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             else:
                 # jog / hold: speedj to a jerk-limited joint velocity. Target is
-                # Servo's velocity while jogging, else zero (which doubles as the
-                # idle self-hold). _jerk_step ramps the acceleration smoothly, so
-                # start/stop are jolt-free yet finite and crisp — no low-pass lag.
-                # jog_ramp = time for the acceleration to build to its cap.
+                # Servo's velocity while jogging, else zero (also the idle hold).
+                # _jerk_step ramps the acceleration smoothly, so start/stop are
+                # jolt-free yet finite and crisp. jog_ramp = accel build-up time.
+                # SAFETY: hard-cap the joint speed both BEFORE and AFTER the
+                # profiler — near a singularity Servo can emit huge joint
+                # velocities for a small twist, and speedj would execute them.
                 with self._tgt_lock:
                     qd_t = list(self._qd_target) if now < self._servo_active_until else _ZERO6
+                qd_t = _cap_speed(qd_t, MAX_JOG_QD)
                 jerk = JOG_ACCEL_CAP / max(self._jog_ramp, 1e-3)
                 v, acc = self._jog_v, self._jog_a
                 nv, na = [0.0] * 6, [0.0] * 6
                 for i in range(6):
                     nv[i], na[i] = _jerk_step(v[i], acc[i], qd_t[i],
                                               JOG_ACCEL_CAP, jerk, step_t)
+                nv = _cap_speed(nv, MAX_JOG_QD)            # final hard guard
                 self._jog_v, self._jog_a = nv, na
                 pkt = _pack(nv, MODE_SPEEDJ, int(SPEEDJ_ACCEL * 100),
                             self._lookahead, step_t)

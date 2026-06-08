@@ -9,6 +9,7 @@ RTDE protocol notes:
   SETUP_OUTPUTS response: recipe_id uint8 (1 byte) + ASCII type names
   DATA_PACKAGE: recipe_id uint8 (1 byte) + packed binary variable data
 """
+import gc
 import socket
 import struct
 import threading
@@ -61,21 +62,20 @@ class URRTDEJointPublisher(Node):
     def __init__(self):
         super().__init__("ur_rtde_joint_pub")
         self.declare_parameter("robot_ip", "192.168.10.2")
-        self.declare_parameter("publish_hz", 50.0)
-
         self._robot_ip = self.get_parameter("robot_ip").get_parameter_value().string_value
-        pub_hz = self.get_parameter("publish_hz").get_parameter_value().double_value
 
         self._pub = self.create_publisher(JointState, "/joint_states", 10)
-        self._latest: list[float] | None = None
-        self._lock = threading.Lock()
+        # Reused message — name is constant; stamp + position are refreshed per
+        # packet. Avoids a fresh allocation on every 125 Hz publish.
+        self._msg = JointState()
+        self._msg.name = JOINT_NAMES
 
-        # Background thread reads RTDE at full 125 Hz and drains the socket buffer.
+        # Read AND publish straight off the RTDE stream (full 125 Hz): no
+        # downsampling timer, so /joint_states is as fresh as the robot makes it
+        # — the smoothest possible state seed for MoveIt Servo and move_group.
+        # Reading every packet also keeps the socket buffer drained (no backlog).
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
-
-        # Timer only publishes the last received joints to ROS2.
-        self.create_timer(1.0 / pub_hz, self._publish)
 
     # ------------------------------------------------------------------
     def _connect(self) -> tuple[socket.socket, int]:
@@ -84,6 +84,9 @@ class URRTDEJointPublisher(Node):
             try:
                 self.get_logger().info(f"Connecting to RTDE at {self._robot_ip}:30004 ...")
                 s = socket.create_connection((self._robot_ip, 30004), timeout=5)
+                # Realtime link: no Nagle batching — deliver every 125 Hz RTDE
+                # packet the instant it arrives, no coalescing delay.
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.settimeout(2.0)
 
                 send_rtde(s, CMD_PROTOCOL_VERSION, struct.pack(">H", 2))
@@ -127,9 +130,9 @@ class URRTDEJointPublisher(Node):
                     cmd, data = recv_rtde(sock)
                     # DATA_PACKAGE: recipe_id (uint8) + VECTOR6D (6×float64 = 48 bytes)
                     if cmd == CMD_DATA_PACKAGE and len(data) >= 49 and data[0] == recipe_id:
-                        joints = list(struct.unpack(">6d", data[1:49]))
-                        with self._lock:
-                            self._latest = joints
+                        self._msg.header.stamp = self.get_clock().now().to_msg()
+                        self._msg.position = list(struct.unpack(">6d", data[1:49]))
+                        self._pub.publish(self._msg)
             except Exception as exc:
                 if rclpy.ok():
                     self.get_logger().warn(f"RTDE stream lost: {exc} — reconnecting")
@@ -138,22 +141,14 @@ class URRTDEJointPublisher(Node):
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------
-    def _publish(self) -> None:
-        with self._lock:
-            joints = self._latest
-        if joints is None:
-            return
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = JOINT_NAMES
-        msg.position = joints
-        self._pub.publish(msg)
-
 
 def main() -> None:
     rclpy.init()
     node = URRTDEJointPublisher()
+    # Freeze startup objects out of the GC scan set: the 125 Hz reader/publisher
+    # then runs without collection pauses (steady-state allocs are non-cyclic).
+    gc.collect()
+    gc.freeze()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

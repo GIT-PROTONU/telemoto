@@ -10,9 +10,25 @@ channels = [
 platforms = ["linux-64"]
 
 # ---------------------------------------------------------------------------
+# ROS2 middleware tuning (applies to every task in the env)
+# All nodes (move_group, servo_node, ur_servo_controller, RViz) run on THIS
+# host, and the robot link is raw TCP (RTDE/URCap sockets, not DDS) — so we
+# pin DDS to localhost for deterministic, jitter-free loopback transport.
+#   - CycloneDDS: lower/steadier latency than the default for realtime control.
+#   - LOCALHOST discovery + fixed domain: no network discovery traffic/jitter,
+#     and no cross-talk with other ROS2 hosts on the LAN.
+# To revert, comment this block out (falls back to rmw_fastrtps_cpp).
+# ---------------------------------------------------------------------------
+[activation.env]
+RMW_IMPLEMENTATION            = "rmw_cyclonedds_cpp"
+ROS_DOMAIN_ID                 = "42"
+ROS_AUTOMATIC_DISCOVERY_RANGE = "LOCALHOST"
+
+# ---------------------------------------------------------------------------
 # Core ROS2 + robot stack
 # ---------------------------------------------------------------------------
 [dependencies]
+ros-jazzy-rmw-cyclonedds-cpp = "*"
 ros-jazzy-desktop           = "*"
 ros-jazzy-ur-robot-driver   = "*"
 ros-jazzy-ur-description    = "*"

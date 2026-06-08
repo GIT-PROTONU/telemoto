@@ -18,6 +18,7 @@ Reply packet — 11 × int32 big-endian, read as p[1..11]:
   p[10] lookahead×1000 (ms) · p[11] servoj duration×1e6 (µs)
 """
 import base64
+import gc
 import hashlib
 import json
 import socket
@@ -34,6 +35,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TwistStamped
@@ -50,10 +52,9 @@ UR_JOINT_ORDER = [
 REVERSE_PORT = 50001        # URCap requests the script here AND robot connects back
 WEB_PORT     = 8080
 MULT         = 1_000_000
-MODE_SERVOJ  = 1            # position control (planned moves, hold)
-MODE_SPEEDJ  = 2            # joint-velocity control (jogging)
-JOG_SPEED_DEF = 0.12       # m/s at full axis (default)
-JOG_ACCEL_DEF = 15.0       # rad/s^2 speedj ramp (default)
+MODE_SERVOJ  = 1            # position control (planned moves AND WASD jog)
+MODE_SPEEDJ  = 2            # joint-velocity control (idle self-hold only)
+JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
 _ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
@@ -69,8 +70,8 @@ JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist)
 JOG_LEASE   = 0.1           # s — each jog command is a lease; if no new command
                             # arrives within this the robot stops (latency/drop
                             # safety + instant stop on key release)
-JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.02, 0.5    # m/s at full axis (web slider)
-JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 2.0,  40.0   # rad/s^2 speedj ramp (web slider)
+JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
+                                              # 5 mm/s floor → sub-mm taps for fine work
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -152,15 +153,12 @@ _WEB_PAGE = """<!doctype html>
      <b>Q/E</b> across (tool frame). Hold to move, release to stop. Robot must be connected.</div>
  </div>
  <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
-   <input type="range" id="jspeed" min="0.02" max="0.5" step="0.01">
-   <div class="hint">Cartesian jog velocity. Live.</div></div>
- <div class="row"><label>Jog acceleration <span class="val" id="jaccelv"></span></label>
-   <input type="range" id="jaccel" min="2" max="40" step="1">
-   <div class="hint">How sharply the jog ramps (speedj). Higher = snappier. Live.</div></div>
+   <input type="range" id="jspeed" min="0.005" max="0.5" step="0.005">
+   <div class="hint">Cartesian jog velocity &mdash; lower for mm-precise work. Live.</div></div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
-   jspeed:v=>(+v).toFixed(2)+" m/s",jaccel:v=>Math.round(v)+" rad/s\\u00b2"};
- const ids=["speed","gain","lookahead","jspeed","jaccel"];
+   jspeed:v=>Math.round(+v*1000)+" mm/s"};
+ const ids=["speed","gain","lookahead","jspeed"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -267,15 +265,11 @@ class URServoController(Node):
             floating_point_range=[FloatingPointRange(
                 from_value=LOOKAHEAD_MIN, to_value=LOOKAHEAD_MAX, step=0.005)]))
         self.declare_parameter("speed_scale", 1.0)   # trajectory time-scale (next move)
-        # WASD jog tuning (live): linear speed and speedj acceleration.
+        # WASD jog tuning (live): Cartesian linear speed (m/s at full axis).
         self.declare_parameter("jog_speed", JOG_SPEED_DEF, ParameterDescriptor(
             description="WASD jog linear speed m/s (live)",
             floating_point_range=[FloatingPointRange(
-                from_value=JOG_SPEED_MIN, to_value=JOG_SPEED_MAX, step=0.01)]))
-        self.declare_parameter("jog_accel", JOG_ACCEL_DEF, ParameterDescriptor(
-            description="WASD jog speedj acceleration rad/s^2 (live)",
-            floating_point_range=[FloatingPointRange(
-                from_value=JOG_ACCEL_MIN, to_value=JOG_ACCEL_MAX, step=1.0)]))
+                from_value=JOG_SPEED_MIN, to_value=JOG_SPEED_MAX, step=0.005)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -285,7 +279,6 @@ class URServoController(Node):
         self._lookahead = g("servoj_lookahead").get_parameter_value().double_value
         self._speed     = g("speed_scale").get_parameter_value().double_value
         self._jog_speed = g("jog_speed").get_parameter_value().double_value
-        self._jog_accel = g("jog_accel").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -298,22 +291,28 @@ class URServoController(Node):
 
         # WASD jog (MoveIt Servo): the web streams the desired twist at ~30 Hz
         # while a key is held; each command leases the twist for JOG_LEASE, so it
-        # zeroes itself on release / latency / drop. _qd_target is Servo's joint
-        # velocity, streamed as speedj while jogging.
+        # zeroes itself on release / latency / drop. _q_jog_target is Servo's
+        # integrated joint POSITION, servoj'd while jogging (closed-loop position
+        # tracking → drift-free and jitter-immune; None until Servo first emits).
         self._jog = [0.0] * 6
         self._jog_lease = 0.0                          # twist valid until this time
-        self._jog_mode = False                         # web toggle: stay in velocity mode
+        self._jog_mode = False                         # web toggle: stay in jog mode
         self._pub_lock = threading.Lock()              # serialise twist publishes
-        self._qd_target = [0.0] * 6
+        self._q_jog_target = None
         self._servo_active_until = 0.0
         self._dbg_pub_nz = False                        # diagnostics
         self._dbg_rx = 0
         self._dbg_log_t = 0.0
 
+        # Control streams carry only the latest sample (keep_last 1): for a jog
+        # at 30–250 Hz a stale command is worthless, so we never want a queue to
+        # build during a brief stall — always act on the freshest value.
+        ctrl_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                              reliability=ReliabilityPolicy.RELIABLE)
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
-        self.create_subscription(JointTrajectory, SERVO_OUT_TOPIC, self._servo_cb, 10)
-        self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, 10)
+        self.create_subscription(JointTrajectory, SERVO_OUT_TOPIC, self._servo_cb, ctrl_qos)
+        self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, ctrl_qos)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
             self, FollowJointTrajectory,
@@ -342,8 +341,6 @@ class URServoController(Node):
                 self._speed = float(_clamp(SPEED_MIN, SPEED_MAX, p.value))
             elif p.name == "jog_speed":
                 self._jog_speed = float(_clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, p.value))
-            elif p.name == "jog_accel":
-                self._jog_accel = float(_clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, p.value))
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
@@ -351,7 +348,6 @@ class URServoController(Node):
         if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
         if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
-        if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
@@ -386,19 +382,21 @@ class URServoController(Node):
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
     def _servo_cb(self, msg: JointTrajectory) -> None:
-        # Servo's joint velocities drive the speedj jog. Ignored during planned
-        # moves (the control loop prioritises the trajectory anyway).
+        # Servo integrates the twist into joint POSITIONS; we servoj to them, so
+        # jog is closed-loop position (drift-free, mm-precise) rather than
+        # open-loop velocity. Ignored during planned moves (the control loop
+        # prioritises the trajectory anyway).
         with self._traj_lock:
             if self._traj is not None:
                 return
-        if not msg.points or not msg.points[0].velocities:
+        if not msg.points or not msg.points[0].positions:
             return
         try:
-            qd = self._reorder(list(msg.joint_names), list(msg.points[0].velocities))
+            q = self._reorder(list(msg.joint_names), list(msg.points[0].positions))
         except ValueError:
             return
         with self._tgt_lock:
-            self._qd_target = qd
+            self._q_jog_target = q
         self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
 
     def _arm_servo(self) -> None:
@@ -462,7 +460,7 @@ class URServoController(Node):
                         connected = node._conn is not None
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
-                        "jspeed": round(node._jog_speed, 2), "jaccel": round(node._jog_accel, 0),
+                        "jspeed": round(node._jog_speed, 3),
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -681,13 +679,14 @@ class URServoController(Node):
             if q_traj is not None:
                 # planned move: servoj to the interpolated position.
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
-            elif now < self._servo_active_until:
-                # jogging: speedj to MoveIt Servo's joint velocity. The gain
-                # field carries the speedj acceleration (×100) for speedj mode.
+            elif now < self._servo_active_until and self._q_jog_target is not None:
+                # jogging: servoj to MoveIt Servo's integrated joint positions —
+                # closed-loop position tracking, drift-free and jitter-immune
+                # (a late cycle is reached late, not overshot). Same gain/
+                # lookahead as planned moves so the handoff is seamless.
                 with self._tgt_lock:
-                    qd = list(self._qd_target)
-                pkt = _pack(qd, MODE_SPEEDJ, int(self._jog_accel * 100),
-                            self._lookahead, step_t)
+                    q = list(self._q_jog_target)
+                pkt = _pack(q, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             else:
                 # idle: speedj(0) — the robot holds its own position, so there's
                 # no commanded target to snap back to after a jog.
@@ -770,6 +769,11 @@ def main() -> None:
     # fewer than the default (one per CPU) to spare the control-loop thread.
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+    # Realtime: take everything alive after setup out of the GC's scan set so the
+    # 125 Hz control loop never eats a collection pause (per-cycle lists are
+    # non-cyclic → freed immediately by refcounting; GC only adds jitter here).
+    gc.collect()
+    gc.freeze()
     try:
         executor.spin()
     except KeyboardInterrupt:

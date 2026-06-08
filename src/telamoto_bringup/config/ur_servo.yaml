@@ -7,15 +7,19 @@ publish_period: 0.004           # servo output rate [s] — faster = lower laten
 max_expected_latency: 0.03
 
 command_in_type: "speed_units"  # twist values are m/s and rad/s
-scale:                          # only used when command_in_type == unitless
-  linear: 0.2
-  rotational: 0.5
+# In speed_units mode `scale.linear/rotational` are the MAX linear/angular
+# velocities (a hard cap on the incoming twist), not just unitless scaling.
+# Keep linear == JOG_SPEED_MAX (0.5 m/s) in ur_servo_controller.py so the jog
+# slider's full range gets through instead of being clamped here.
+scale:
+  linear: 0.5                   # m/s cap — matches JOG_SPEED_MAX
+  rotational: 1.0               # rad/s cap (jog is linear-only today)
   joint: 0.5
 
 command_out_type: trajectory_msgs/JointTrajectory
 command_out_topic: /telamoto/servo_command
-publish_joint_positions: true    # used to hold position when jogging stops
-publish_joint_velocities: true   # used as the speedj command while jogging
+publish_joint_positions: true    # servoj'd directly: closed-loop position jog
+publish_joint_velocities: false  # unused — jog is position, not velocity (speedj)
 publish_joint_accelerations: false
 
 # Smoothing needs a configured plugin; keep off for now (enable once verified).

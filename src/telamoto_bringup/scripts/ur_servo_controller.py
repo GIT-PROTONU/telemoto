@@ -56,10 +56,20 @@ MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (WASD jog + idle self-hold)
 JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
 JOG_ACCEL_DEF = 1.0        # rad/s^2 — speedj acceleration (default; gentle ramp)
+JOG_COAST_DEF = 0.03       # s — how long a Servo velocity stays valid after the
+                           # last sample before falling back to zero (stop crispness)
 MAX_JOG_QD    = 0.5        # rad/s — HARD per-joint speed cap during jogging. The
                            # arm CANNOT exceed this no matter what Servo emits
                            # (singularity amplification, glitches). Safety net.
 TIMEOUT_MS   = 200          # robot counts a missed read after this long
+STEP_T       = 0.008        # s — servoj/speedj duration we command each cycle (=1
+                            # CB3 125 Hz cycle). The robot's pull loop runs at ≈2×
+                            # this (measured: 8 ms → 16 ms cycle ≈ 62 Hz; 50 ms →
+                            # 104 ms ≈ 10 Hz), so this constant sets the loop rate.
+                            # NOT a safety bound — the runaway guard is the URScript
+                            # read_timeout (TIMEOUT_MS) + miss→stopj. Fixed, not
+                            # dt-tracked: with the 2× robot behavior, feeding dt back
+                            # into step_t is positive feedback that pegs the rate low.
 _ZERO6       = [0.0] * 6
 # servoj-safe ranges (UR limits) for clamping + the web sliders.
 GAIN_MIN, GAIN_MAX           = 100, 2000
@@ -78,6 +88,12 @@ JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
                                               # 5 mm/s floor → sub-mm taps for fine work
 JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # rad/s^2 speedj accel (web slider);
                                               # lower = gentler start/stop
+JOG_COAST_MIN,  JOG_COAST_MAX  = 0.001, 0.2   # s coast window (web slider); lower =
+                                              # crisper stop. Floor >0 so the jog
+                                              # never self-zeros between Servo samples.
+                                              # NOTE: below ~the 4 ms Servo period /
+                                              # ~8 ms robot cycle the jog stutters
+                                              # (fails safe → stops), so keep ≥0.01 in use.
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -164,10 +180,14 @@ _WEB_PAGE = """<!doctype html>
  <div class="row"><label>Jog acceleration <span class="val" id="jaccelv"></span></label>
    <input type="range" id="jaccel" min="0.3" max="20" step="0.1">
    <div class="hint">speedj ramp rate &mdash; lower = gentler start/stop. Live.</div></div>
+ <div class="row"><label>Jog coast <span class="val" id="jcoastv"></span></label>
+   <input type="range" id="jcoast" min="0.001" max="0.2" step="0.001">
+   <div class="hint">Motion held after Servo goes quiet &mdash; lower = crisper stop. Live.</div></div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
-   jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" rad/s\\u00b2"};
- const ids=["speed","gain","lookahead","jspeed","jaccel"];
+   jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" rad/s\\u00b2",
+   jcoast:v=>Math.round(+v*1000)+" ms"};
+ const ids=["speed","gain","lookahead","jspeed","jaccel","jcoast"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -184,8 +204,8 @@ _WEB_PAGE = """<!doctype html>
  // WebSocket while a key is held, zero on release. WS is ordered + low-overhead.
  let jogOn=false; const held=new Set(); let stream=null, ws=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
- function jogVec(){return {lx:(held.has("q")?1:0)-(held.has("e")?1:0),
-   ly:(held.has("a")?1:0)-(held.has("d")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
+ function jogVec(){return {lx:(held.has("a")?1:0)-(held.has("d")?1:0),
+   ly:(held.has("q")?1:0)-(held.has("e")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
  function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
@@ -295,6 +315,10 @@ class URServoController(Node):
             description="WASD jog speedj acceleration rad/s^2; lower = gentler (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=JOG_ACCEL_MIN, to_value=JOG_ACCEL_MAX, step=0.1)]))
+        self.declare_parameter("jog_coast", JOG_COAST_DEF, ParameterDescriptor(
+            description="WASD jog coast window s; lower = crisper stop (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=JOG_COAST_MIN, to_value=JOG_COAST_MAX, step=0.001)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -305,6 +329,7 @@ class URServoController(Node):
         self._speed     = g("speed_scale").get_parameter_value().double_value
         self._jog_speed = g("jog_speed").get_parameter_value().double_value
         self._jog_accel = g("jog_accel").get_parameter_value().double_value
+        self._jog_coast = g("jog_coast").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -370,6 +395,8 @@ class URServoController(Node):
                 self._jog_speed = float(_clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, p.value))
             elif p.name == "jog_accel":
                 self._jog_accel = float(_clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, p.value))
+            elif p.name == "jog_coast":
+                self._jog_coast = float(_clamp(JOG_COAST_MIN, JOG_COAST_MAX, p.value))
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
@@ -378,6 +405,7 @@ class URServoController(Node):
         if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
         if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
         if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
+        if "jcoast" in q:    self._jog_coast = _clamp(JOG_COAST_MIN, JOG_COAST_MAX, float(q["jcoast"][0]))
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
@@ -425,7 +453,12 @@ class URServoController(Node):
             return
         with self._tgt_lock:
             self._qd_target = qd
-        self._servo_active_until = time.monotonic() + 0.12   # ~jog-active window
+        # Staleness window (jog_coast, live via web): command this velocity only
+        # until here, then fall back to zero. Tight (default 30 ms ≈
+        # max_expected_latency, ~7 Servo cycles at the 250 Hz publish_period) so the
+        # jog stops crisply with no coast, while still zeroing on Servo silence
+        # (crash/halt/drop) — the runaway guard. Floor (JOG_COAST_MIN) keeps it >0.
+        self._servo_active_until = time.monotonic() + self._jog_coast
 
     def _arm_servo(self) -> None:
         # Put MoveIt Servo in TWIST mode up front so even a quick tap is acted on
@@ -489,6 +522,7 @@ class URServoController(Node):
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
+                        "jcoast": round(node._jog_coast, 3),
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -671,9 +705,10 @@ class URServoController(Node):
     def _control_loop(self) -> None:
         self._js_ready.wait()
         first = True
-        health_t = last_req = time.monotonic()
+        health_t = last_req = last_send = time.monotonic()
         cycles = 0
         max_gap = 0.0
+        sum_wait = sum_host = 0.0   # robot-round-trip vs host-compute time per cycle
         while rclpy.ok():
             with self._conn_lock:
                 conn = self._conn
@@ -695,14 +730,23 @@ class URServoController(Node):
             dt = now - last_req                   # measured cycle → servoj duration
             last_req = now
             cycles += 1; max_gap = max(max_gap, dt)
+            sum_wait += now - last_send           # robot block + 2× wire (we were idle here)
             if now - health_t >= 5.0:
+                # Split the cycle: `wait` = time blocked on the robot (its step_t
+                # block + round-trip), `host` = our own per-cycle compute. If `host`
+                # is the big one, the bottleneck is on this box (GIL/scheduling); if
+                # `wait` dominates, it's the robot/protocol (step_t block, delayed
+                # ACK on the robot's TCP, URScript socket timing).
+                n = max(cycles, 1)
                 self.get_logger().info(
-                    f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms")
-                cycles = 0; max_gap = 0.0; health_t = now
+                    f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms | "
+                    f"avg wait {sum_wait/n*1000:.1f}ms, host {sum_host/n*1000:.2f}ms")
+                cycles = 0; max_gap = 0.0; sum_wait = sum_host = 0.0; health_t = now
 
-            # step duration = real cycle time so velocity == planned/commanded
-            # (clamp only extreme outliers; never below dt, which would spike it).
-            step_t = _clamp(0.002, 0.5, dt)
+            # Fixed servoj/speedj duration (see STEP_T). The robot blocks ≈2×STEP_T
+            # per pull, so this sets the loop rate; speedj holds the commanded
+            # velocity across the gap, so the jog stays smooth (no stutter).
+            step_t = STEP_T
             q_traj = self._traj_target(now)
             if q_traj is not None:
                 # planned move: servoj to the interpolated position.
@@ -725,6 +769,8 @@ class URServoController(Node):
                     self.get_logger().info("[ctrl] streaming to robot")
             except Exception:
                 self._drop(conn)
+            last_send = time.monotonic()
+            sum_host += last_send - now           # our per-cycle compute (recv→send)
 
     # ── FollowJointTrajectory action ────────────────────────────────────────────
 

@@ -1,31 +1,46 @@
-# Joint limits for the UR10 CB3.1 (match ur_description defaults)
+# Joint limits for the UR10 CB3.1 (match ur_description defaults).
+#
+# Acceleration limits are REQUIRED by the MoveIt Servo AccelerationLimitedPlugin
+# (config/ur_servo.yaml). They bound how fast Servo's velocity command may slew;
+# the robot's speedj ramp (jog_accel) must be >= this so it can always track the
+# command — otherwise you get a "Position deviates from path" protective stop at
+# high jog speed. 4.0 rad/s^2 reaches MAX_JOG_QD (0.5 rad/s) in ~125 ms at the
+# 250 Hz Servo rate: responsive, while clamping the un-trackable transient spikes.
+# This is THE knob to tune if high-speed jog still trips (lower) or feels laggy
+# (raise, and raise the jog_accel slider to match).
 joint_limits:
   shoulder_pan_joint:
     has_velocity_limits: true
     max_velocity: 2.094       # rad/s  (~120 deg/s)
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0     # rad/s^2
 
   shoulder_lift_joint:
     has_velocity_limits: true
     max_velocity: 2.094
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0
 
   elbow_joint:
     has_velocity_limits: true
     max_velocity: 3.142
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0
 
   wrist_1_joint:
     has_velocity_limits: true
     max_velocity: 3.142
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0
 
   wrist_2_joint:
     has_velocity_limits: true
     max_velocity: 3.142
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0
 
   wrist_3_joint:
     has_velocity_limits: true
     max_velocity: 3.142
-    has_acceleration_limits: false
+    has_acceleration_limits: true
+    max_acceleration: 4.0

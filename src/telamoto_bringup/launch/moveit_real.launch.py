@@ -127,7 +127,14 @@ def generate_launch_description():
         output="screen",
         parameters=[
             servo_params,
+            # Top-level (un-namespaced) params the AccelerationLimitedPlugin
+            # smoother reads directly off the node: planning_group_name and
+            # update_period (= publish_period). update_period has NO default and
+            # the plugin THROWS on init if it's missing → Servo never servos and
+            # WASD jog goes dead silent. Keep update_period == ur_servo.yaml's
+            # publish_period.
             {"planning_group_name": "ur_manipulator"},
+            {"update_period": 0.004},
             {"robot_description":          robot_description_content},
             {"robot_description_semantic": robot_description_semantic_content},
             _moveit_cfg.robot_description_kinematics,

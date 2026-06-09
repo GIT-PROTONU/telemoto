@@ -6,10 +6,12 @@ input register on this CB3 and there's no Remote Control mode to release them).
 
 Flow: pressing Play on the pendant makes the URCap connect to REVERSE_PORT and
 send "request_program"; we reply with a URScript that connects back to the same
-port and then PULLS one target per cycle (4-byte request, 11-int reply, then
-servoj/speedj). Robot-paced pull keeps motion gap-free (no vibration) with no
-TCP backlog. Each reply commands a fixed STEP_T duration; the robot's loop runs
-at ~2x that (~62 Hz) — see STEP_T.
+port and PIPELINES targets: it requests the next one, runs speedj/servoj on the
+current one (continuous motion, ~100% duty), then reads the reply that arrived
+DURING that motion (4-byte request, 11-int reply). Overlapping the socket round
+trip with the motion removes the idle gap of the old block-then-move loop (which
+made the arm average ~50% of commanded speed → "deviates from path" trip); the
+loop now runs ~125 Hz with no added latency. See _URSCRIPT.
 
 Two modes (packet p[8]): servoj (position) for planned moves + the idle hold,
 speedj (joint velocity) for WASD jogging via MoveIt Servo. A web UI on :8080
@@ -24,6 +26,7 @@ import base64
 import gc
 import hashlib
 import json
+import os
 import socket
 import struct
 import threading
@@ -97,6 +100,13 @@ JOG_COAST_MIN,  JOG_COAST_MAX  = 0.001, 0.2   # s coast window (web slider); low
                                               # NOTE: below ~the 4 ms Servo period /
                                               # ~8 ms robot cycle the jog stutters
                                               # (fails safe → stops), so keep ≥0.01 in use.
+STEP_T_MIN,     STEP_T_MAX     = 0.008, 0.05  # s speedj/servoj duration per cycle.
+                                              # Higher = the robot spends MORE of each
+                                              # cycle executing motion vs blocked on
+                                              # socket I/O → higher duty cycle → actual
+                                              # speed tracks commanded (fixes the ~50%
+                                              # velocity deficit) at the cost of a lower
+                                              # update rate. Tune live vs the cmd/act log.
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
@@ -110,42 +120,85 @@ _TUNE = (
     ("jog_speed",        "jspeed",    "_jog_speed", JOG_SPEED_MIN, JOG_SPEED_MAX, float),
     ("jog_accel",        "jaccel",    "_jog_accel", JOG_ACCEL_MIN, JOG_ACCEL_MAX, float),
     ("jog_coast",        "jcoast",    "_jog_coast", JOG_COAST_MIN, JOG_COAST_MAX, float),
+    ("step_t",           "stept",     "_step_t",    STEP_T_MIN,    STEP_T_MAX,    float),
 )
 
 # Served on request_program. The "# HEADER_*" anchors are mandatory (the URCap
-# splits header/body); we keep the header empty. A single missed read is
-# tolerated — the loop exits only after ~10 s of real silence.
+# splits header/body); we keep the header empty.
+#
+# PIPELINED pull loop. The old loop was: request → BLOCK on reply → speedj(8ms)
+# → repeat. speedj (the only moving part) ran ~8ms of every ~17ms cycle; the
+# other ~9ms was socket I/O with no active motion, and the velocity did NOT
+# persist across that gap → the arm averaged ~50% of the commanded speed → a
+# constant velocity deficit → position fell behind linearly → "deviates from
+# path" protective stop at higher speed.
+#
+# Now we overlap the socket round-trip WITH the motion: send the NEXT request,
+# run speedj/servoj on the CURRENT target (continuous, ~100% duty), then read the
+# reply — which already arrived during the motion — with a short timeout. No idle
+# gap → actual speed tracks commanded, no deficit, no trip, and the loop runs
+# faster (~125 Hz) so latency is the same or better. Single 4-byte request per
+# consumed reply (the `pending` guard) keeps the host handshake 1:1.
+#
+# SAFETY: motion is now continuous, so a dead host would otherwise coast on a
+# stale qd. The miss watchdog stopj's hard (8 rad/s²) after ~8 missed reads
+# (~60 ms) and the host-side MAX_JOG_QD cap + Servo singularity decel still apply.
 _URSCRIPT = """\
 # HEADER_BEGIN
 # HEADER_END
 textmsg("telamoto: external control active")
 socket_open("{host}", {port}, "reverse_socket")
-read_timeout = 0
+mode = 0
+qd = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+accel = 1.0
+gain = 300
+lookahead = 0.1
+step_t = 0.008
 misses = 0
-last_mode = 0
+pending = False
 keep_going = True
 while keep_going:
-  socket_send_int(1, "reverse_socket")
-  p = socket_read_binary_integer(11, "reverse_socket", read_timeout)
+  if not pending:
+    socket_send_int(1, "reverse_socket")
+    pending = True
+  end
+  # Execute the current target — this is where the arm moves, continuously.
+  if mode == 2:
+    speedj(qd, accel, step_t)
+  elif mode == 1:
+    servoj(q, t=step_t, lookahead_time=lookahead, gain=gain)
+  else:
+    sync()
+  end
+  # Consume the reply that arrived during the motion. Normally it is already
+  # buffered → returns immediately whatever the timeout. The 0.008 s timeout only
+  # bounds the wait on a genuine miss; it is deliberately ONE full 125 Hz tick:
+  # large enough to never round to 0 (which would block forever and defeat the
+  # watchdog), small enough that a dead host is caught in ~128 ms (8 misses).
+  p = socket_read_binary_integer(11, "reverse_socket", 0.008)
   if p[0] > 0:
+    pending = False
     misses = 0
-    read_timeout = p[1] / 1000.0
-    last_mode = p[8]
-    if p[8] == 1:
-      q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
-      servoj(q, t=p[11]/1000000.0, lookahead_time=p[10]/1000.0, gain=p[9])
-    elif p[8] == 2:
+    mode = p[8]
+    gain = p[9]
+    accel = p[9] / 100.0
+    lookahead = p[10] / 1000.0
+    step_t = p[11] / 1000000.0
+    if mode == 2:
       qd = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
-      # speedj acceleration is streamed live in p[9] (×100), so it's tunable.
-      speedj(qd, p[9]/100.0, p[11]/1000000.0)
+    elif mode == 1:
+      q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
     end
   else:
     misses = misses + 1
-    if last_mode == 2:
-      stopj(4.0)
-      last_mode = 0
+    if misses > 8:
+      if mode == 2:
+        stopj(8.0)
+      end
+      mode = 0
     end
-    if misses > 50:
+    if misses > 250:
       keep_going = False
     end
   end
@@ -174,6 +227,7 @@ _WEB_PAGE = """<!doctype html>
  <h1>Telamoto &mdash; motion tuning</h1>
  <div id="status" class="bad">connecting&hellip;</div>
  <div id="pendant" class="hint">pendant speed slider: &mdash;</div>
+ <div id="qd" class="hint">joint speed: &mdash; &nbsp;|&nbsp; 1.5s peak: &mdash; rad/s</div>
  <div class="row"><label>Speed <span class="val" id="speedv"></span></label>
    <input type="range" id="speed" min="0.25" max="3" step="0.05">
    <div class="hint">Overall move speed (also scales acceleration). Next move.</div></div>
@@ -211,10 +265,14 @@ _WEB_PAGE = """<!doctype html>
    st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
    st.className=s.connected?"ok":"bad";
    document.getElementById("pendant").textContent="pendant speed slider: "
-     +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");}catch(e){}}
+     +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");
+   const qd=document.getElementById("qd");
+   qd.textContent="joint speed: "+(s.qdnow==null?"\\u2014":s.qdnow.toFixed(3))
+     +" \\u2014 1.5s peak: "+(s.qdpeak==null?"\\u2014":s.qdpeak.toFixed(3))+" rad/s";
+   qd.style.color=(s.qdpeak>0.02)?"#ff7b72":"#888";}catch(e){}}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));}catch(e){}
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
-   refreshStatus();setInterval(refreshStatus,2000);}
+   refreshStatus();setInterval(refreshStatus,300);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
  // WASD jog: stream the direction as a CBOR binary frame at 30 Hz over a
@@ -336,6 +394,11 @@ class URServoController(Node):
             description="WASD jog coast window s; lower = crisper stop (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=JOG_COAST_MIN, to_value=JOG_COAST_MAX, step=0.001)]))
+        self.declare_parameter("step_t", STEP_T, ParameterDescriptor(
+            description="speedj/servoj duration per cycle s; higher = better speed "
+                        "tracking, lower update rate (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=STEP_T_MIN, to_value=STEP_T_MAX, step=0.001)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -347,6 +410,7 @@ class URServoController(Node):
         self._jog_speed = g("jog_speed").get_parameter_value().double_value
         self._jog_accel = g("jog_accel").get_parameter_value().double_value
         self._jog_coast = g("jog_coast").get_parameter_value().double_value
+        self._step_t    = g("step_t").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -371,6 +435,25 @@ class URServoController(Node):
         self._servo_active_until = 0.0
         self._jog_moving = False                        # for the moving/stopped log
         self._speed_fraction = None                     # pendant speed slider [0,1], read-only
+        # Trip diagnostics: when the connection drops (often a protective stop),
+        # _drop() classifies it against the last commanded motion. Lets us tell a
+        # mid-motion following-error from an on-release settle oscillation from a
+        # plain idle/user stop — see _drop.
+        self._last_motion_t = 0.0                       # monotonic t of last nonzero speedj
+        self._last_peak_qd = 0.0                        # |joint speed| at that moment (rad/s)
+        # ACTUAL joint speed (from RTDE actual_qd in /joint_states.velocity), for
+        # the web readout: lets us SEE the standstill ring / real jog speed instead
+        # of inferring it. _qd_now = current max |joint speed|; _qd_peak = ~1.5 s
+        # decaying peak-hold so a brief ring still registers between UI polls.
+        self._qd_now = 0.0
+        self._qd_peak = 0.0
+        self._qd_peak_t = 0.0
+        # Slew-limited jog command: we ramp the velocity WE send toward Servo's
+        # target at jog_accel rad/s², so the command never outruns what the robot
+        # can physically reach (no following-error trip) while still climbing to
+        # full speed. Gentle start + fast top speed; the felt acceleration is
+        # jog_accel. Reset to 0 whenever not jogging / between connects.
+        self._qd_cmd = [0.0] * 6
 
         # Control streams carry only the latest sample (keep_last 1): for a jog
         # at 30–250 Hz a stale command is worthless, so we never want a queue to
@@ -526,6 +609,7 @@ class URServoController(Node):
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "jcoast": round(node._jog_coast, 3),
                         "speedfrac": round(sf, 3) if sf is not None else None,
+                        "qdnow": round(node._qd_now, 3), "qdpeak": round(node._qd_peak, 3),
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -597,7 +681,15 @@ class URServoController(Node):
         if not self._js_ready.is_set():
             self._js_ready.set()
             self.get_logger().info("[ctrl] first joint states received")
-            self.destroy_subscription(self._js_sub)
+        # Kept subscribed (no longer self-destructs): track the actual measured
+        # joint speed for the web readout. msg.velocity is RTDE actual_qd.
+        if msg.velocity:
+            m = max(abs(v) for v in msg.velocity)
+            self._qd_now = m
+            now = time.monotonic()
+            if m >= self._qd_peak or now - self._qd_peak_t > 1.5:
+                self._qd_peak = m
+                self._qd_peak_t = now
 
     def _speed_cb(self, msg: Float64) -> None:
         self._speed_fraction = msg.data            # pendant speed slider, display only
@@ -668,7 +760,20 @@ class URServoController(Node):
                 self._conn = None
         try: conn.close()
         except Exception: pass
-        self.get_logger().warn("[server] robot disconnected — press Play to resume")
+        # Classify the drop against the last commanded motion. A protective stop
+        # closes the socket just like a user stop, so timing is the only tell:
+        #   MID-MOTION  → following error while moving (the classic high-speed trip)
+        #   ON-RELEASE  → tripped while decelerating/settling (overshoot/resonance)
+        #   IDLE        → no recent motion → almost certainly user stop / E-stop
+        dt = time.monotonic() - self._last_motion_t if self._last_motion_t else 1e9
+        if dt < 0.25:
+            kind = f"*** TRIP? MID-MOTION (peak {self._last_peak_qd:.3f} rad/s) ***"
+        elif dt < 2.0:
+            kind = f"*** TRIP? ON-RELEASE/SETTLE {dt:.2f}s after motion (peak {self._last_peak_qd:.3f} rad/s) ***"
+        else:
+            kind = f"IDLE ({dt:.1f}s since motion) — likely user/E-stop"
+        self.get_logger().warn(
+            f"[server] robot disconnected — press Play to resume | {kind}")
 
     # ── Control loop: robot-paced (request → reply) ─────────────────────────────
 
@@ -708,9 +813,51 @@ class URServoController(Node):
             return list(waypoints[-1][1])
         return self._interp(waypoints, now - t_start)
 
+    def _log_protective_stop(self, last_req: float) -> None:
+        """Classify a robot-stopped-requesting event (almost always a protective
+        stop) against the last commanded motion, so the trip self-labels:
+          MID-MOTION  → tripped while moving (following error)
+          ON-RELEASE  → tripped while decelerating/settling (overshoot/resonance)
+          IDLE        → no recent motion → user / E-stop / pendant pause."""
+        dt = last_req - self._last_motion_t if self._last_motion_t else 1e9
+        if dt < 0.25:
+            kind = f"MID-MOTION (peak {self._last_peak_qd:.3f} rad/s)"
+        elif dt < 2.0:
+            kind = f"ON-RELEASE/SETTLE {dt:.2f}s after motion (peak {self._last_peak_qd:.3f} rad/s)"
+        else:
+            kind = f"IDLE ({dt:.1f}s since motion) — user/E-stop"
+        self.get_logger().warn(
+            f"[ctrl] *** robot stopped requesting — likely PROTECTIVE STOP | {kind} ***")
+
+    def _promote_realtime(self) -> None:
+        """Put THIS thread (the robot pull-loop) on SCHED_FIFO so it preempts the
+        node's ~45 other threads the instant the robot's request arrives, instead of
+        waiting out a SCHED_OTHER timeslice. This keeps the loop timing steady (was
+        24–60 ms jitter → ~8 ms) AND is what makes the pipeline reliable: the reply
+        must be sent within the robot's speedj window, so a prompt RT wake-up keeps
+        replies on time and misses near zero. (The high-speed trip itself turned out
+        to be the speedj duty-cycle, fixed in the URScript — but steady timing still
+        matters here.) The loop is almost always blocked on the socket recv (GIL
+        released), so RT priority starves nothing and any GIL priority-inversion is
+        bounded to ~one GIL switch interval. Priority 20 is deliberate: every sibling
+        thread is SCHED_OTHER so even a low FIFO priority preempts them, while staying
+        BELOW MoveIt Servo's RT thread (40) and kernel net/IRQ threads. Best-effort:
+        needs the rtprio ulimit (setup/realtime-limits.sh); logs + continues if not."""
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(20))
+            self.get_logger().info("[ctrl] control loop promoted to SCHED_FIFO:20")
+        except (PermissionError, OSError) as exc:
+            self.get_logger().warn(
+                f"[ctrl] could not set SCHED_FIFO ({exc}); staying SCHED_OTHER — "
+                "high-speed jog may trip on scheduling gaps. "
+                "Check rtprio ulimit (setup/realtime-limits.sh).")
+
     def _control_loop(self) -> None:
         self._js_ready.wait()
+        self._promote_realtime()
         first = True
+        stalled = False                           # robot stopped pulling (trip detect)
+        last_diag = 0.0                           # throttle for cmd-vs-actual log
         health_t = last_req = time.monotonic()
         cycles = 0
         max_gap = 0.0
@@ -719,17 +866,31 @@ class URServoController(Node):
                 conn = self._conn
             if conn is None:
                 first = True
+                self._qd_cmd = [0.0] * 6           # robot is at rest → slew from 0 on reconnect
+                last_req = time.monotonic()         # avoid a huge dt (slew/health) on reconnect
                 time.sleep(0.01)
                 continue
             try:                                  # block until the robot requests
                 conn.settimeout(1.0)
                 req = self._recvall(conn, 4)
             except socket.timeout:
+                # Connected, but the robot stopped sending pull-requests — the
+                # signature of a PROTECTIVE STOP (URScript halts; it does NOT drop
+                # our socket, so we'd otherwise stream into the void unaware). Log
+                # once per stall, classified against the LAST successful request
+                # (detection-latency-independent).
+                if not stalled:
+                    stalled = True
+                    self._qd_cmd = [0.0] * 6       # robot halted → slew from 0 on resume
+                    self._log_protective_stop(last_req)
                 continue
             except Exception:
                 self._drop(conn); continue
             if req is None:
                 self._drop(conn); continue
+            if stalled:                           # robot came back (Play pressed)
+                stalled = False
+                self.get_logger().info("[ctrl] robot resumed pull-requests")
 
             now = time.monotonic()
             dt = now - last_req                   # measured cycle time (health only)
@@ -740,13 +901,15 @@ class URServoController(Node):
                     f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms")
                 cycles = 0; max_gap = 0.0; health_t = now
 
-            # Fixed servoj/speedj duration (see STEP_T). The robot blocks ≈2×STEP_T
-            # per pull, so this sets the loop rate; speedj holds the commanded
-            # velocity across the gap, so the jog stays smooth (no stutter).
-            step_t = STEP_T
+            # speedj/servoj duration per cycle = the loop period. With the pipelined
+            # URScript the motion runs continuously (≈100% duty) regardless of this,
+            # so step_t just sets the rate: 8 ms is the robot's 125 Hz floor (lowest
+            # latency) and is the right default — live-tunable, but no need to touch.
+            step_t = self._step_t
             q_traj = self._traj_target(now)
             if q_traj is not None:
                 # planned move: servoj to the interpolated position.
+                self._qd_cmd = [0.0] * 6              # reset slew state for next jog
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             else:
                 # jog / hold: speedj to Servo's joint velocity while jogging, else
@@ -754,9 +917,38 @@ class URServoController(Node):
                 # acceleration (jog_accel) shapes the ramp — lower it for a gentler
                 # start/stop. SAFETY: _cap_speed hard-limits the joint speed so a
                 # singularity-amplified Servo output can never make the arm shoot.
+                #
+                # Gate on ACTUAL jog intent (self._jog non-zero), not just on Servo
+                # freshness: the jog loop keeps Servo warm with zero-twist, so at
+                # standstill Servo still publishes tiny non-zero residual velocities.
+                # Streaming those as speedj makes the arm chase the residual = the
+                # standstill ring. When released, command a clean exact zero instead.
+                jogging = any(self._jog)
                 with self._tgt_lock:
-                    qd = self._qd_target if now < self._servo_active_until else _ZERO6
-                qd = _cap_speed(qd, MAX_JOG_QD)
+                    target = self._qd_target if (jogging and now < self._servo_active_until) else _ZERO6
+                target = _cap_speed(target, MAX_JOG_QD)
+                # Slew-limit our command toward the target at jog_accel rad/s² (clamp
+                # dt so a stall can't make it jump). The pipelined URScript is what
+                # fixed the trip (the robot now holds the commanded velocity — no
+                # duty-cycle deficit); this slew is purely for FEEL: a gentle ramp UP
+                # and a clean ramp DOWN to exact zero on release (smooth stop, no
+                # residual ring). jog_accel is the single smoothness knob.
+                step = self._jog_accel * min(dt, 0.05)
+                qd = [c + _clamp(-step, step, t - c) for c, t in zip(self._qd_cmd, target)]
+                self._qd_cmd = qd
+                peak = max((abs(x) for x in qd), default=0.0)
+                if peak > 1e-4:                          # remember last real motion (for _drop)
+                    self._last_motion_t = now
+                    self._last_peak_qd = peak
+                # Diagnostic (throttled): target (Servo demand) vs cmd (our slewed
+                # command) vs act (RTDE actual_qd). Healthy = act tracks cmd closely;
+                # cmd lags target only during the ramp, then converges.
+                if (peak > 1e-4 or any(target)) and now - last_diag >= 0.3:
+                    last_diag = now
+                    tgt = max((abs(x) for x in target), default=0.0)
+                    self.get_logger().info(
+                        f"[jog] tgt={tgt:.3f} cmd={peak:.3f} act={self._qd_now:.3f} rad/s "
+                        f"(accel={self._jog_accel:.1f} step_t={self._step_t*1000:.0f}ms)")
                 pkt = _pack(qd, MODE_SPEEDJ, int(self._jog_accel * 100),
                             self._lookahead, step_t)
             try:

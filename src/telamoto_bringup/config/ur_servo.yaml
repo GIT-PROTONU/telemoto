@@ -22,8 +22,17 @@ publish_joint_positions: true    # used to seed the servoj hold when jogging sto
 publish_joint_velocities: true   # the speedj command stream while jogging
 publish_joint_accelerations: false
 
-# Smoothing needs a configured plugin; keep off for now (enable once verified).
+# Smoothing DISABLED again (2026-06-09). The AccelerationLimitedPlugin was wired
+# up + given accel limits (joint_limits.yaml) + the top-level update_period param
+# (moveit_real.launch.py), and it ran — but it did NOT fix the high-speed
+# "Position deviates from path" trip and it INTRODUCED a standstill resonance
+# (the OSQP output appears to ring). Combined with raising jog_accel to match it,
+# that reproduced the old jog oscillation. Reverted to plain speedj. The plugin
+# scaffolding (limits + update_period) is left in place so re-enabling is one line
+# if we revisit. The real win this round was the SCHED_FIFO control loop (steady
+# 17 ms cycle, was 24–60 ms) — see ur_servo_controller._promote_realtime.
 use_smoothing: false
+# smoothing_filter_plugin_name: "online_signal_smoothing::AccelerationLimitedPlugin"
 
 # move_group owns the planning scene; servo just reads it.
 is_primary_planning_scene_monitor: false

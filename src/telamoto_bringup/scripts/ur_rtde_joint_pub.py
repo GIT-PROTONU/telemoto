@@ -37,11 +37,14 @@ CMD_START            = 83   # 0x53 'S'
 CMD_DATA_PACKAGE     = 85   # 0x55 'U'
 
 # Request order fixes the byte layout of each DATA_PACKAGE: actual_q (VECTOR6D,
-# 48 B) then target_speed_fraction (DOUBLE, 8 B). The speed var is optional — if
-# the robot doesn't expose it, joint states still stream unchanged.
-OUTPUT_VARS = "actual_q,target_speed_fraction"
-Q_BYTES     = 1 + 48        # recipe_id + 6×float64
-SPEED_BYTES = Q_BYTES + 8   #            + 1×float64
+# 48 B), actual_qd (VECTOR6D, 48 B — measured joint speeds, for observability:
+# lets us SEE the standstill ring and how fast the arm really moves), then
+# target_speed_fraction (DOUBLE, 8 B). actual_q/actual_qd are core RTDE outputs
+# (always present); the speed var is optional.
+OUTPUT_VARS = "actual_q,actual_qd,target_speed_fraction"
+Q_BYTES     = 1 + 48        # recipe_id + actual_q (6×float64)
+QD_BYTES    = Q_BYTES + 48  #            + actual_qd (6×float64)
+SPEED_BYTES = QD_BYTES + 8  #            + target_speed_fraction (1×float64)
 STREAM_FREQ = 125.0
 
 
@@ -94,10 +97,11 @@ class URRTDEJointPublisher(Node):
         self._reader.start()
 
     # ------------------------------------------------------------------
-    def _connect(self) -> tuple[socket.socket, int, bool]:
+    def _connect(self) -> tuple[socket.socket, int, bool, bool]:
         """Open RTDE, negotiate v2, setup outputs, start.
-        Returns (sock, recipe_id, have_speed) — have_speed False if the robot
-        didn't accept target_speed_fraction (joint states still work)."""
+        Returns (sock, recipe_id, have_qd, have_speed) — the have_* flags are
+        False if the robot didn't accept that optional var (joint positions still
+        stream regardless)."""
         while rclpy.ok():
             try:
                 self.get_logger().info(f"Connecting to RTDE at {self._robot_ip}:30004 ...")
@@ -122,21 +126,27 @@ class URRTDEJointPublisher(Node):
                     raise RuntimeError(f"SETUP_OUTPUTS failed: {data!r}")
                 recipe_id = data[0]
                 types = data[1:].decode(errors="replace").split(",")
-                have_speed = len(types) >= 2 and types[1] == "DOUBLE"
-                if not have_speed:
+                # types[0]=actual_q, [1]=actual_qd, [2]=target_speed_fraction.
+                # The byte offsets below assume actual_qd is present (it's a core
+                # output); if it somehow isn't, drop qd+speed parsing so the fixed
+                # offsets can't misread — joint positions still stream unchanged.
+                have_qd    = len(types) >= 2 and types[1] == "VECTOR6D"
+                have_speed = have_qd and len(types) >= 3 and types[2] == "DOUBLE"
+                if not have_qd:
                     self.get_logger().warn(
-                        "RTDE: target_speed_fraction unavailable — speed slider not shown")
+                        "RTDE: actual_qd unavailable — no velocity/speed readout")
 
                 send_rtde(s, CMD_START)
                 cmd, data = recv_rtde(s)
                 if data != b"\x01":
                     raise RuntimeError(f"START failed: {data.hex()}")
 
+                extras = "".join(("+qd" if have_qd else "", "+speed" if have_speed else ""))
                 self.get_logger().info(
-                    f"RTDE streaming actual_q{'+speed' if have_speed else ''} at "
+                    f"RTDE streaming actual_q{extras} at "
                     f"{STREAM_FREQ} Hz (recipe_id={recipe_id})"
                 )
-                return s, recipe_id, have_speed
+                return s, recipe_id, have_qd, have_speed
             except Exception as exc:
                 self.get_logger().warn(f"RTDE connect failed: {exc} — retry in 2 s")
                 try:
@@ -151,22 +161,25 @@ class URRTDEJointPublisher(Node):
         """Background loop: reads RTDE data packets as fast as the robot sends them."""
         while rclpy.ok():
             try:
-                sock, recipe_id, have_speed = self._connect()
+                sock, recipe_id, have_qd, have_speed = self._connect()
                 last_frac = None                       # republish on each reconnect
                 while rclpy.ok():
                     cmd, data = recv_rtde(sock)
                     if cmd != CMD_DATA_PACKAGE or data[0] != recipe_id:
                         continue
-                    # DATA_PACKAGE: recipe_id (uint8) + VECTOR6D (48 B) [+ DOUBLE (8 B)].
-                    # Joint states are CRITICAL (they seed MoveIt Servo) and must never
-                    # depend on the optional speed var — publish on actual_q alone.
+                    # DATA_PACKAGE: recipe_id + actual_q(48 B) [+ actual_qd(48 B)]
+                    # [+ target_speed_fraction(8 B)]. Joint POSITIONS are CRITICAL
+                    # (they seed MoveIt Servo) and must never depend on an optional
+                    # var — publish on actual_q alone; attach qd only when present.
                     if len(data) >= Q_BYTES:
                         self._msg.header.stamp = self.get_clock().now().to_msg()
                         self._msg.position = list(struct.unpack(">6d", data[1:Q_BYTES]))
+                        if have_qd and len(data) >= QD_BYTES:
+                            self._msg.velocity = list(struct.unpack(">6d", data[Q_BYTES:QD_BYTES]))
                         self._pub.publish(self._msg)
                     # Speed slider: a bonus, only when the extra bytes are present.
                     if have_speed and len(data) >= SPEED_BYTES:
-                        frac = struct.unpack(">d", data[Q_BYTES:SPEED_BYTES])[0]
+                        frac = struct.unpack(">d", data[QD_BYTES:SPEED_BYTES])[0]
                         if last_frac is None or abs(frac - last_frac) > 1e-4:
                             last_frac = frac
                             self._speed_pub.publish(Float64(data=frac))

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Minimal RTDE reader that subscribes to actual_q outputs only and publishes /joint_states.
+"""Minimal RTDE reader: publishes /joint_states from actual_q, plus the pendant
+speed-slider setting (target_speed_fraction) on /telamoto/speed_fraction.
 
 CB3 3.15 PolyScopeX holds all RTDE INPUT variables internally, making ur_robot_driver's
 on_configure() always fail. We bypass the driver: only RTDE OUTPUTS (read-only) are used.
+(So we can READ the speed slider here, but not set it — there's no RTDE-input path.)
 
 RTDE protocol notes:
   DATA_PACKAGE cmd = 85 (0x55 = 'U'), NOT 82
-  SETUP_OUTPUTS response: recipe_id uint8 (1 byte) + ASCII type names
+  SETUP_OUTPUTS response: recipe_id uint8 (1 byte) + comma-separated ASCII type names
   DATA_PACKAGE: recipe_id uint8 (1 byte) + packed binary variable data
 """
 import gc
@@ -16,7 +18,9 @@ import threading
 import time
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64
 
 JOINT_NAMES = [
     "shoulder_pan_joint",
@@ -32,7 +36,12 @@ CMD_SETUP_OUTPUTS    = 79   # 0x4F 'O'
 CMD_START            = 83   # 0x53 'S'
 CMD_DATA_PACKAGE     = 85   # 0x55 'U'
 
-OUTPUT_VARS = "actual_q"
+# Request order fixes the byte layout of each DATA_PACKAGE: actual_q (VECTOR6D,
+# 48 B) then target_speed_fraction (DOUBLE, 8 B). The speed var is optional — if
+# the robot doesn't expose it, joint states still stream unchanged.
+OUTPUT_VARS = "actual_q,target_speed_fraction"
+Q_BYTES     = 1 + 48        # recipe_id + 6×float64
+SPEED_BYTES = Q_BYTES + 8   #            + 1×float64
 STREAM_FREQ = 125.0
 
 
@@ -70,6 +79,13 @@ class URRTDEJointPublisher(Node):
         self._msg = JointState()
         self._msg.name = JOINT_NAMES
 
+        # Pendant speed-slider fraction [0,1], LATCHED so a late subscriber (the
+        # web UI in ur_servo_controller) gets the last value immediately. Published
+        # only on change — the slider rarely moves, so this is near-silent.
+        latched = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._speed_pub = self.create_publisher(Float64, "/telamoto/speed_fraction", latched)
+
         # Read AND publish straight off the RTDE stream (full 125 Hz): no
         # downsampling timer, so /joint_states is as fresh as the robot makes it
         # — the smoothest possible state seed for MoveIt Servo and move_group.
@@ -78,8 +94,10 @@ class URRTDEJointPublisher(Node):
         self._reader.start()
 
     # ------------------------------------------------------------------
-    def _connect(self) -> tuple[socket.socket, int]:
-        """Open RTDE, negotiate v2, setup outputs, start. Returns (sock, recipe_id)."""
+    def _connect(self) -> tuple[socket.socket, int, bool]:
+        """Open RTDE, negotiate v2, setup outputs, start.
+        Returns (sock, recipe_id, have_speed) — have_speed False if the robot
+        didn't accept target_speed_fraction (joint states still work)."""
         while rclpy.ok():
             try:
                 self.get_logger().info(f"Connecting to RTDE at {self._robot_ip}:30004 ...")
@@ -97,10 +115,17 @@ class URRTDEJointPublisher(Node):
                 payload = struct.pack(">d", STREAM_FREQ) + OUTPUT_VARS.encode()
                 send_rtde(s, CMD_SETUP_OUTPUTS, payload)
                 cmd, data = recv_rtde(s)
-                # data[0] = recipe_id (uint8), data[1:] = ASCII type name(s)
+                # data[0] = recipe_id (uint8), data[1:] = comma-separated type names.
+                # An unrecognised var comes back "NOT_FOUND" and is dropped from the
+                # package, so confirm target_speed_fraction was accepted as DOUBLE.
                 if len(data) < 1 or data[0] == 0:
                     raise RuntimeError(f"SETUP_OUTPUTS failed: {data!r}")
                 recipe_id = data[0]
+                types = data[1:].decode(errors="replace").split(",")
+                have_speed = len(types) >= 2 and types[1] == "DOUBLE"
+                if not have_speed:
+                    self.get_logger().warn(
+                        "RTDE: target_speed_fraction unavailable — speed slider not shown")
 
                 send_rtde(s, CMD_START)
                 cmd, data = recv_rtde(s)
@@ -108,9 +133,10 @@ class URRTDEJointPublisher(Node):
                     raise RuntimeError(f"START failed: {data.hex()}")
 
                 self.get_logger().info(
-                    f"RTDE streaming actual_q at {STREAM_FREQ} Hz (recipe_id={recipe_id})"
+                    f"RTDE streaming actual_q{'+speed' if have_speed else ''} at "
+                    f"{STREAM_FREQ} Hz (recipe_id={recipe_id})"
                 )
-                return s, recipe_id
+                return s, recipe_id, have_speed
             except Exception as exc:
                 self.get_logger().warn(f"RTDE connect failed: {exc} — retry in 2 s")
                 try:
@@ -125,14 +151,25 @@ class URRTDEJointPublisher(Node):
         """Background loop: reads RTDE data packets as fast as the robot sends them."""
         while rclpy.ok():
             try:
-                sock, recipe_id = self._connect()
+                sock, recipe_id, have_speed = self._connect()
+                last_frac = None                       # republish on each reconnect
                 while rclpy.ok():
                     cmd, data = recv_rtde(sock)
-                    # DATA_PACKAGE: recipe_id (uint8) + VECTOR6D (6×float64 = 48 bytes)
-                    if cmd == CMD_DATA_PACKAGE and len(data) >= 49 and data[0] == recipe_id:
+                    if cmd != CMD_DATA_PACKAGE or data[0] != recipe_id:
+                        continue
+                    # DATA_PACKAGE: recipe_id (uint8) + VECTOR6D (48 B) [+ DOUBLE (8 B)].
+                    # Joint states are CRITICAL (they seed MoveIt Servo) and must never
+                    # depend on the optional speed var — publish on actual_q alone.
+                    if len(data) >= Q_BYTES:
                         self._msg.header.stamp = self.get_clock().now().to_msg()
-                        self._msg.position = list(struct.unpack(">6d", data[1:49]))
+                        self._msg.position = list(struct.unpack(">6d", data[1:Q_BYTES]))
                         self._pub.publish(self._msg)
+                    # Speed slider: a bonus, only when the extra bytes are present.
+                    if have_speed and len(data) >= SPEED_BYTES:
+                        frac = struct.unpack(">d", data[Q_BYTES:SPEED_BYTES])[0]
+                        if last_frac is None or abs(frac - last_frac) > 1e-4:
+                            last_frac = frac
+                            self._speed_pub.publish(Float64(data=frac))
             except Exception as exc:
                 if rclpy.ok():
                     self.get_logger().warn(f"RTDE stream lost: {exc} — reconnecting")

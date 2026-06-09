@@ -5,17 +5,20 @@ Control URCap — no ur_robot_driver, no RTDE inputs (PolyScope owns every RTDE
 input register on this CB3 and there's no Remote Control mode to release them).
 
 Flow: pressing Play on the pendant makes the URCap connect to REVERSE_PORT and
-send "request_program"; we reply with a servoj URScript that connects back to
-the same port and then PULLS one target per cycle (sends a 4-byte request, reads
-a reply, servoj()s). Robot-paced pull keeps servoj gap-free (no vibration) with
-no TCP backlog, and we stream the measured cycle time as servoj's duration so
-commanded velocity == planned velocity despite jitter (else → protective stops).
+send "request_program"; we reply with a URScript that connects back to the same
+port and then PULLS one target per cycle (4-byte request, 11-int reply, then
+servoj/speedj). Robot-paced pull keeps motion gap-free (no vibration) with no
+TCP backlog. Each reply commands a fixed STEP_T duration; the robot's loop runs
+at ~2x that (~62 Hz) — see STEP_T.
 
-A tiny web UI on :8080 tunes Speed / Stiffness (gain) / Smoothness (lookahead).
+Two modes (packet p[8]): servoj (position) for planned moves + the idle hold,
+speedj (joint velocity) for WASD jogging via MoveIt Servo. A web UI on :8080
+tunes speed/stiffness/smoothness + the jog and streams WASD over a WebSocket.
 
-Reply packet — 11 × int32 big-endian, read as p[1..11]:
-  p[1] timeout_ms · p[2..7] q×MULT · p[8] mode(1=servoj) · p[9] gain ·
-  p[10] lookahead×1000 (ms) · p[11] servoj duration×1e6 (µs)
+Reply packet — 11 x int32 big-endian, read as p[1..11]:
+  p[1] timeout_ms . p[2..7] q x MULT . p[8] mode (1=servoj, 2=speedj) .
+  p[9] servoj gain OR speedj accel x100 . p[10] lookahead x1000 (ms) .
+  p[11] step duration x1e6 (us)
 """
 import base64
 import gc
@@ -28,16 +31,15 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 handshake magic
-
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64
 from geometry_msgs.msg import TwistStamped
 from trajectory_msgs.msg import JointTrajectory
 from moveit_msgs.srv import ServoCommandType
@@ -51,6 +53,7 @@ UR_JOINT_ORDER = [
 ]
 REVERSE_PORT = 50001        # URCap requests the script here AND robot connects back
 WEB_PORT     = 8080
+_WS_GUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 handshake magic
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (WASD jog + idle self-hold)
@@ -97,6 +100,17 @@ JOG_COAST_MIN,  JOG_COAST_MAX  = 0.001, 0.2   # s coast window (web slider); low
 SERVO_TWIST_TOPIC = "/servo_node/delta_twist_cmds"
 SERVO_OUT_TOPIC   = "/telamoto/servo_command"
 SERVO_TYPE_SRV    = "/servo_node/switch_command_type"
+
+# Live-tunable knobs — single source of truth for the ROS-param callback, the web
+# setter, and clamping: (ros_param, web_key, attr, lo, hi, cast).
+_TUNE = (
+    ("speed_scale",      "speed",     "_speed",     SPEED_MIN,     SPEED_MAX,     float),
+    ("servoj_gain",      "gain",      "_gain",      GAIN_MIN,      GAIN_MAX,      int),
+    ("servoj_lookahead", "lookahead", "_lookahead", LOOKAHEAD_MIN, LOOKAHEAD_MAX, float),
+    ("jog_speed",        "jspeed",    "_jog_speed", JOG_SPEED_MIN, JOG_SPEED_MAX, float),
+    ("jog_accel",        "jaccel",    "_jog_accel", JOG_ACCEL_MIN, JOG_ACCEL_MAX, float),
+    ("jog_coast",        "jcoast",    "_jog_coast", JOG_COAST_MIN, JOG_COAST_MAX, float),
+)
 
 # Served on request_program. The "# HEADER_*" anchors are mandatory (the URCap
 # splits header/body); we keep the header empty. A single missed read is
@@ -159,6 +173,7 @@ _WEB_PAGE = """<!doctype html>
 <body>
  <h1>Telamoto &mdash; motion tuning</h1>
  <div id="status" class="bad">connecting&hellip;</div>
+ <div id="pendant" class="hint">pendant speed slider: &mdash;</div>
  <div class="row"><label>Speed <span class="val" id="speedv"></span></label>
    <input type="range" id="speed" min="0.25" max="3" step="0.05">
    <div class="hint">Overall move speed (also scales acceleration). Next move.</div></div>
@@ -194,7 +209,9 @@ _WEB_PAGE = """<!doctype html>
  async function refreshStatus(){try{const s=await(await fetch("/api/state")).json();
    const st=document.getElementById("status");
    st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
-   st.className=s.connected?"ok":"bad";}catch(e){}}
+   st.className=s.connected?"ok":"bad";
+   document.getElementById("pendant").textContent="pendant speed slider: "
+     +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");}catch(e){}}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));}catch(e){}
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
    refreshStatus();setInterval(refreshStatus,2000);}
@@ -352,9 +369,8 @@ class URServoController(Node):
         self._pub_lock = threading.Lock()              # serialise twist publishes
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
-        self._dbg_pub_nz = False                        # diagnostics
-        self._dbg_rx = 0
-        self._dbg_log_t = 0.0
+        self._jog_moving = False                        # for the moving/stopped log
+        self._speed_fraction = None                     # pendant speed slider [0,1], read-only
 
         # Control streams carry only the latest sample (keep_last 1): for a jog
         # at 30–250 Hz a stale command is worthless, so we never want a queue to
@@ -362,6 +378,11 @@ class URServoController(Node):
         ctrl_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                               reliability=ReliabilityPolicy.RELIABLE)
         self._js_sub = self.create_subscription(JointState, "/joint_states", self._js_cb, 10)
+        # Pendant speed-slider fraction from ur_rtde_joint_pub — latched (matches
+        # the publisher) so we get the last value on subscribe; display only.
+        latched = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Float64, "/telamoto/speed_fraction", self._speed_cb, latched)
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
         self.create_subscription(JointTrajectory, SERVO_OUT_TOPIC, self._servo_cb, ctrl_qos)
         self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, ctrl_qos)
@@ -384,28 +405,17 @@ class URServoController(Node):
     # ── Live tuning (params + web) ──────────────────────────────────────────────
 
     def _on_set_params(self, params) -> SetParametersResult:
+        spec = {ros: (attr, lo, hi, cast) for ros, _, attr, lo, hi, cast in _TUNE}
         for p in params:
-            if p.name == "servoj_gain":
-                self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, p.value))
-            elif p.name == "servoj_lookahead":
-                self._lookahead = float(_clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, p.value))
-            elif p.name == "speed_scale":
-                self._speed = float(_clamp(SPEED_MIN, SPEED_MAX, p.value))
-            elif p.name == "jog_speed":
-                self._jog_speed = float(_clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, p.value))
-            elif p.name == "jog_accel":
-                self._jog_accel = float(_clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, p.value))
-            elif p.name == "jog_coast":
-                self._jog_coast = float(_clamp(JOG_COAST_MIN, JOG_COAST_MAX, p.value))
+            if p.name in spec:
+                attr, lo, hi, cast = spec[p.name]
+                setattr(self, attr, cast(_clamp(lo, hi, float(p.value))))
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
-        if "speed" in q:     self._speed = _clamp(SPEED_MIN, SPEED_MAX, float(q["speed"][0]))
-        if "gain" in q:      self._gain = int(_clamp(GAIN_MIN, GAIN_MAX, float(q["gain"][0])))
-        if "lookahead" in q: self._lookahead = _clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX, float(q["lookahead"][0]))
-        if "jspeed" in q:    self._jog_speed = _clamp(JOG_SPEED_MIN, JOG_SPEED_MAX, float(q["jspeed"][0]))
-        if "jaccel" in q:    self._jog_accel = _clamp(JOG_ACCEL_MIN, JOG_ACCEL_MAX, float(q["jaccel"][0]))
-        if "jcoast" in q:    self._jog_coast = _clamp(JOG_COAST_MIN, JOG_COAST_MAX, float(q["jcoast"][0]))
+        for _, web, attr, lo, hi, cast in _TUNE:
+            if web in q:
+                setattr(self, attr, cast(_clamp(lo, hi, float(q[web][0]))))
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
@@ -417,7 +427,6 @@ class URServoController(Node):
                      sp * _clamp(-1.0, 1.0, ly),
                      sp * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
         self._jog_lease = time.monotonic() + JOG_LEASE
-        self._dbg_rx += 1
         self._publish_twist()                       # publish NOW, don't wait for the loop
 
     def _publish_twist(self) -> None:
@@ -479,23 +488,15 @@ class URServoController(Node):
         self._arm_servo()
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
-            now = time.monotonic()
-            if now >= self._jog_lease:                        # lease expired → stop
+            if time.monotonic() >= self._jog_lease:           # lease expired → stop
                 self._jog = _ZERO6
-            # Lightweight diagnostics: a sparse on/off line + a 2 s summary, so
-            # the realtime control loop isn't starved by per-command logging.
-            pub_nz = any(self._jog)
-            if pub_nz != self._dbg_pub_nz:
-                self._dbg_pub_nz = pub_nz
-                self.get_logger().info(f"[jog] {'moving' if pub_nz else 'stopped'}")
-            if now - self._dbg_log_t >= 2.0:
-                if self._dbg_rx:
-                    self.get_logger().info(f"[jog] 2s: {self._dbg_rx} ws cmds")
-                self._dbg_rx = 0
-                self._dbg_log_t = now
-            # Background publisher: keeps Servo warm when idle and re-publishes
-            # the zero on lease expiry. Active commands are published instantly in
-            # _apply_jog, so this is just the steady fallback stream.
+            moving = any(self._jog)                           # log only on transition
+            if moving != self._jog_moving:
+                self._jog_moving = moving
+                self.get_logger().info(f"[jog] {'moving' if moving else 'stopped'}")
+            # Background publisher: keeps Servo warm when idle and re-publishes the
+            # zero on lease expiry. Active commands publish instantly in _apply_jog,
+            # so this is just the steady fallback stream.
             self._publish_twist()
 
     def _web_loop(self) -> None:
@@ -519,10 +520,12 @@ class URServoController(Node):
                 if self.path.startswith("/api/state"):
                     with node._conn_lock:
                         connected = node._conn is not None
+                    sf = node._speed_fraction
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "jcoast": round(node._jog_coast, 3),
+                        "speedfrac": round(sf, 3) if sf is not None else None,
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -595,6 +598,9 @@ class URServoController(Node):
             self._js_ready.set()
             self.get_logger().info("[ctrl] first joint states received")
             self.destroy_subscription(self._js_sub)
+
+    def _speed_cb(self, msg: Float64) -> None:
+        self._speed_fraction = msg.data            # pendant speed slider, display only
 
     # ── Reverse server: serves the script on request, then hands the socket to
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
@@ -705,10 +711,9 @@ class URServoController(Node):
     def _control_loop(self) -> None:
         self._js_ready.wait()
         first = True
-        health_t = last_req = last_send = time.monotonic()
+        health_t = last_req = time.monotonic()
         cycles = 0
         max_gap = 0.0
-        sum_wait = sum_host = 0.0   # robot-round-trip vs host-compute time per cycle
         while rclpy.ok():
             with self._conn_lock:
                 conn = self._conn
@@ -727,21 +732,13 @@ class URServoController(Node):
                 self._drop(conn); continue
 
             now = time.monotonic()
-            dt = now - last_req                   # measured cycle → servoj duration
+            dt = now - last_req                   # measured cycle time (health only)
             last_req = now
             cycles += 1; max_gap = max(max_gap, dt)
-            sum_wait += now - last_send           # robot block + 2× wire (we were idle here)
             if now - health_t >= 5.0:
-                # Split the cycle: `wait` = time blocked on the robot (its step_t
-                # block + round-trip), `host` = our own per-cycle compute. If `host`
-                # is the big one, the bottleneck is on this box (GIL/scheduling); if
-                # `wait` dominates, it's the robot/protocol (step_t block, delayed
-                # ACK on the robot's TCP, URScript socket timing).
-                n = max(cycles, 1)
                 self.get_logger().info(
-                    f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms | "
-                    f"avg wait {sum_wait/n*1000:.1f}ms, host {sum_host/n*1000:.2f}ms")
-                cycles = 0; max_gap = 0.0; sum_wait = sum_host = 0.0; health_t = now
+                    f"[ctrl] {cycles} cycles/5s, max gap {max_gap*1000:.1f}ms")
+                cycles = 0; max_gap = 0.0; health_t = now
 
             # Fixed servoj/speedj duration (see STEP_T). The robot blocks ≈2×STEP_T
             # per pull, so this sets the loop rate; speedj holds the commanded
@@ -769,8 +766,6 @@ class URServoController(Node):
                     self.get_logger().info("[ctrl] streaming to robot")
             except Exception:
                 self._drop(conn)
-            last_send = time.monotonic()
-            sum_host += last_send - now           # our per-cycle compute (recv→send)
 
     # ── FollowJointTrajectory action ────────────────────────────────────────────
 

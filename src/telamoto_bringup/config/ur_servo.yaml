@@ -13,7 +13,10 @@ command_in_type: "speed_units"  # twist values are m/s and rad/s
 # slider's full range gets through instead of being clamped here.
 scale:
   linear: 0.5                   # m/s cap — matches JOG_SPEED_MAX
-  rotational: 1.0               # rad/s cap (jog is linear-only today)
+  rotational: 1.0               # rad/s cap. The jog slider is linear-only, but the
+                                # orientation-hold injects a small capped angular
+                                # velocity (ORIENT_LOCK_MAX) to keep the TCP from
+                                # drifting; keep this ≥ that cap so it gets through.
   joint: 0.5
 
 command_out_type: trajectory_msgs/JointTrajectory

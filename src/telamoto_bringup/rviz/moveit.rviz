@@ -61,6 +61,15 @@ Visualization Manager:
       Value: true
       Visual Enabled: true
       Collision Enabled: false
+    - Class: rviz_default_plugins/InteractiveMarkers
+      Enable Transparency: true
+      Enabled: true
+      Interactive Markers Namespace: /scene_wall
+      Name: SceneWall
+      Show Axes: false
+      Show Descriptions: true
+      Show Visual Aids: false
+      Value: true
     - Acceleration_Scaling_Factor: 0.1
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true

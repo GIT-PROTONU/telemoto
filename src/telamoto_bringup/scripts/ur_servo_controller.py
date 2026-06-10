@@ -74,6 +74,8 @@ from moveit_msgs.srv import ServoCommandType
 from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
 )
+from rcl_interfaces.srv import SetParameters
+from rclpy.parameter import Parameter as RclpyParameter
 
 UR_JOINT_ORDER = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
@@ -187,6 +189,22 @@ JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
                                               # 5 mm/s floor → sub-mm taps for fine work
 JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider);
                                               # lower = gentler start/stop
+# Servo collision-monitor proximity thresholds [m] (web sliders): inside the
+# distance the jog gate drops to ×0.25 (DECELERATE_FOR_COLLISION), at contact ×0
+# (HALT_FOR_COLLISION). Pushed live to /servo_node's parameters — the controller
+# owns the UI value, servo owns the check.
+SELF_COLL_MIN,  SELF_COLL_MAX,  SELF_COLL_DEF  = 0.01, 0.5, 0.30
+SCENE_COLL_MIN, SCENE_COLL_MAX, SCENE_COLL_DEF = 0.01, 1.0, 0.50
+# Collision-halt ESCAPE: Servo's collision scale is computed from the robot's
+# ACTUAL state vs the scene (not from the command), so once the model touches a
+# scene object the status pins at HALT_FOR_COLLISION in every direction and a
+# plain ×0 gate would deadlock the jog at the wall. Escape rule: remember the
+# approach direction at the moment of the halt; commands that genuinely REVERSE
+# (within a 60° cone of the exact opposite) pass at the crawl gate, everything
+# else stays hard-blocked. Singularity halts are NOT escapable this way — Servo
+# itself is direction-aware there (DECELERATE_FOR_LEAVING_SINGULARITY).
+COLL_ESCAPE_GATE = 0.25     # crawl factor while backing out of a collision halt
+COLL_ESCAPE_DOT  = 0.5      # cos(60°): how opposed to the approach a command must be
 STEP_T_MIN,     STEP_T_MAX     = 0.008, 0.05  # s speedl/servoj duration per cycle.
                                               # Higher = the robot spends MORE of each
                                               # cycle executing motion vs blocked on
@@ -209,7 +227,17 @@ _TUNE = (
     ("step_t",           "stept",     "_step_t",    STEP_T_MIN,    STEP_T_MAX,    float),
     ("orient_lock_kp",   "okp",       "_orient_kp", ORIENT_KP_MIN, ORIENT_KP_MAX, float),
     ("path_lock_kp",     "pkp",       "_path_kp",   PATH_KP_MIN,   PATH_KP_MAX,   float),
+    ("self_collision_dist",  "selfd", "_self_coll",  SELF_COLL_MIN,  SELF_COLL_MAX,  float),
+    ("scene_collision_dist", "walld", "_scene_coll", SCENE_COLL_MIN, SCENE_COLL_MAX, float),
 )
+
+# Tunables that live in /servo_node, not here: attr → servo parameter name.
+# Changes are coalesced and pushed via /servo_node/set_parameters (see
+# _push_collision_params) — both are dynamic in moveit_servo 2.12.
+_SERVO_PARAM_ATTRS = {
+    "_self_coll":  "moveit_servo.self_collision_proximity_threshold",
+    "_scene_coll": "moveit_servo.scene_collision_proximity_threshold",
+}
 
 # Served on request_program. The "# HEADER_*" anchors are mandatory (the URCap
 # splits header/body); we keep the header empty.
@@ -341,11 +369,20 @@ _WEB_PAGE = """<!doctype html>
    <input type="range" id="pkp" min="0" max="15" step="0.5">
    <div class="hint">Steers the TCP back onto the commanded line while jogging &mdash; raise for a
      tighter line, lower if it wiggles; 0 = off. Live.</div></div>
+ <div class="row"><label>Self-collision distance <span class="val" id="selfdv"></span></label>
+   <input type="range" id="selfd" min="0.01" max="0.5" step="0.01">
+   <div class="hint">Jog slows when robot links get this close to each other, stops at
+     contact. Live.</div></div>
+ <div class="row"><label>Wall distance <span class="val" id="walldv"></span></label>
+   <input type="range" id="walld" min="0.01" max="1" step="0.01">
+   <div class="hint">Jog slows this far from scene objects (the test wall), stops at
+     contact. Live.</div></div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
    jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" m/s\\u00b2",
-   okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1)};
- const ids=["speed","gain","lookahead","jspeed","jaccel","okp","pkp"];
+   okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1),
+   selfd:v=>Math.round(+v*100)+" cm",walld:v=>Math.round(+v*100)+" cm"};
+ const ids=["speed","gain","lookahead","jspeed","jaccel","okp","pkp","selfd","walld"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -557,6 +594,17 @@ class URServoController(Node):
                         "lower if it oscillates; 0 = off (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=PATH_KP_MIN, to_value=PATH_KP_MAX, step=0.5)]))
+        self.declare_parameter("self_collision_dist", SELF_COLL_DEF, ParameterDescriptor(
+            description="Servo self-collision proximity m: jog slows inside this "
+                        "link-to-link distance, halts at contact (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=SELF_COLL_MIN, to_value=SELF_COLL_MAX, step=0.01)]))
+        self.declare_parameter("scene_collision_dist", SCENE_COLL_DEF, ParameterDescriptor(
+            description="Servo scene-collision proximity m: jog slows inside this "
+                        "distance to world objects (e.g. test wall), halts at "
+                        "contact (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=SCENE_COLL_MIN, to_value=SCENE_COLL_MAX, step=0.01)]))
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -570,7 +618,16 @@ class URServoController(Node):
         self._step_t    = g("step_t").get_parameter_value().double_value
         self._orient_kp = g("orient_lock_kp").get_parameter_value().double_value
         self._path_kp   = g("path_lock_kp").get_parameter_value().double_value
+        self._self_coll  = g("self_collision_dist").get_parameter_value().double_value
+        self._scene_coll = g("scene_collision_dist").get_parameter_value().double_value
         self.add_on_set_parameters_callback(self._on_set_params)
+        # Collision distances live in /servo_node — coalesce slider drags and push
+        # via its parameter service. Dirty at startup so the first push syncs servo
+        # to OUR values regardless of what ur_servo.yaml shipped.
+        self._servo_param_cli = self.create_client(SetParameters, "/servo_node/set_parameters")
+        self._servo_params_dirty = True
+        self._servo_srv_was_ready = False
+        self.create_timer(0.25, self._push_collision_params)
 
         self._js_ready = threading.Event()           # set on first JointState
         self._traj = None                             # (waypoints, total_time, t_start)
@@ -661,6 +718,19 @@ class URServoController(Node):
         self._servo_gate = 1.0
         self._qd_gate = 1.0          # smooth singularity-amplification gate [0,1]
         self._qd_guard_t = 0.0
+        # Collision-halt escape state: the base_link-frame jog linear command last
+        # streamed (pre-gate) + its time, the captured approach direction while
+        # halted-for-collision (None = no escape allowed), and a log throttle.
+        self._last_lin = (0.0, 0.0, 0.0)
+        self._last_lin_t = 0.0
+        self._coll_block_dir = None
+        self._servo_code = ServoStatus.NO_WARNING
+        self._escape_log_t = 0.0
+        # Sentinel liveness: jog is only allowed while Servo's status is FRESH.
+        # Starts at 0 → jog blocked until the first status arrives, and a dead
+        # servo_node fails SAFE (gate 0) instead of coasting on the last verdict.
+        self._servo_status_t = 0.0
+        self._sentinel_warn_t = 0.0
         self.create_subscription(ServoStatus, SERVO_STATUS_TOPIC, self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
@@ -685,19 +755,57 @@ class URServoController(Node):
         for p in params:
             if p.name in spec:
                 attr, lo, hi, cast = spec[p.name]
-                setattr(self, attr, cast(_clamp(lo, hi, float(p.value))))
+                v = float(p.value)
+                if not math.isfinite(v):     # nan slips through _clamp as MAX
+                    continue
+                setattr(self, attr, cast(_clamp(lo, hi, v)))
+                if attr in _SERVO_PARAM_ATTRS:
+                    self._servo_params_dirty = True
         return SetParametersResult(successful=True)
 
     def _web_set(self, q: dict) -> None:
         for _, web, attr, lo, hi, cast in _TUNE:
             if web in q:
-                setattr(self, attr, cast(_clamp(lo, hi, float(q[web][0]))))
+                v = float(q[web][0])
+                if not math.isfinite(v):     # "?speed=nan" must not clamp to MAX
+                    continue
+                setattr(self, attr, cast(_clamp(lo, hi, v)))
+                if attr in _SERVO_PARAM_ATTRS:
+                    self._servo_params_dirty = True
+
+    def _push_collision_params(self) -> None:
+        # 4 Hz coalescer: slider "input" events fire per pixel of drag; servo only
+        # needs the latest value. Stays dirty (retries) until servo's parameter
+        # service is up, so values survive a servo_node restart race.
+        ready = self._servo_param_cli.service_is_ready()
+        # servo_node restarted (service came back): its YAML defaults may not match
+        # the current sliders — re-push ours.
+        if ready and not self._servo_srv_was_ready:
+            self._servo_params_dirty = True
+        self._servo_srv_was_ready = ready
+        if not self._servo_params_dirty or not ready:
+            return
+        self._servo_params_dirty = False
+        req = SetParameters.Request(parameters=[
+            RclpyParameter(name, RclpyParameter.Type.DOUBLE,
+                           float(getattr(self, attr))).to_parameter_msg()
+            for attr, name in _SERVO_PARAM_ATTRS.items()
+        ])
+        self._servo_param_cli.call_async(req)
+        self.get_logger().info(
+            f"[jog] collision distances → self {self._self_coll:.2f} m, "
+            f"scene {self._scene_coll:.2f} m (pushed to servo)")
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
         # Lease model: each message renews the twist for JOG_LEASE; a zero msg
         # (key release) stops instantly, and a stalled/closed socket lets the
         # lease expire so the robot stops on its own.
+        # SERVER-side jog-mode gate: the browser also checks its toggle, but any
+        # WS client can send frames — without this, jog would move the robot with
+        # the sentinel feed off (no fresh Servo status). Never trust the client.
+        if not self._jog_mode:
+            lx = ly = lz = 0.0
         sp = self._jog_speed
         self._jog = [sp * _clamp(-1.0, 1.0, lx),
                      sp * _clamp(-1.0, 1.0, ly),
@@ -954,7 +1062,9 @@ class URServoController(Node):
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "okp": round(node._orient_kp, 1),
-                        "pkp": round(node._path_kp, 1), "basef": node._jog_base,
+                        "pkp": round(node._path_kp, 1),
+                        "selfd": round(node._self_coll, 2), "walld": round(node._scene_coll, 2),
+                        "basef": node._jog_base,
                         "speedfrac": round(sf, 3) if sf is not None else None,
                         "qdnow": round(node._qd_now, 3), "qdpeak": round(node._qd_peak, 3),
                         "connected": connected}).encode(),
@@ -1070,6 +1180,27 @@ class URServoController(Node):
             gate = 1.0
         else:
             gate = 0.25
+        self._servo_status_t = time.monotonic()
+        # Collision-halt escape bookkeeping. Capture the approach direction ONLY on
+        # the transition into the halt, and only if a jog was actually streaming
+        # (≤0.5 s old) — a halt that appears while idle (e.g. the wall dragged onto
+        # the robot in RViz) has no trustworthy "out" direction, so it stays fully
+        # blocked: fix the scene instead. Cleared as soon as Servo reports anything
+        # other than a collision halt (= the model separated).
+        prev, self._servo_code = self._servo_code, msg.code
+        if msg.code == ServoStatus.HALT_FOR_COLLISION:
+            if (prev != ServoStatus.HALT_FOR_COLLISION
+                    and time.monotonic() - self._last_lin_t < 0.5):
+                lx, ly, lz = self._last_lin
+                mag = math.sqrt(lx * lx + ly * ly + lz * lz)
+                if mag > 1e-6:
+                    self._coll_block_dir = (lx / mag, ly / mag, lz / mag)
+                    self.get_logger().warn(
+                        "[jog] collision halt — approach dir captured, jog the "
+                        "OPPOSITE way to back out (×%.2f crawl)" % COLL_ESCAPE_GATE)
+        elif self._coll_block_dir is not None:
+            self._coll_block_dir = None
+            self.get_logger().info("[jog] collision cleared — full jog restored")
         if gate != self._servo_gate:
             self._servo_gate = gate
             self.get_logger().warn(
@@ -1323,7 +1454,44 @@ class URServoController(Node):
                             f"[jog] amplification guard: qd {self._qd_now:.2f} rad/s vs "
                             f"{allowed:.2f} allowed at {cmd_speed*1000:.0f} mm/s — "
                             f"gate ×{self._qd_gate:.2f}")
-                    g = self._servo_gate * self._qd_gate
+                    # Record the pre-gate commanded direction (base_link) — the
+                    # collision-halt escape needs the approach dir even though the
+                    # gated output is zero.
+                    lin_mag = math.sqrt(lin[0]**2 + lin[1]**2 + lin[2]**2)
+                    if lin_mag > 0.002:
+                        self._last_lin = lin
+                        self._last_lin_t = now
+                    # Collision-halt ESCAPE: while halted for collision, a command
+                    # genuinely opposing the captured approach direction passes at
+                    # the crawl gate so the operator can back out of the (virtual)
+                    # wall. Anything else stays hard-blocked. Singularity halts
+                    # never set _coll_block_dir, so they are unaffected.
+                    g_servo = self._servo_gate
+                    # SENTINEL LIVENESS: with the steady 50 Hz feed Servo verdicts
+                    # arrive continuously; a silent sentinel (servo_node dead, not
+                    # armed yet, or feed off) means NO protection — fail safe to a
+                    # hard block rather than coasting on the last verdict. The
+                    # collision-halt escape below must NOT apply here: it may only
+                    # relax a verdict from a LIVE sentinel.
+                    sentinel_fresh = now - self._servo_status_t <= 0.5
+                    if not sentinel_fresh:
+                        g_servo = 0.0
+                        if now - self._sentinel_warn_t > 2.0:
+                            self._sentinel_warn_t = now
+                            self.get_logger().warn(
+                                "[jog] servo sentinel SILENT (no status for "
+                                f"{now - self._servo_status_t:.1f}s) — jog blocked")
+                    bd = self._coll_block_dir
+                    if sentinel_fresh and g_servo == 0.0 and bd is not None and lin_mag > 1e-6:
+                        dot = (lin[0]*bd[0] + lin[1]*bd[1] + lin[2]*bd[2]) / lin_mag
+                        if dot <= -COLL_ESCAPE_DOT:
+                            g_servo = COLL_ESCAPE_GATE
+                            if now - self._escape_log_t > 1.0:
+                                self._escape_log_t = now
+                                self.get_logger().info(
+                                    f"[jog] collision-halt escape: reversing out "
+                                    f"×{COLL_ESCAPE_GATE} (dot {dot:.2f})")
+                    g = g_servo * self._qd_gate
                     v6 = [-(lin[0] + lat[0]) * g, -(lin[1] + lat[1]) * g,
                           (lin[2] + lat[2]) * g, -ang[0] * g, -ang[1] * g, ang[2] * g]
                     peak = math.sqrt(v6[0]**2 + v6[1]**2 + v6[2]**2)

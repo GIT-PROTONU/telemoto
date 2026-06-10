@@ -55,8 +55,15 @@ joint_command_in_topic: ~/delta_joint_cmds
 joint_topic: /joint_states
 status_topic: ~/status
 
-# Collision checking off for v1 (operator-supervised jogging); enable later.
-check_collisions: false
-collision_check_rate: 10.0
-self_collision_proximity_threshold: 0.01
-scene_collision_proximity_threshold: 0.02
+# Collision checking ON — Servo's collision monitor scales its status from the
+# planning scene (self-collision via the SRDF ACM + world objects, e.g. the
+# scene_wall.py test wall): DECELERATE_FOR_COLLISION inside the proximity
+# threshold (jog gate ×0.25), HALT_FOR_COLLISION on contact (gate ×0).
+# The thresholds below are startup defaults only — ur_servo_controller owns them
+# (web UI sliders "Self-collision distance" / "Wall distance") and pushes its
+# values here via /servo_node/set_parameters; keep the two in sync
+# (SELF_COLL_DEF / SCENE_COLL_DEF in ur_servo_controller.py).
+check_collisions: true
+collision_check_rate: 50.0
+self_collision_proximity_threshold: 0.30
+scene_collision_proximity_threshold: 0.50

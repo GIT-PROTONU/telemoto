@@ -135,6 +135,16 @@ def generate_launch_description():
         condition=UnlessCondition(use_mock_hardware),
     )
 
+    # Movable test wall in the planning scene (both modes): drag it in RViz to
+    # test collision detection — move_group plans around it, Servo's collision
+    # monitor gates the jog near/at it.
+    scene_wall = Node(
+        package="telamoto_bringup",
+        executable="scene_wall.py",
+        name="scene_wall",
+        output="screen",
+    )
+
     # ═══════════════════════════════════════════════════════════════════════
     # RVIZ2 — separate instances per condition (reusing one object breaks launch)
     # ═══════════════════════════════════════════════════════════════════════
@@ -148,9 +158,16 @@ def generate_launch_description():
 
     return LaunchDescription(
         declared_args + [
+            scene_wall,
             # Fake mode
             ur_control_fake,
-            TimerAction(period=5.0, actions=[ur_moveit_fake], condition=IfCondition(use_mock_hardware)),
+            # NOT wrapped in a TimerAction: ur_moveit.launch.py self-orders via its
+            # wait_for_robot_description node, whose OnProcessExit handler starts
+            # move_group AFTER any TimerAction scope would have been popped —
+            # TimerAction push/pops launch configurations, so a deferred include
+            # dies with "launch configuration 'warehouse_sqlite_path' does not
+            # exist" when the handler finally fires.
+            ur_moveit_fake,
             TimerAction(period=8.0, actions=[_rviz(fake=True)],  condition=IfCondition(use_mock_hardware)),
             # Real mode
             ur_rsp_real,

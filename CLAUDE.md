@@ -32,8 +32,30 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   **straight-line hold** (PI, critically damped) riding on the commanded twist as
   trim. Jog axes are tool- or base-frame (web toggle).
 - **Web tuning UI** on `http://<pc>:8080` — live sliders (speed/stiffness/jog
-  speed/accel/orientation-hold `okp`/straight-line-hold `pkp`), Base/Tool frame
-  toggle, WASD jog over a WebSocket (CBOR frames).
+  speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision &
+  wall distance — pushed to `/servo_node` params), Base/Tool frame toggle, WASD
+  jog over a WebSocket (CBOR frames).
+- **Collision testing**: `scene_wall.py` (launched by both bringups) puts a draggable
+  wall in the planning scene — move it via its RViz interactive marker
+  (namespace `/scene_wall`). Planned moves avoid it; the jog is gated by Servo's
+  collision monitor (`check_collisions` in `ur_servo.yaml`): decelerate inside the
+  proximity threshold, halt at contact (self-collision too, via the SRDF ACM).
+  **Collision-halt escape**: the halt is direction-blind (Servo scores state, not
+  command), so the controller captures the approach direction at the halt and lets
+  roughly-opposite commands (≥60° cone) through at ×0.25 to back out; a halt that
+  appears while idle stays fully blocked (move the wall instead). ⚠ The UR10's own
+  collision model keeps certain wrist links ~2 cm apart at ANY pose, so a
+  self-collision distance above ~2 cm = permanent ×0.25 jog (the 30 cm default
+  slider value does this — lower it to ~1–2 cm for full-speed jogging).
+- **Jog fail-safes** (verified by fake-robot E2E): WS jog frames are ignored
+  server-side when jog mode is off; jog is hard-blocked whenever Servo's status is
+  >0.5 s stale (servo_node dead/not armed = no sentinel = no motion); web/param
+  tunables reject non-finite values; jog twist leases expire in 0.1 s.
+- ⚠ **Launch gotcha**: never wrap `ur_moveit.launch.py` in a `TimerAction` —
+  TimerAction push/pops launch configurations, and that file starts move_group from
+  an `OnProcessExit` handler that fires after the pop → "launch configuration
+  'warehouse_sqlite_path' does not exist". Its `wait_for_robot_description` node
+  already provides the start ordering.
 - ⚠ **SAFETY** (past incident: singularity amplification made the arm shoot) —
   layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
   (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);

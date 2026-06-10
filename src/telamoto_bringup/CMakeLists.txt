@@ -11,6 +11,7 @@ install(PROGRAMS
   scripts/ur_rtde_joint_pub.py
   scripts/ur_dashboard_autoplay.py
   scripts/ur_servo_controller.py
+  scripts/scene_wall.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

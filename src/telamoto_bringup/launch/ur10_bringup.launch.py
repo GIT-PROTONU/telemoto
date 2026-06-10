@@ -25,6 +25,7 @@ from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution,
 )
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 _CALIBRATION_FILE = os.path.normpath(
@@ -88,11 +89,24 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(launch_rviz),
     )
 
-    # Give the driver ~10 s to connect and spawn controllers before MoveIt2 starts
-    moveit_delayed = TimerAction(period=10.0, actions=[moveit])
-    rviz_delayed   = TimerAction(period=15.0, actions=[rviz])
+    # Movable test wall in the planning scene — drag it in RViz to test
+    # collision detection (planning routes around it, Servo gates the jog).
+    scene_wall = Node(
+        package="telamoto_bringup",
+        executable="scene_wall.py",
+        name="scene_wall",
+        output="screen",
+    )
 
-    return [ur_driver, moveit_delayed, rviz_delayed]
+    # MoveIt must NOT be wrapped in a TimerAction: ur_moveit.launch.py starts
+    # move_group from an OnProcessExit handler (wait_for_robot_description),
+    # which fires after a TimerAction's launch-configuration scope is popped —
+    # the deferred nodes then crash with "launch configuration
+    # 'warehouse_sqlite_path' does not exist". The wait node already provides
+    # the start ordering a timer would have.
+    rviz_delayed = TimerAction(period=15.0, actions=[rviz])
+
+    return [ur_driver, scene_wall, moveit, rviz_delayed]
 
 
 def generate_launch_description():

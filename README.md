@@ -45,13 +45,30 @@ pixi run shell            # sourced bash shell inside the Pixi env
 stack against the physical UR10 and starts the control bridge — **no
 `ur_robot_driver`**.
 
+### The URCap
+
+The robot side needs exactly one add-on: the **External Control URCap**
+(`externalcontrol-1.0.5.urcap`, by Universal Robots / FZI — the same URCap the
+standard `ur_robot_driver` uses; ships in the
+[Universal_Robots_ExternalControl_URCap](https://github.com/UniversalRobots/Universal_Robots_ExternalControl_URCap)
+releases). Install it on the pendant via USB (**Setup Robot → URCaps → +**),
+then configure under **Installation → External Control**:
+
+| Setting | Value |
+|---|---|
+| Remote host IP | `192.168.10.1` (this PC) |
+| Custom port | `50001` |
+| Host name | anything (display only) |
+
+Create a program named **`telamoto`** containing a single **External Control**
+node, and save it. Pressing **Play** on that program makes the URCap request the
+control script from the bridge — that's the entire handoff.
+
 ### Running on the real robot
 
 1. **Network:** the robot must be reachable at `192.168.10.2`. For low-jitter
    control use the direct onboard-NIC link — see [Host setup](#host-setup-network--realtime).
-2. **Pendant:** load a program named `telamoto` containing a single **External
-   Control** node (FZI `externalcontrol-1.0.5`), configured with this PC's IP and
-   Custom Port **50001**.
+2. **Pendant:** the `telamoto` External Control program (see [The URCap](#the-urcap)).
 3. `pixi run twin-real`
 4. **Press Play on the pendant.** The URCap then requests the control script from
    the bridge and connects back. (A dashboard `play` reuses a cached script — a
@@ -207,12 +224,30 @@ Optional but recommended for the smoothest control. Scripts in `setup/`:
   #   IP 192.168.10.2  mask 255.255.255.0  gateway (blank)
   ```
 
-- **`realtime-limits.sh`** — grants `rtprio`/`memlock` so MoveIt Servo's
-  `SCHED_FIFO` servo thread can actually use the realtime kernel (`ulimit -r` is 0
-  by default, which silently demotes it). **Log out and back in afterwards.**
+- **`realtime-limits.sh`** — grants `rtprio`/`memlock` so the `SCHED_FIFO`
+  realtime threads can actually use the realtime kernel (`ulimit -r` is 0 by
+  default, which silently demotes them). **Log out and back in afterwards.**
   ```bash
   sudo bash setup/realtime-limits.sh
   ```
+
+### System settings & paths (reference)
+
+| What | Value / path |
+|---|---|
+| Robot IP (pendant: Setup Robot → Network, static) | `192.168.10.2 / 255.255.255.0`, no gateway |
+| PC IP (direct link, `eno1`) | `192.168.10.1/24` — NetworkManager profile written by `setup/robot-net.sh` |
+| Script-sender / reverse port | `50001` (URCap Custom Port — must match) |
+| RTDE output stream (read-only joint states) | robot port `30004` |
+| Dashboard server (`ur_dashboard_autoplay.py`) | robot port `29999` |
+| Tuning + jog web UI | `http://<pc>:8080` |
+| RT limits | `/etc/security/limits.d/99-telamoto-realtime.conf` — group `realtime`, `rtprio 98`, `memlock unlimited` |
+| Thread priorities | control loop `SCHED_FIFO:20`; MoveIt Servo's RT thread above it |
+| ROS middleware | CycloneDDS (`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, set in `pixi.toml` activation env) |
+| Runtime logs | `~/.ros/log/` (per-node files; `setup/jog_log.sh` finds the newest controller log) |
+| 125 Hz TCP pose log | `~/.ros/log/tcp_path.csv` (truncated each run; `setup/jog_log.sh -c`) |
+| Kinematics calibration | `src/telamoto_bringup/config/ur10_calibration.yaml` (`pixi run calibrate`) |
+| Servo sentinel config | `src/telamoto_bringup/config/ur_servo.yaml` |
 
 ---
 

@@ -17,7 +17,7 @@ jogging both run smoothly on the physical UR10.
 |---|---|---|
 | Environment / package manager | **Pixi** (RoboStack-Jazzy channel) | `pixi.toml` at repo root — no system ROS install needed |
 | Motion planning | **MoveIt 2** | Jazzy release |
-| Real-time jog | **MoveIt Servo** | Cartesian twist → joint velocities |
+| Real-time jog | **URScript `speedl`** (onboard IK) | straight lines like the pendant — measured 0.15 mm avg off-axis deflection at up to 500 mm/s; MoveIt Servo stays on as a singularity sentinel |
 | Control | `ros2_control` + `ros2_controllers` | scaled joint-trajectory controller (sim/twin) |
 | Custom interfaces | `telamoto_msgs` | `msg/`, `srv/` |
 | HW extension | `telamoto_hardware` | C++ pluginlib plugin |

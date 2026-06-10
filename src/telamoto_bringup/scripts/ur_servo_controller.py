@@ -48,6 +48,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64
 from geometry_msgs.msg import TwistStamped
 from trajectory_msgs.msg import JointTrajectory
+from moveit_msgs.msg import ServoStatus
 from moveit_msgs.srv import ServoCommandType
 from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
@@ -62,7 +63,29 @@ WEB_PORT     = 8080
 _WS_GUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 handshake magic
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
-MODE_SPEEDJ  = 2            # joint-velocity control (WASD jog + idle self-hold)
+MODE_SPEEDJ  = 2            # joint-velocity control (idle self-hold + speedj fallback)
+MODE_SPEEDL  = 3            # CARTESIAN velocity control (WASD jog). speedl() lets the
+                            # ROBOT's own controller do the Cartesian→joint conversion
+                            # onboard at 125 Hz with fresh state — same mechanism as
+                            # the pendant jog, which is why the pendant tracks straight
+                            # lines at speed and a PC-side J⁻¹ (MoveIt Servo, ~15–30 ms
+                            # stale by execution time) never quite does.
+SPEEDL_ACCEL = 2.5          # m/s² — robot-side tool accel for speedl: must outrun the
+                            # Cartesian ramp (jog_accel) + corrections so the robot
+                            # faithfully TRACKS the smooth command.
+# Singularity-amplification guard for speedl (replaces a fixed joint-speed cap, which
+# bang-banged at 500 mm/s where joints LEGITIMATELY need >0.5 rad/s → stutter). The
+# danger signature from the incident is a SMALL Cartesian command producing LARGE
+# joint speeds (J⁻¹ blowup near a singularity), so the allowance scales with the
+# commanded TCP speed: allowed_qd = BASE + SLOPE·|cmd|. At 20 mm/s that allows only
+# 0.35 rad/s (tight protection exactly where the incident lives); at 500 mm/s it
+# allows 1.55 rad/s (normal fast-jog joint speeds; UR's own safety limit ~3.3 rad/s
+# still backstops). Applied as a SMOOTH gate — brakes fast, recovers gently — never a
+# hard cut, so no limit-cycle stutter.
+QD_ALLOW_BASE  = 0.3        # rad/s allowed at zero commanded speed
+QD_ALLOW_SLOPE = 2.5        # rad/s additional per m/s of commanded TCP speed
+QD_GATE_DOWN   = 0.20       # max gate decrease per 125 Hz cycle (~40 ms to full stop)
+QD_GATE_UP     = 0.02       # max gate increase per cycle (~0.4 s to full recovery)
 JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
 JOG_ACCEL_DEF = 1.0        # m/s^2 — CARTESIAN start/stop ramp rate (default; gentle).
                            # Ramps the TWIST magnitude before Servo (direction-
@@ -115,6 +138,31 @@ ORIENT_KP_DEF             = 6.0
 ORIENT_KP_MIN, ORIENT_KP_MAX = 0.0, 30.0
 ORIENT_LOCK_MAX = 0.5       # rad/s — cap on the correction (≤ servo.yaml rotational
                             # cap 1.0; MAX_JOG_QD 0.5 still backstops the joints)
+# Straight-line hold: same closed-loop idea as the orientation lock, applied to the
+# PATH. Open-loop twist jogging accumulates a speed-proportional LATERAL lag (measured
+# from the 125 Hz CSV: a +Y push at 500 mm/s bowed ~21 mm in −X, returning to the line
+# only on stop). We hold the line through the jog-start point along the commanded
+# direction, feeding the perpendicular position error back as a corrective linear
+# velocity. Along-track motion is untouched (the error is perpendicular-only), so the
+# hold can neither slow nor delay the jog itself.
+#
+# PI, not P: the disturbance is (approximately) a constant lateral VELOCITY — Servo's
+# stale-state J⁻¹ steers the realized direction a few degrees off the commanded one,
+# proportional to speed. A P position loop can never zero a constant-rate disturbance
+# (steady state = rate/KP: measured 14 mm at 500 mm/s with KP=4, exactly as predicted).
+# The INTEGRAL term learns that disturbance velocity and cancels it outright → lateral
+# error converges to ~0 at ANY speed, no per-speed gain balancing. KI is derived from
+# KP for CRITICAL damping (KI = KP²/4 → ζ=1): no overshoot, no oscillation, smooth by
+# construction. One knob (pkp) sets the convergence rate; the structure does the rest.
+PATH_KP_DEF             = 6.0   # 1/s — P gain; with KI=KP²/4 the error converges to 0
+                                # with time constant ≈ 2/KP (~0.33 s) regardless of
+                                # speed. Stability: KP·loop-delay ≪ 1 (delay ~30–50 ms).
+PATH_KP_MIN, PATH_KP_MAX = 0.0, 15.0
+PATH_LOCK_MAX = 0.15        # m/s — cap on the TOTAL correction; small vs jog speed
+                            # so a TF glitch can never fling the arm sideways.
+PATH_I_MAX    = 0.12        # m/s — separate clamp on the integral part (anti-windup:
+                            # it can hold the full ~60 mm/s disturbance with margin,
+                            # but can never wind past what motion could justify).
 REORIENT_IDLE   = 1.0       # s — only re-capture the locked orientation after the jog
                             # has been idle THIS long. Rapid consecutive taps keep the
                             # SAME reference (so residual drift is pulled back, not
@@ -154,6 +202,7 @@ _TUNE = (
     ("jog_coast",        "jcoast",    "_jog_coast", JOG_COAST_MIN, JOG_COAST_MAX, float),
     ("step_t",           "stept",     "_step_t",    STEP_T_MIN,    STEP_T_MAX,    float),
     ("orient_lock_kp",   "okp",       "_orient_kp", ORIENT_KP_MIN, ORIENT_KP_MAX, float),
+    ("path_lock_kp",     "pkp",       "_path_kp",   PATH_KP_MIN,   PATH_KP_MAX,   float),
 )
 
 # Served on request_program. The "# HEADER_*" anchors are mandatory (the URCap
@@ -199,6 +248,8 @@ while keep_going:
   # Execute the current target — this is where the arm moves, continuously.
   if mode == 2:
     speedj(qd, accel, step_t)
+  elif mode == 3:
+    speedl(qd, accel, step_t)
   elif mode == 1:
     servoj(q, t=step_t, lookahead_time=lookahead, gain=gain)
   else:
@@ -218,7 +269,7 @@ while keep_going:
     accel = p[9] / 100.0
     lookahead = p[10] / 1000.0
     step_t = p[11] / 1000000.0
-    if mode == 2:
+    if mode == 2 or mode == 3:
       qd = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
     elif mode == 1:
       q = [p[2]/1000000.0, p[3]/1000000.0, p[4]/1000000.0, p[5]/1000000.0, p[6]/1000000.0, p[7]/1000000.0]
@@ -226,7 +277,7 @@ while keep_going:
   else:
     misses = misses + 1
     if misses > 8:
-      if mode == 2:
+      if mode >= 2:
         stopj(8.0)
       end
       mode = 0
@@ -289,11 +340,15 @@ _WEB_PAGE = """<!doctype html>
    <input type="range" id="okp" min="0" max="30" step="0.5">
    <div class="hint">TCP orientation-hold stiffness &mdash; raise for tighter hold, lower if it
      waddles/oscillates; 0 = off. Live.</div></div>
+ <div class="row"><label>Straight-line hold <span class="val" id="pkpv"></span></label>
+   <input type="range" id="pkp" min="0" max="15" step="0.5">
+   <div class="hint">Steers the TCP back onto the commanded line while jogging &mdash; raise for a
+     tighter line, lower if it wiggles; 0 = off. Live.</div></div>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
    jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" m/s\\u00b2",
-   jcoast:v=>Math.round(+v*1000)+" ms",okp:v=>(+v).toFixed(1)};
- const ids=["speed","gain","lookahead","jspeed","jaccel","jcoast","okp"];
+   jcoast:v=>Math.round(+v*1000)+" ms",okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1)};
+ const ids=["speed","gain","lookahead","jspeed","jaccel","jcoast","okp","pkp"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
@@ -508,6 +563,15 @@ class URServoController(Node):
                         "lower = softer (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=ORIENT_KP_MIN, to_value=ORIENT_KP_MAX, step=0.5)]))
+        self.declare_parameter("path_lock_kp", PATH_KP_DEF, ParameterDescriptor(
+            description="TCP straight-line hold gain; higher = tighter line, "
+                        "lower if it oscillates; 0 = off (live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=PATH_KP_MIN, to_value=PATH_KP_MAX, step=0.5)]))
+        # Cartesian jog (speedl): the robot does the Cartesian→joint conversion
+        # onboard like the pendant — straight lines by construction. False falls back
+        # to the MoveIt-Servo speedj pipeline (read at startup, not live).
+        self.declare_parameter("cartesian_jog", True)
 
         g = self.get_parameter
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
@@ -521,6 +585,8 @@ class URServoController(Node):
         self._jog_coast = g("jog_coast").get_parameter_value().double_value
         self._step_t    = g("step_t").get_parameter_value().double_value
         self._orient_kp = g("orient_lock_kp").get_parameter_value().double_value
+        self._path_kp   = g("path_lock_kp").get_parameter_value().double_value
+        self._cart_jog  = g("cartesian_jog").get_parameter_value().bool_value
         self.add_on_set_parameters_callback(self._on_set_params)
 
         self._js_ready = threading.Event()           # set on first JointState
@@ -592,6 +658,10 @@ class URServoController(Node):
         self._jog_dir = None               # direction (base frame, unit) → lets the
                                            # trace measure how far the PATH bends off
                                            # the commanded straight line (lat/angle)
+        self._path_i = [0.0, 0.0, 0.0]     # integral of lateral error (base frame,
+                                           # m/s) — the learned disturbance velocity;
+                                           # reset on baseline anchor + at standstill
+        self._path_i_t = time.monotonic()  # last integration timestamp
 
         # Control streams carry only the latest sample (keep_last 1): for a jog
         # at 30–250 Hz a stale command is worthless, so we never want a queue to
@@ -607,6 +677,14 @@ class URServoController(Node):
         # MoveIt Servo's JointTrajectory output → our stream (during jog).
         self.create_subscription(JointTrajectory, SERVO_OUT_TOPIC, self._servo_cb, ctrl_qos)
         self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, ctrl_qos)
+        # SAFETY SENTINEL for Cartesian jog: Servo keeps evaluating the kinematics on
+        # every twist we publish even though its joint output is unused with speedl —
+        # its status gates the speedl command (slow near a singularity, zero at the
+        # hard threshold), so the singularity protection from the incident stays live.
+        self._servo_gate = 1.0
+        self._qd_gate = 1.0          # smooth singularity-amplification gate [0,1]
+        self._qd_guard_t = 0.0
+        self.create_subscription(ServoStatus, "/servo_node/status", self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
             self, FollowJointTrajectory,
@@ -665,15 +743,12 @@ class URServoController(Node):
         pose = self._tcp_pose()
         return pose[1] if pose else None
 
-    def _orient_lock_angular(self):
+    def _orient_lock_angular(self, cur):
         """Proportional orientation hold: corrective angular velocity (rad/s,
         expressed in JOG_FRAME) that drives tool0 back to self._orient_target.
-        Returns (0,0,0) if there's no target yet or TF is unavailable."""
+        `cur` = current tool orientation quaternion. (0,0,0) if no target."""
         target = self._orient_target
-        if target is None:
-            return (0.0, 0.0, 0.0)
-        cur = self._tcp_orientation()
-        if cur is None:
+        if target is None or cur is None:
             return (0.0, 0.0, 0.0)
         # Error rotation in the CURRENT tool frame: R_cur⁻¹ · R_target. Its rotation
         # vector is the axis/angle (in tool coords) that returns us to the target,
@@ -687,20 +762,86 @@ class URServoController(Node):
             wx, wy, wz = wx * s, wy * s, wz * s
         return (wx, wy, wz)
 
+    def _set_path_baseline(self, pose, jog_vec) -> None:
+        """Anchor the straight-line hold: line = current TCP position along the
+        commanded jog direction (tool coords → base frame via the current
+        orientation). Cleared (None) if TF is unavailable or the vector is zero."""
+        self._path_i = [0.0, 0.0, 0.0]     # new line → forget the learned disturbance
+        self._path_i_t = time.monotonic()
+        if pose is None:
+            self._jog_start_pos = self._jog_dir = None
+            return
+        self._jog_start_pos = pose[0]
+        d = _quat_rotate(pose[1], jog_vec)
+        n = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+        self._jog_dir = tuple(c / n for c in d) if n > 1e-9 else None
+
+    def _path_lock_linear(self, pose):
+        """PI straight-line hold: corrective linear velocity (m/s, expressed in the
+        BASE frame) that steers tool0 back onto the line through the jog-start point
+        along the commanded direction. P pulls back on the current error; I learns the
+        constant lateral-lag velocity and cancels it → error converges to ~0 at ANY
+        speed. KI = KP²/4 (critical damping: no overshoot/oscillation by construction).
+        Only the PERPENDICULAR error is fed back — along-track motion (the jog itself)
+        is untouched. Returns (0,0,0) if there's no baseline or pose."""
+        start, u = self._jog_start_pos, self._jog_dir
+        if start is None or u is None or pose is None:
+            return (0.0, 0.0, 0.0)
+        pos, q = pose
+        disp = (pos[0] - start[0], pos[1] - start[1], pos[2] - start[2])
+        along = disp[0] * u[0] + disp[1] * u[1] + disp[2] * u[2]
+        # Lateral error = displacement minus its along-line component (base frame).
+        e = (disp[0] - along * u[0], disp[1] - along * u[1], disp[2] - along * u[2])
+        kp = self._path_kp
+        # Integrate the error (base frame). dt from a real clock so the two publisher
+        # threads (50 Hz loop + ~30 Hz websocket) integrate correctly between them;
+        # clamped so a stall can't produce a windup step.
+        now = time.monotonic()
+        dt = _clamp(0.0, 0.1, now - self._path_i_t)
+        self._path_i_t = now
+        ki = kp * kp / 4.0
+        i = self._path_i
+        i[0] -= ki * e[0] * dt
+        i[1] -= ki * e[1] * dt
+        i[2] -= ki * e[2] * dt
+        n = math.sqrt(i[0] * i[0] + i[1] * i[1] + i[2] * i[2])
+        if n > PATH_I_MAX:                            # anti-windup, direction kept
+            s = PATH_I_MAX / n
+            i[0], i[1], i[2] = i[0] * s, i[1] * s, i[2] * s
+        vx = -kp * e[0] + i[0]
+        vy = -kp * e[1] + i[1]
+        vz = -kp * e[2] + i[2]
+        n = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if n > PATH_LOCK_MAX:                         # gentle cap, direction kept
+            s = PATH_LOCK_MAX / n
+            vx, vy, vz = vx * s, vy * s, vz * s
+        return (vx, vy, vz)                           # BASE frame
+
     def _publish_twist(self) -> None:
         if not self._jog_mode:
             return
-        # Publish the RAMPED Cartesian linear velocity (_jog_cmd, managed in _jog_loop)
-        # plus the orientation-hold correction. The correction runs at FULL authority
-        # whenever the arm is actually moving — including the ramp-down after release —
-        # so orientation is held through the whole motion with no post-release coast
-        # drift. The reference (_orient_target) is captured/re-captured in _jog_loop.
+        # Publish the RAMPED Cartesian jog to MoveIt Servo. In Cartesian-jog mode
+        # (speedl) the robot executes OUR twist directly and Servo is kept in the loop
+        # purely as a SINGULARITY SENTINEL (its status gates the speedl command in the
+        # control loop), so it gets the plain twist — corrections are applied where
+        # they're executed. In the speedj fallback the corrections ride here as before.
         moving = any(abs(v) > 1e-6 for v in self._jog_cmd)
-        ang = self._orient_lock_angular() if moving else (0.0, 0.0, 0.0)
+        ang = lat = (0.0, 0.0, 0.0)
+        if moving:
+            if not self._cart_jog:
+                pose = self._tcp_pose()
+                if pose:
+                    ang = self._orient_lock_angular(pose[1])
+                    lat = _quat_rotate(_quat_conj(pose[1]), self._path_lock_linear(pose))
+        else:
+            self._path_i = [0.0, 0.0, 0.0]    # standstill → drop the learned
+            self._path_i_t = time.monotonic()  # disturbance (it's speed-specific)
         m = TwistStamped()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = JOG_FRAME
-        m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog_cmd
+        m.twist.linear.x = self._jog_cmd[0] + lat[0]
+        m.twist.linear.y = self._jog_cmd[1] + lat[1]
+        m.twist.linear.z = self._jog_cmd[2] + lat[2]
         m.twist.angular.x, m.twist.angular.y, m.twist.angular.z = ang
         with self._pub_lock:
             self._twist_pub.publish(m)
@@ -754,6 +895,7 @@ class URServoController(Node):
         last_orient_log = 0.0
         last_ramp = time.monotonic()
         prev_intent = False
+        jog_ref = (0.0, 0.0, 0.0)          # last commanded jog vector (direction-change detect)
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
             now = time.monotonic()
@@ -765,23 +907,22 @@ class URServoController(Node):
             # hand-reposition / planned-move between jogs and re-lock, while rapid taps
             # keep the SAME reference (residual drift is pulled back, not ratcheted in).
             # The idle clock starts on release (falling edge).
+            jog_vec = tuple(self._jog[0:3])
             if intent and not prev_intent:
                 pose = self._tcp_pose()
                 o = pose[1] if pose else None
                 if self._orient_target is None or now - self._jog_stop_t > REORIENT_IDLE:
                     self._orient_target = o
                 self._jog_start_orient = self._orient_target
-                # Path-straightness baseline: where the TCP is now + the commanded
-                # direction expressed in the base frame (the jog is in tool coords).
-                self._jog_start_pos = pose[0] if pose else None
-                if o is not None:
-                    d = _quat_rotate(o, tuple(self._jog[0:3]))
-                    n = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
-                    self._jog_dir = tuple(c / n for c in d) if n > 1e-9 else None
-                else:
-                    self._jog_dir = None
+                self._set_path_baseline(pose, jog_vec)
+            elif intent and jog_vec != jog_ref:
+                # Commanded direction changed MID-jog (key switch / speed slider):
+                # re-anchor the line at the current pose along the new direction, or
+                # the path lock would fight the new motion as "lateral error".
+                self._set_path_baseline(self._tcp_pose(), jog_vec)
             elif not intent and prev_intent:
                 self._jog_stop_t = now
+            jog_ref = jog_vec
             prev_intent = intent
 
             # Cartesian linear-velocity ramp toward the target (tool frame). Ramping
@@ -860,6 +1001,7 @@ class URServoController(Node):
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "jcoast": round(node._jog_coast, 3), "okp": round(node._orient_kp, 1),
+                        "pkp": round(node._path_kp, 1),
                         "speedfrac": round(sf, 3) if sf is not None else None,
                         "qdnow": round(node._qd_now, 3), "qdpeak": round(node._qd_peak, 3),
                         "connected": connected}).encode(),
@@ -962,6 +1104,21 @@ class URServoController(Node):
 
     def _speed_cb(self, msg: Float64) -> None:
         self._speed_fraction = msg.data            # pendant speed slider, display only
+
+    def _servo_status_cb(self, msg: ServoStatus) -> None:
+        # Map Servo's kinematic assessment to a speedl gate: full speed when clean,
+        # crawl while approaching/leaving a singularity or a joint bound, hard zero at
+        # the halt thresholds. Transitions are logged so trips self-explain.
+        if msg.code in (ServoStatus.HALT_FOR_SINGULARITY, ServoStatus.HALT_FOR_COLLISION):
+            gate = 0.0
+        elif msg.code == ServoStatus.NO_WARNING:
+            gate = 1.0
+        else:
+            gate = 0.25
+        if gate != self._servo_gate:
+            self._servo_gate = gate
+            self.get_logger().warn(
+                f"[jog] servo sentinel code {msg.code} → speed gate ×{gate}")
 
     # ── Reverse server: serves the script on request, then hands the socket to
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
@@ -1178,37 +1335,73 @@ class URServoController(Node):
                 # planned move: servoj to the interpolated position.
                 pkt = _pack(q_traj, MODE_SERVOJ, self._gain, self._lookahead, step_t)
             else:
-                # jog / hold: stream Servo's joint-velocity solution as speedj. NO
-                # per-joint slew here — that distorted Servo's Cartesian-resolved
-                # direction during the ramp and manufactured TCP rotation. The
-                # start/stop ramp is now a direction-preserving Cartesian ramp on the
-                # twist (_jog_loop); we send the capped solution straight through and
-                # let speedj's own accel (SPEEDJ_ACCEL) track the smooth command.
-                # SAFETY: _cap_speed hard-limits joint speed so a singularity-amplified
-                # Servo output can never make the arm shoot.
-                #
-                # Gate on the RAMPED command (_jog_cmd), not Servo freshness: at
-                # standstill Servo still emits tiny residuals (the jog loop keeps it
-                # warm); streaming those as speedj = the standstill ring. Stream only
-                # while the ramped command is non-zero (this also covers the smooth
-                # ramp-down after release); otherwise command a clean exact zero.
+                # jog / hold. Gate on the RAMPED command (_jog_cmd): stream only while
+                # it is non-zero (covers the smooth ramp-down after release); at
+                # standstill command exact speedj zeros — the active idle hold (also
+                # kills the old standstill ring from Servo's near-zero residuals).
                 moving = any(abs(v) > 1e-6 for v in self._jog_cmd)
-                with self._tgt_lock:
-                    target = self._qd_target if (moving and now < self._servo_active_until) else _ZERO6
-                qd = _cap_speed(target, MAX_JOG_QD)
-                peak = max((abs(x) for x in qd), default=0.0)
-                if peak > 1e-4:                          # remember last real motion (for _drop)
-                    self._last_motion_t = now
-                    self._last_peak_qd = peak
-                # Diagnostic (throttled): cmd (what we send) vs act (RTDE actual_qd).
-                # Healthy = act tracks cmd closely.
-                if (peak > 1e-4 or any(target)) and now - last_diag >= 0.3:
-                    last_diag = now
-                    self.get_logger().info(
-                        f"[jog] cmd={peak:.3f} act={self._qd_now:.3f} rad/s "
-                        f"(jog_accel={self._jog_accel:.1f} step_t={self._step_t*1000:.0f}ms)")
-                pkt = _pack(qd, MODE_SPEEDJ, int(SPEEDJ_ACCEL * 100),
-                            self._lookahead, step_t)
+                pose = self._tcp_pose() if (self._cart_jog and moving) else None
+                if pose is not None:
+                    # CARTESIAN jog (speedl): the robot's own controller converts the
+                    # twist to joint motion onboard, 125 Hz, zero-staleness — straight
+                    # lines like the pendant, by construction. The orientation + line
+                    # holds ride along as trim. Built in base_link, then rotated into
+                    # the UR-native Base frame (= base_link yawed π in ur_description:
+                    # x→−x, y→−y; angular likewise) which speedl expects.
+                    q = pose[1]
+                    lin = _quat_rotate(q, tuple(self._jog_cmd))
+                    lat = self._path_lock_linear(pose)
+                    ang = _quat_rotate(q, self._orient_lock_angular(q))
+                    # SAFETY GATE 1: Servo's kinematic sentinel (singularity/collision).
+                    # SAFETY GATE 2: singularity-AMPLIFICATION guard — measured joint
+                    # speed (RTDE actual_qd) vs what the commanded TCP speed justifies.
+                    # Smooth braking (slew-limited gate), never a hard cut: a fixed cap
+                    # bang-banged at full speed (cut → re-ramp → cut = stutter).
+                    cmd_speed = math.sqrt(sum(c * c for c in self._jog_cmd))
+                    allowed = QD_ALLOW_BASE + QD_ALLOW_SLOPE * cmd_speed
+                    tgt = 1.0 if self._qd_now <= allowed else allowed / self._qd_now
+                    self._qd_gate += _clamp(-QD_GATE_DOWN, QD_GATE_UP, tgt - self._qd_gate)
+                    if self._qd_gate < 0.6 and now - self._qd_guard_t > 1.0:
+                        self._qd_guard_t = now
+                        self.get_logger().warn(
+                            f"[jog] amplification guard: qd {self._qd_now:.2f} rad/s vs "
+                            f"{allowed:.2f} allowed at {cmd_speed*1000:.0f} mm/s — "
+                            f"gate ×{self._qd_gate:.2f}")
+                    g = self._servo_gate * self._qd_gate
+                    v6 = [-(lin[0] + lat[0]) * g, -(lin[1] + lat[1]) * g,
+                          (lin[2] + lat[2]) * g, -ang[0] * g, -ang[1] * g, ang[2] * g]
+                    peak = math.sqrt(v6[0]**2 + v6[1]**2 + v6[2]**2)
+                    if peak > 1e-4:
+                        self._last_motion_t = now
+                        self._last_peak_qd = self._qd_now
+                    if peak > 1e-4 and now - last_diag >= 0.3:
+                        last_diag = now
+                        self.get_logger().info(
+                            f"[jog] speedl cmd={peak*1000:.0f}mm/s act_qd={self._qd_now:.3f} "
+                            f"gate={g:.2f}")
+                    pkt = _pack(v6, MODE_SPEEDL, int(SPEEDL_ACCEL * 100),
+                                self._lookahead, step_t)
+                else:
+                    # speedj path: idle hold (exact zeros) or full fallback when
+                    # cartesian_jog:=false (Servo's joint solution, hard-capped).
+                    if not moving:
+                        self._qd_gate = 1.0          # fresh gate for the next jog
+                    with self._tgt_lock:
+                        target = self._qd_target if (
+                            moving and not self._cart_jog
+                            and now < self._servo_active_until) else _ZERO6
+                    qd = _cap_speed(target, MAX_JOG_QD)
+                    peak = max((abs(x) for x in qd), default=0.0)
+                    if peak > 1e-4:                      # remember last real motion (for _drop)
+                        self._last_motion_t = now
+                        self._last_peak_qd = peak
+                    if (peak > 1e-4 or any(target)) and now - last_diag >= 0.3:
+                        last_diag = now
+                        self.get_logger().info(
+                            f"[jog] cmd={peak:.3f} act={self._qd_now:.3f} rad/s "
+                            f"(jog_accel={self._jog_accel:.1f} step_t={self._step_t*1000:.0f}ms)")
+                    pkt = _pack(qd, MODE_SPEEDJ, int(SPEEDJ_ACCEL * 100),
+                                self._lookahead, step_t)
             try:
                 conn.sendall(pkt)
                 if first:

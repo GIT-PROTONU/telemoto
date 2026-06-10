@@ -23,23 +23,23 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   script-sender: serves a pipelined URScript on port 50001 (press **Play** on the
   pendant to connect), then streams 11-int packets at 125 Hz. Modes: `servoj`
   (planned moves, FollowJointTrajectory action), **`speedl` (WASD jog — the robot
-  does the Cartesian→joint conversion onboard, pendant-grade straight lines)**, and
-  `speedj` (idle hold + `cartesian_jog:=false` fallback via MoveIt Servo). Control
-  loop runs SCHED_FIFO:20. speedl vectors are built in `base_link` then rotated π
-  about Z into the UR-native Base frame.
+  does the Cartesian→joint conversion onboard, pendant-grade straight lines:
+  measured ~0.1 mm median off-axis at 500 mm/s)**, and `speedj` zeros (idle hold).
+  Control loop runs SCHED_FIFO:20. speedl vectors are built in `base_link` then
+  rotated π about Z into the UR-native Base frame.
 - **Jog correctness**: the twist is ramped in Cartesian space (never per-joint — that
   bends the path), with closed-loop **orientation hold** (proportional, tf2-based) and
-  **straight-line hold** (PI, critically damped) riding on the commanded twist.
-  MoveIt Servo stays in the loop as a **singularity sentinel**: its status gates the
-  speedl command (crawl near a singularity, zero at the halt threshold), and a host
-  watchdog on RTDE `actual_qd` cuts the command if any joint exceeds `MAX_JOG_QD`.
+  **straight-line hold** (PI, critically damped) riding on the commanded twist as
+  trim. Jog axes are tool- or base-frame (web toggle).
 - **Web tuning UI** on `http://<pc>:8080` — live sliders (speed/stiffness/jog
-  speed/accel/orientation-hold `okp`/straight-line-hold `pkp`) + WASD jog over a
-  WebSocket (CBOR frames).
-- ⚠ **SAFETY**: `MAX_JOG_QD` (0.5 rad/s per-joint cap) and the MoveIt Servo
-  singularity thresholds in `config/ur_servo.yaml` must stay ON (past incident:
-  singularity amplification made the arm shoot). `scale.linear` in `ur_servo.yaml`
-  must stay ≥ JOG_SPEED_MAX + PATH_LOCK_MAX or the line hold gets clipped.
+  speed/accel/orientation-hold `okp`/straight-line-hold `pkp`), Base/Tool frame
+  toggle, WASD jog over a WebSocket (CBOR frames).
+- ⚠ **SAFETY** (past incident: singularity amplification made the arm shoot) —
+  layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
+  (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);
+  (2) the **amplification guard** (`QD_ALLOW_*`): measured joint speed beyond what
+  the commanded TCP speed justifies shrinks a smooth gate; (3) the URScript
+  miss-watchdog `stopj`; (4) UR's own safety limits.
 
 ## Diagnostics
 ```bash

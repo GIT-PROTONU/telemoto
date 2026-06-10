@@ -83,49 +83,58 @@ script-sender protocol directly:
 `ur_rtde_joint_pub.py` separately reads the RTDE output stream and republishes
 `/joint_states` at the robot's native 125 Hz (used to seed planning / Servo).
 
-### The pull loop (robot-paced)
+### The pipelined pull loop (robot-paced, ~125 Hz)
 
-Each cycle the on-robot URScript does:
+Each cycle the on-robot URScript overlaps the socket round-trip with the motion:
 
 ```
-socket_send_int(1)              # "send me a target"  (request)
-p = socket_read_binary_integer  # 11×int32 reply from the PC
-servoj(...) or speedj(...)      # execute it
+socket_send_int(1)              # request the NEXT target
+speedl/speedj/servoj(...)       # execute the CURRENT one (continuous, ~100% duty)
+p = socket_read_binary_integer  # consume the reply that arrived DURING the motion
 ```
 
-The PC's control loop blocks on the request and answers with the freshest target.
-This **pull** model (rather than the PC pushing on a timer) is deliberate: pushing
-either left gaps between `servoj` calls (~100 Hz vibration) or backed up the TCP
-buffer (growing lag). Pulling keeps motion back-to-back and one reply per request
-— no gaps, no backlog. **Do not revert to push.**
+A naive request→block→move loop leaves the motion command idle during the socket
+round-trip (~50% duty → the arm averages half the commanded speed → protective
+stop at higher speeds). Pipelining keeps motion back-to-back at the robot's native
+**125 Hz**, one reply per request, no backlog. If the PC dies, the script
+`stopj()`s after ~8 missed reads (~64 ms).
 
-### Hybrid servoj / speedj
+### Three modes
 
 The reply's mode field selects the on-robot command:
 
-- **`servoj`** (position) — planned moves from MoveIt, and the idle hold.
-- **`speedj`** (joint velocity) — WASD jogging.
-
-WASD jog uses velocity because, for continuous human-in-the-loop teleop, the
-operator closes the position loop by eye: `speedj` has no reference pose to snap
-back to and tolerates control-cycle jitter, whereas `servoj` would turn a position
-delta over a too-short step into a velocity spike → protective stop.
+- **`servoj`** (joint position) — planned moves from MoveIt.
+- **`speedl`** (Cartesian velocity) — WASD jogging. The **robot's own controller**
+  does the Cartesian→joint conversion onboard with fresh state — the same
+  mechanism as the pendant jog, which is why it tracks straight lines at any
+  speed. (A PC-side conversion works on a joint state that is ~15–30 ms stale by
+  execution time, which bends the path proportionally to speed — measured 21 mm
+  over a 343 mm push at 500 mm/s before this design.)
+- **`speedj`** zeros — the active idle hold.
 
 ### WASD jog pipeline
 
 ```
-browser (WASD)  ──WebSocket(CBOR)──▶  bridge  ──TwistStamped──▶  MoveIt Servo
-                                                                      │
-                                                            JointTrajectory
-                                                                      ▼
-robot  ◀──speedj──  bridge control loop  ◀──────────────────  (joint velocities)
+browser (WASD) ──WebSocket(CBOR)──▶ bridge ──ramp + holds──▶ speedl ──▶ robot
+                                      │                        ▲
+                                      └─TwistStamped─▶ MoveIt Servo (sentinel)
+                                                         └──status gate──┘
 ```
 
 - The web UI streams the jog direction as a compact **CBOR** frame over a
   WebSocket (~30 Hz while a key is held; the first keypress fires immediately).
-- The bridge publishes a `TwistStamped` to MoveIt Servo, which solves for joint
-  velocities and streams them back; the bridge feeds them to `speedj`.
-- **Tool frame:** `W/S` along the tool, `A/D` and `Q/E` across the flange.
+- The bridge ramps the twist in Cartesian space (direction-preserving) and adds
+  two closed-loop trims: an **orientation hold** (proportional lock on the tool
+  orientation captured at jog start) and a **straight-line hold** (PI lock,
+  critically damped, on the line through the jog-start point).
+- **MoveIt Servo is a singularity sentinel**, not the executor: it receives the
+  same twist, keeps evaluating the kinematics, and its status gates the speedl
+  command (full speed → crawl → zero).
+- **Frames:** tool frame (`W/S` along the tool, `A/D`/`Q/E` across) or base frame
+  (`A/D` = ±X, `Q/E` = ±Y, `W/S` = ±Z) — live toggle in the web UI.
+
+Measured result on the physical UR10: **~0.1 mm median off-axis deviation** at up
+to 500 mm/s, orientation held to ≤0.1°.
 
 ---
 
@@ -133,51 +142,30 @@ robot  ◀──speedj──  bridge control loop  ◀────────�
 
 Measured on the physical robot, control bridge on the same PC, direct NIC link.
 
-### Loop rate — 62 Hz setpoints over a 125 Hz robot
+### Loop rate — 125 Hz
 
-The CB3 runs its servo loop at **125 Hz (8 ms)** internally and `speedj` holds the
-commanded velocity continuously between updates — so the *robot's motion* is always
-smooth 125 Hz. What we control is the **setpoint refresh rate**.
-
-The pull loop's cycle time is **≈ 2.1 × the commanded step duration** (`step_t`),
-with essentially no fixed overhead — confirmed by a two-point fit:
-
-| commanded `step_t` | measured cycle | rate |
-|---|---|---|
-| 8 ms | 16 ms | **62 Hz** |
-| 50 ms | 104 ms | 10 Hz |
-
-`step_t` is fixed at **8 ms** (one CB3 control cycle — the floor; the robot cannot
-act on sub-cycle durations). That yields ~62 Hz. It is *not* fed back from the
-measured cycle time: with the 2× behaviour, doing so is positive feedback that
-pegs the rate at the clamp (this was a real bug — the loop was stuck at 10 Hz).
-
-62 Hz is the architectural ceiling for a pull loop: one setpoint costs two control
-cycles (one to move, one for the socket round-trip), so 125 Hz *setpoints* would
-require a push/pipelined transport, which reintroduces the vibration/backlog the
-pull design exists to avoid. 62 Hz of velocity refresh on top of a 125 Hz servo
-loop is far more than human teleop needs.
+The CB3 runs its servo loop at **125 Hz (8 ms)**. With the pipelined URScript the
+socket round-trip overlaps the motion, so the loop runs at the robot's native rate
+(measured: 626 cycles / 5 s, max gap ~10 ms; the control-loop thread runs
+`SCHED_FIFO` to keep replies inside the motion window). `step_t` is fixed at
+**8 ms** — one CB3 control cycle, the floor.
 
 ### End-to-end latency — keypress → robot moves
 
-Jogging from a browser on the control PC:
+Jogging from a browser on the control PC (MoveIt Servo is out of the command
+path — it only gates):
 
 | Stage | Typical | Worst |
 |---|---|---|
 | keypress → browser event → `ws.send` *(est.)* | ~10 ms | ~16 ms |
 | WebSocket → bridge (localhost) | <1 ms | ~1 ms |
-| publish twist → MoveIt Servo (DDS) | ~0.3 ms | ~0.5 ms |
-| Servo cycle + IK (`publish_period` 4 ms, 250 Hz) | ~2–3 ms | ~5 ms |
-| Servo output → bridge target (DDS) | ~0.3 ms | ~0.5 ms |
-| control loop picks up + sends (62 Hz / 16 ms) | ~8 ms | ~16 ms |
-| robot reads `speedj`, first motion (8 ms cycle) | ~8 ms | ~8 ms |
-| **Total** | **~30 ms** | **~47 ms** |
+| control loop picks up + sends (125 Hz / 8 ms) | ~4 ms | ~8 ms |
+| robot reads `speedl`, first motion (8 ms cycle) | ~8 ms | ~8 ms |
+| **Total** | **~23 ms** | **~33 ms** |
 
-From a **phone over WiFi**, add ~10–30 ms for the wireless hop (~40–60 ms total).
-This is latency to *motion onset*; reaching the commanded velocity then ramps at
-the `jog_accel` (a tunable feel knob, not pipeline latency). The two pull cycles at
-the end dominate the controllable budget. Rows above `_apply_jog` are estimates;
-everything from the bridge onward is measured/configured.
+From a **phone over WiFi**, add ~10–30 ms for the wireless hop. This is latency to
+*motion onset*; reaching the commanded velocity then ramps at `jog_accel` (a
+tunable feel knob, not pipeline latency).
 
 ---
 
@@ -191,10 +179,14 @@ clamped to UR servoj-safe ranges:
 - **Stiffness** — `servoj` gain.
 - **Smoothness** — `servoj` lookahead.
 - **Jog speed** — Cartesian jog speed (mm/s; 5 mm/s floor for fine work).
-- **Jog acceleration** — `speedj` ramp rate (gentler start/stop).
-- **Jog coast** — how long a jog velocity stays valid after Servo goes quiet
-  (lower = crisper stop; default 30 ms).
-- A live robot-connection indicator.
+- **Jog acceleration** — Cartesian start/stop ramp (gentler ↔ snappier feel).
+- **Orientation hold** (`okp`) — stiffness of the tool-orientation lock
+  (raise for a tighter hold, lower if it oscillates; 0 = off).
+- **Straight-line hold** (`pkp`) — stiffness of the path lock
+  (same trade-off; 0 = off).
+- **Base frame** checkbox — jog along robot-base axes instead of tool axes.
+- A live robot-connection indicator, pendant speed-slider readout, and actual
+  joint-speed readout.
 
 In RViz, planned-move speed comes from MoveIt's **Velocity/Acceleration Scaling**
 (default 0.1 — raise to 1.0 for fast moves), not the web slider.
@@ -226,19 +218,23 @@ Optional but recommended for the smoothest control. Scripts in `setup/`:
 
 ## Safety
 
-⚠️ **The arm once shot at high speed near a singularity.** Two guards must stay on
-and must not be weakened:
+⚠️ **The arm once shot at high speed near a singularity.** The guards are layered
+and must all stay on:
 
-- **Hard per-joint speed cap** on jogging (`MAX_JOG_QD`) — the arm cannot exceed
-  it no matter what Servo emits (singularity amplification, glitches).
-- **Singularity deceleration** in MoveIt Servo (`config/ur_servo.yaml`).
-
-Other safety properties of the design:
-
-- `speedj` jog is open-loop velocity, so the on-robot URScript `stopj()`s on a
-  missed read — a stalled or dead PC cannot run the arm away.
-- The jog has a lease/coast window: release, latency, drop, or crash stops the
-  motion within tens of ms.
+1. **MoveIt Servo singularity sentinel** — Servo receives every jog twist and its
+   status gates the `speedl` command: full speed when clean, crawl approaching a
+   singularity, zero at the halt threshold (`config/ur_servo.yaml` thresholds).
+2. **Amplification guard** — the incident's signature is a *small* command
+   producing *large* joint speeds (J⁻¹ blowup near a singularity). Measured joint
+   speed beyond what the commanded TCP speed justifies
+   (`QD_ALLOW_BASE + QD_ALLOW_SLOPE·|cmd|`) shrinks a smooth slew-limited gate —
+   tight at low speed where the danger lives, permissive at honest high speed,
+   and unable to limit-cycle (a fixed cap stuttered at full speed).
+3. **Dead-host watchdog** — the on-robot URScript `stopj()`s after ~8 missed
+   reads (~64 ms); a stalled or dead PC cannot run the arm away.
+4. **Jog lease** — release, latency, drop, or crash zeroes the command within
+   tens of ms.
+5. **UR's own safety limits** backstop everything.
 
 ---
 

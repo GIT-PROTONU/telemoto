@@ -1,42 +1,36 @@
 # MoveIt Servo config for the UR10 (Jazzy moveit_servo 2.12, new param schema).
 # Loaded under the "moveit_servo" namespace via launch_param_builder.
-# Drives WASD jogging: servo_node receives TwistStamped on ~/delta_twist_cmds
-# and publishes a JointTrajectory the ur_servo_controller feeds into its stream.
+#
+# ROLE: kinematic SENTINEL for the WASD jog — servo_node receives the jog twist on
+# ~/delta_twist_cmds and keeps evaluating the kinematics; ur_servo_controller uses
+# its ~/status (singularity/joint-bound codes) to gate the speedl command it sends
+# the robot. Servo's own JointTrajectory output is NOT used for motion (the robot
+# executes the Cartesian command onboard via URScript speedl).
 
 publish_period: 0.004           # servo output rate [s] — faster = lower latency
 max_expected_latency: 0.03
 
 command_in_type: "speed_units"  # twist values are m/s and rad/s
 # In speed_units mode `scale.linear/rotational` are the MAX linear/angular
-# velocities (a hard cap on the incoming twist), not just unitless scaling.
-# linear = JOG_SPEED_MAX (0.5) + PATH_LOCK_MAX (0.15): the straight-line-hold
-# correction rides on top of the jog, and clamping here would strip it exactly
-# at full slider speed — where it's needed most. MAX_JOG_QD still caps joints.
+# velocities (a hard cap on the incoming twist), not just unitless scaling. Keep
+# linear ≥ the jog slider max (JOG_SPEED_MAX = 0.5) with headroom so a full-speed
+# twist is never clamped — a clamped twist would skew the sentinel's assessment.
 scale:
-  linear: 0.65                  # m/s cap — JOG_SPEED_MAX + PATH_LOCK_MAX
-  rotational: 1.0               # rad/s cap. The jog slider is linear-only, but the
-                                # orientation-hold injects a small capped angular
-                                # velocity (ORIENT_LOCK_MAX) to keep the TCP from
-                                # drifting; keep this ≥ that cap so it gets through.
+  linear: 0.65                  # m/s cap — jog max + headroom
+  rotational: 1.0               # rad/s cap
   joint: 0.5
 
+# Servo's joint output is unused (sentinel role) but a valid output config is
+# required; nothing subscribes to this topic.
 command_out_type: trajectory_msgs/JointTrajectory
 command_out_topic: /telamoto/servo_command
-publish_joint_positions: true    # used to seed the servoj hold when jogging stops
-publish_joint_velocities: true   # the speedj command stream while jogging
+publish_joint_positions: true
+publish_joint_velocities: true
 publish_joint_accelerations: false
 
-# Smoothing DISABLED again (2026-06-09). The AccelerationLimitedPlugin was wired
-# up + given accel limits (joint_limits.yaml) + the top-level update_period param
-# (moveit_real.launch.py), and it ran — but it did NOT fix the high-speed
-# "Position deviates from path" trip and it INTRODUCED a standstill resonance
-# (the OSQP output appears to ring). Combined with raising jog_accel to match it,
-# that reproduced the old jog oscillation. Reverted to plain speedj. The plugin
-# scaffolding (limits + update_period) is left in place so re-enabling is one line
-# if we revisit. The real win this round was the SCHED_FIFO control loop (steady
-# 17 ms cycle, was 24–60 ms) — see ur_servo_controller._promote_realtime.
+# Smoothing is pointless in the sentinel role (output unused) and previously
+# introduced a standstill resonance when it drove the arm; keep OFF.
 use_smoothing: false
-# smoothing_filter_plugin_name: "online_signal_smoothing::AccelerationLimitedPlugin"
 
 # move_group owns the planning scene; servo just reads it.
 is_primary_planning_scene_monitor: false

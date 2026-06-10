@@ -323,9 +323,10 @@ _WEB_PAGE = """<!doctype html>
    <div class="hint">Higher = smoother but more lag; raise if it buzzes. Live.</div></div>
  <button onclick="reset()">Reset to defaults</button>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
-   <label>Jog (WASD) <span><input type="checkbox" id="jogon"> enable</span></label>
-   <div class="hint"><b>W/S</b> forward/back along the tool &middot; <b>A/D</b> across &middot;
-     <b>Q/E</b> across (tool frame). Hold to move, release to stop. Robot must be connected.</div>
+   <label>Jog (WASD) <span>
+     <input type="checkbox" id="basef"> base frame &nbsp;
+     <input type="checkbox" id="jogon"> enable</span></label>
+   <div class="hint" id="joghint"></div>
  </div>
  <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
    <input type="range" id="jspeed" min="0.005" max="0.5" step="0.005">
@@ -362,8 +363,16 @@ _WEB_PAGE = """<!doctype html>
    qd.textContent="joint speed: "+(s.qdnow==null?"\\u2014":s.qdnow.toFixed(3))
      +" \\u2014 1.5s peak: "+(s.qdpeak==null?"\\u2014":s.qdpeak.toFixed(3))+" rad/s";
    qd.style.color=(s.qdpeak>0.02)?"#ff7b72":"#888";}catch(e){}}
- async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));}catch(e){}
+ const hints={tool:"<b>W/S</b> forward/back along the tool \\u00b7 <b>A/D</b> across \\u00b7 <b>Q/E</b> across (tool frame). Hold to move, release to stop.",
+   base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z (robot BASE frame). Hold to move, release to stop."};
+ function showHint(){document.getElementById("joghint").innerHTML=
+   hints[document.getElementById("basef").checked?"base":"tool"];}
+ async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));
+   document.getElementById("basef").checked=!!s.basef;}catch(e){}
+   showHint();
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
+   document.getElementById("basef").addEventListener("change",e=>{showHint();
+     fetch("/api/jogframe?base="+(e.target.checked?1:0),{method:"POST"});});
    refreshStatus();setInterval(refreshStatus,300);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
@@ -606,6 +615,8 @@ class URServoController(Node):
         self._jog = [0.0] * 6
         self._jog_lease = 0.0                          # twist valid until this time
         self._jog_mode = False                         # web toggle: stay in jog mode
+        self._jog_base = False                         # web toggle: jog axes in BASE
+                                                       # frame (True) or TOOL (False)
         self._pub_lock = threading.Lock()              # serialise twist publishes
         self._qd_target = [0.0] * 6
         self._servo_active_until = 0.0
@@ -764,15 +775,15 @@ class URServoController(Node):
 
     def _set_path_baseline(self, pose, jog_vec) -> None:
         """Anchor the straight-line hold: line = current TCP position along the
-        commanded jog direction (tool coords → base frame via the current
-        orientation). Cleared (None) if TF is unavailable or the vector is zero."""
+        commanded jog direction (expressed in base frame; tool-frame jogs are rotated
+        via the current orientation). Cleared (None) if TF is unavailable or zero."""
         self._path_i = [0.0, 0.0, 0.0]     # new line → forget the learned disturbance
         self._path_i_t = time.monotonic()
         if pose is None:
             self._jog_start_pos = self._jog_dir = None
             return
         self._jog_start_pos = pose[0]
-        d = _quat_rotate(pose[1], jog_vec)
+        d = jog_vec if self._jog_base else _quat_rotate(pose[1], jog_vec)
         n = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
         self._jog_dir = tuple(c / n for c in d) if n > 1e-9 else None
 
@@ -831,14 +842,20 @@ class URServoController(Node):
             if not self._cart_jog:
                 pose = self._tcp_pose()
                 if pose:
+                    # Corrections in the frame the twist is stamped with: orientation
+                    # hold is computed in tool coords, the line hold in base coords.
                     ang = self._orient_lock_angular(pose[1])
-                    lat = _quat_rotate(_quat_conj(pose[1]), self._path_lock_linear(pose))
+                    lat = self._path_lock_linear(pose)
+                    if self._jog_base:
+                        ang = _quat_rotate(pose[1], ang)
+                    else:
+                        lat = _quat_rotate(_quat_conj(pose[1]), lat)
         else:
             self._path_i = [0.0, 0.0, 0.0]    # standstill → drop the learned
             self._path_i_t = time.monotonic()  # disturbance (it's speed-specific)
         m = TwistStamped()
         m.header.stamp = self.get_clock().now().to_msg()
-        m.header.frame_id = JOG_FRAME
+        m.header.frame_id = BASE_FRAME if self._jog_base else JOG_FRAME
         m.twist.linear.x = self._jog_cmd[0] + lat[0]
         m.twist.linear.y = self._jog_cmd[1] + lat[1]
         m.twist.linear.z = self._jog_cmd[2] + lat[2]
@@ -851,6 +868,10 @@ class URServoController(Node):
         if not self._jog_mode:
             self._jog = _ZERO6
         self.get_logger().info(f"[jog] velocity mode {'ON' if self._jog_mode else 'OFF'}")
+
+    def _web_jogframe(self, q: dict) -> None:
+        self._jog_base = q.get("base", ["0"])[0] in ("1", "true", "on")
+        self.get_logger().info(f"[jog] frame: {'BASE' if self._jog_base else 'TOOL'}")
 
     # ── WASD jog: bridge web → MoveIt Servo → our stream ────────────────────────
 
@@ -895,7 +916,7 @@ class URServoController(Node):
         last_orient_log = 0.0
         last_ramp = time.monotonic()
         prev_intent = False
-        jog_ref = (0.0, 0.0, 0.0)          # last commanded jog vector (direction-change detect)
+        jog_ref = (False, (0.0, 0.0, 0.0))  # last (frame, jog vector) — change detect
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
             now = time.monotonic()
@@ -907,7 +928,10 @@ class URServoController(Node):
             # hand-reposition / planned-move between jogs and re-lock, while rapid taps
             # keep the SAME reference (residual drift is pulled back, not ratcheted in).
             # The idle clock starts on release (falling edge).
+            # Re-anchor key includes the jog FRAME: toggling Base/Tool mid-jog changes
+            # what the same key vector means, so it must re-anchor like a key switch.
             jog_vec = tuple(self._jog[0:3])
+            jog_key = (self._jog_base, jog_vec)
             if intent and not prev_intent:
                 pose = self._tcp_pose()
                 o = pose[1] if pose else None
@@ -915,14 +939,14 @@ class URServoController(Node):
                     self._orient_target = o
                 self._jog_start_orient = self._orient_target
                 self._set_path_baseline(pose, jog_vec)
-            elif intent and jog_vec != jog_ref:
-                # Commanded direction changed MID-jog (key switch / speed slider):
+            elif intent and jog_key != jog_ref:
+                # Commanded direction changed MID-jog (key switch / slider / frame):
                 # re-anchor the line at the current pose along the new direction, or
                 # the path lock would fight the new motion as "lateral error".
                 self._set_path_baseline(self._tcp_pose(), jog_vec)
             elif not intent and prev_intent:
                 self._jog_stop_t = now
-            jog_ref = jog_vec
+            jog_ref = jog_key
             prev_intent = intent
 
             # Cartesian linear-velocity ramp toward the target (tool frame). Ramping
@@ -1001,7 +1025,7 @@ class URServoController(Node):
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
                         "jcoast": round(node._jog_coast, 3), "okp": round(node._orient_kp, 1),
-                        "pkp": round(node._path_kp, 1),
+                        "pkp": round(node._path_kp, 1), "basef": node._jog_base,
                         "speedfrac": round(sf, 3) if sf is not None else None,
                         "qdnow": round(node._qd_now, 3), "qdpeak": round(node._qd_peak, 3),
                         "connected": connected}).encode(),
@@ -1016,6 +1040,8 @@ class URServoController(Node):
                         node._web_set(q)
                     elif self.path.startswith("/api/jogmode"):
                         node._web_jogmode(q)
+                    elif self.path.startswith("/api/jogframe"):
+                        node._web_jogframe(q)
                 except (ValueError, KeyError):
                     pass
                 self._send(b"ok")
@@ -1349,7 +1375,8 @@ class URServoController(Node):
                     # the UR-native Base frame (= base_link yawed π in ur_description:
                     # x→−x, y→−y; angular likewise) which speedl expects.
                     q = pose[1]
-                    lin = _quat_rotate(q, tuple(self._jog_cmd))
+                    lin = (tuple(self._jog_cmd) if self._jog_base
+                           else _quat_rotate(q, tuple(self._jog_cmd)))
                     lat = self._path_lock_linear(pose)
                     ang = _quat_rotate(q, self._orient_lock_angular(q))
                     # SAFETY GATE 1: Servo's kinematic sentinel (singularity/collision).

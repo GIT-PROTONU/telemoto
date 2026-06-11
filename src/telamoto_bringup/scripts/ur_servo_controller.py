@@ -403,7 +403,7 @@ _WEB_PAGE = """<!doctype html>
  /* Fullscreen top bar: one glassy strip — status dot, compact equal buttons,
     a jog-speed row, and (when active) the collision chip. */
  #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;
-  gap:.45rem;row-gap:.4rem;flex-wrap:wrap;align-items:center;
+  gap:.45rem;row-gap:.4rem;flex-wrap:wrap;align-items:center;justify-content:center;
   padding:calc(.55rem + env(safe-area-inset-top)) .65rem .55rem;
   background:#0e131adb;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
   border-bottom:1px solid #ffffff14}
@@ -418,7 +418,7 @@ _WEB_PAGE = """<!doctype html>
  #fsping{flex:0 0 auto;font-size:.72rem;color:#9ab;white-space:nowrap;
   font-variant-numeric:tabular-nums;padding-right:.1rem}
  #fsspeed{flex-basis:100%;display:flex;align-items:center;gap:.6rem;
-  font-size:.75rem;color:#9ab}
+  font-size:.75rem;color:#9ab;max-width:560px;margin:0 auto}
  #fsspeed input{flex:1;height:1.7rem;margin:0;width:auto}
  #fsspeed .val{min-width:4.2rem;text-align:right}
  #fsjoghint{display:none}
@@ -459,11 +459,12 @@ _WEB_PAGE = """<!doctype html>
  #collAlert.halt{display:block;background:#3d1414;border:1px solid #ff7b72;color:#ff7b72}
  body.fs #collAlert{display:none!important}
  #fsCollAlert{display:none;flex-basis:100%;font-size:.78rem;line-height:1.5;
-  padding:.35rem .65rem;border-radius:.45rem;border:1px solid transparent}
+  padding:.35rem .65rem;border-radius:.45rem;border:1px solid transparent;
+  max-width:560px;margin:0 auto;text-align:center}
  #fsCollAlert.warn{display:block;background:#3d3000;border-color:#e3b341;color:#e3b341}
  #fsCollAlert.halt{display:block;background:#3d1414;border-color:#ff7b72;color:#ff7b72}
 </style></head>
-<body>
+<body class="fs">
  <h1>Telamoto &mdash; motion tuning</h1>
  <div id="status" class="bad">connecting&hellip;</div>
  <div id="collAlert"></div>
@@ -712,8 +713,11 @@ _WEB_PAGE = """<!doctype html>
  // blur/hidden clearing) applies unchanged.
  const padLabels={tool:{w:"\\u25b2 fwd",s:"\\u25bc back",a:"\\u25c0",d:"\\u25b6",q:"\\u2191 up",e:"\\u2193 down",t:"tilt"},
    base:{w:"+Z \\u25b2",s:"\\u2212Z \\u25bc",a:"+X",d:"\\u2212X",q:"+Y",e:"\\u2212Y",t:"tilt"}};
+ // Desktop (mouse-primary): the keyboard key rides above the label so the pads
+ // double as a WASD legend — the fullscreen layout is the default view there too.
  function padRelabel(){const L=padLabels[document.getElementById("basef").checked?"base":"tool"];
-   document.querySelectorAll("#pads .jb").forEach(b=>b.textContent=L[b.dataset.k]);}
+   document.querySelectorAll("#pads .jb").forEach(b=>{const k=b.dataset.k;
+     b.innerHTML=(!isMobile&&k!=="t"?"<small style='opacity:.55'>"+k.toUpperCase()+"</small><br>":"")+L[k];});}
  function clearPads(){document.querySelectorAll("#pads .jb.on").forEach(b=>b.classList.remove("on"));}
  function press(k,on){if(!jogOn)return;
    if(on&&!held.has(k)){held.add(k);sendJog();startStream();}
@@ -810,8 +814,10 @@ _WEB_PAGE = """<!doctype html>
    v.checked=true;v.dispatchEvent(new Event("change"));}
  if(location.hash==="#fs")setFS(true);
  if(location.hash==="#tune")panel.classList.add("open");
- // Auto-fullscreen on touch-primary devices (phones, tablets).
- if(window.matchMedia("(pointer:coarse)").matches)setFS(true);
+ // The page boots straight into the fullscreen layout on EVERY device (body
+ // ships class="fs" so there's no classic-page flash); this just syncs the 3D
+ // view + checkbox. The classic scroll page remains available via ✕.
+ setFS(true);
 </script>
 </body></html>
 """
@@ -1854,9 +1860,21 @@ class URServoController(Node):
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
 
     def _pc_ip(self) -> str:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((self._robot_ip, self._port))
-            return s.getsockname()[0]
+        """Best local IP for the log line and the URScript connect-back. NEVER
+        raises: with the robot dark its direct link is down and the UDP connect
+        probe fails with 'Network is unreachable' — that used to kill the web
+        thread before serve_forever(), taking the whole UI offline. The robot
+        probe stays first so the connect-back host is correct whenever a robot
+        is actually there (it must be: _serve_script only runs after the robot
+        reached us, so the route exists)."""
+        for probe in ((self._robot_ip, self._port), ("8.8.8.8", 53)):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(probe)
+                    return s.getsockname()[0]
+            except OSError:
+                continue
+        return "localhost"
 
     def _serve_script(self, conn, addr) -> None:
         host = self._pc_ip()

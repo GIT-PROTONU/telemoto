@@ -3,7 +3,7 @@ project(telamoto_bringup)
 
 find_package(ament_cmake REQUIRED)
 
-install(DIRECTORY launch config rviz
+install(DIRECTORY launch config rviz web
   DESTINATION share/${PROJECT_NAME}
 )
 

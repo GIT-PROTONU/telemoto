@@ -189,8 +189,12 @@ tunable feel knob, not pipeline latency).
 ## Tuning web UI
 
 Served by the control bridge on port **8080** while `twin-real` runs (`pixi run
-tune`, or `http://<this-pc-ip>:8080` from a phone). All sliders are **live** and
-clamped to UR servoj-safe ranges:
+tune`, or `http://<this-pc-ip>:8080` from a phone). The layout is mobile-first:
+the 3D view takes most of the screen, **touch jog pads** sit under it
+(hold-to-jog buttons — they drive exactly the same key-handling path as WASD, so
+every fail-safe applies; labels switch with the Base/Tool toggle), and all
+sliders live in a slide-up **tuning panel** behind the floating ⚙ button (deep
+link `/#tune`). All sliders are **live** and clamped to UR servoj-safe ranges:
 
 - **Speed** — trajectory time-scale for planned moves (0.25–3.0×).
 - **Stiffness** — `servoj` gain.
@@ -202,8 +206,35 @@ clamped to UR servoj-safe ranges:
 - **Straight-line hold** (`pkp`) — stiffness of the path lock
   (same trade-off; 0 = off).
 - **Base frame** checkbox — jog along robot-base axes instead of tool axes.
-- A live robot-connection indicator, pendant speed-slider readout, and actual
-  joint-speed readout.
+- A live robot-connection indicator, pendant speed-slider readout, actual
+  joint-speed readout, and link-health stats (RTT / frame gap / lease / jog
+  speed scale) for remote use.
+- **3D view** — an embedded live twin of the robot rendered in the browser
+  (three.js + urdf-loader, fed by a ~25 Hz binary state stream — a few kB/s,
+  no video). Shows the robot, the planning-scene collision cage, and a TCP
+  trail; orbit with mouse or touch. Loaded on demand (~1.4 MB once, then
+  cached); deep link: `http://<pc>:8080/#3d`. The ⛶ button (or `/#fs`) goes
+  **fullscreen**: the view fills the phone screen with the jog pads and a slim
+  top bar (status, base frame, jog on/off, exit) overlaid on it.
+- **Tilt-to-jog** — hold the round *tilt* pad and tilt the phone: the pose at
+  press is neutral, tilting past a 4° deadzone jogs proportionally (full speed
+  at 25°), releasing stops — a dead-man control riding the same stream and
+  fail-safes as the keys. Browsers only deliver motion sensors on **HTTPS**:
+  front the UI with `tailscale serve --bg 8080` and open the `https://…ts.net`
+  URL (iOS additionally pops a motion-permission prompt). Verify the tilt
+  directions at LOW jog speed first.
+- **Collision cage** — `scene_wall.py` now publishes six movable walls
+  (front/back/left/right at ±0.8 m, ceiling at 1.6 m, floor just under the
+  base plane); drag any wall along its normal in RViz (InteractiveMarkers,
+  namespace `/scene_wall`). The floor is special: it only appears after the
+  node fetches move_group's allowed-collision matrix and excludes the floor
+  against the base/shoulder links (which sit permanently at z≈0 — without the
+  exclusion the collision monitor would halt the jog forever). With the full
+  cage, keep the **Wall distance** slider ≤ ~10 cm. Dragged wall positions
+  **persist** across restarts and reboots (`~/.ros/telamoto_cage_poses.yaml`,
+  written on mouse-up; delete the file to restore defaults). The **walls**
+  button on the 3D view (also in fullscreen) hides the cage *rendering* —
+  collision checking is unaffected.
 
 In RViz, planned-move speed comes from MoveIt's **Velocity/Acceleration Scaling**
 (default 0.1 — raise to 1.0 for fast moves), not the web slider.
@@ -268,7 +299,11 @@ and must all stay on:
 3. **Dead-host watchdog** — the on-robot URScript `stopj()`s after ~8 missed
    reads (~64 ms); a stalled or dead PC cannot run the arm away.
 4. **Jog lease** — release, latency, drop, or crash zeroes the command within
-   tens of ms.
+   tens of ms. On laggy links (remote/VPN) the lease adapts to the measured
+   frame jitter (0.1 s floor, 0.4 s ceiling) and the jog speed scales down by
+   the same factor, so worst-case blind travel never exceeds the LAN case —
+   a bad link degrades to a *slower* jog, never a less safe one. Live link
+   stats (RTT / frame gap / lease / speed scale) show in the web UI.
 5. **UR's own safety limits** backstop everything.
 
 ---

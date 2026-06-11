@@ -49,6 +49,7 @@ import gc
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import socket
 import struct
@@ -56,6 +57,8 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from ament_index_python.packages import get_package_share_directory
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -67,9 +70,10 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import Float64, String
 from geometry_msgs.msg import TwistStamped
-from moveit_msgs.msg import ServoStatus
+from moveit_msgs.msg import CollisionObject, PlanningScene, ServoStatus
 from moveit_msgs.srv import ServoCommandType
 from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
@@ -134,7 +138,8 @@ SPEED_MIN, SPEED_MAX         = 0.25, 3.0
 
 # WASD jogging via MoveIt Servo. The web streams per-axis direction in [-1,1]
 # at ~30 Hz while a key is held; we scale to these speeds and publish a
-# TwistStamped in JOG_FRAME. Each command leases the twist for JOG_LEASE.
+# TwistStamped in JOG_FRAME. Each command leases the twist for the link-adaptive
+# lease (JOG_LEASE floor — see the laggy-link block below).
 JOG_FRAME   = "tool0"       # jog in the TOOL frame (Servo transforms the twist);
                             # use "base_link" for base-frame jogging instead
 BASE_FRAME  = "base_link"   # fixed frame the TCP orientation is held against
@@ -185,6 +190,36 @@ REORIENT_IDLE   = 1.0       # s — only re-capture the locked orientation after
 JOG_LEASE   = 0.1           # s — each jog command is a lease; if no new command
                             # arrives within this the robot stops (latency/drop
                             # safety + instant stop on key release)
+# Laggy-link compensation (remote/VPN jogging). A fixed 0.1 s lease assumes the
+# ~30 Hz frame stream never gaps more than ~67 ms — true on a LAN, false over the
+# internet, where jitter expires the lease mid-hold and the jog stutters at FULL
+# speed (ramp down → ramp up). Instead the lease ADAPTS to the measured
+# frame-arrival gap, and the jog speed is scaled DOWN by the same factor, holding
+#   scaled_speed × lease  =  jog_speed × JOG_LEASE
+# so the worst-case uncommanded travel after the last received frame (expiry,
+# dead client) never exceeds what the 0.1 s lease allows on a LAN — a laggy link
+# degrades to a slower jog, never a less safe one. The client streams at a fixed
+# 30 Hz whenever jog mode is on (zeros while no key is held), so the gap between
+# frames IS the link jitter and the estimate is warm before the first key press.
+JOG_LEASE_MAX     = 0.4     # s — lease ceiling; links gapping beyond this still
+                            # stutter (correctly: unusable for jogging)
+LINK_GAP_TOL      = 0.05    # s — frame gaps up to this are normal even on a LAN
+                            # (33 ms period + timer jitter) and do NOT stretch the
+                            # lease, so LAN behavior is bit-identical
+LINK_LEASE_FACTOR = 3.0     # lease = JOG_LEASE + factor × (recent-max gap − TOL)
+LINK_GAP_NOMINAL  = 1.0 / 30.0  # s — the client's frame period (30 Hz stream)
+LINK_GAP_TAU      = 10.0    # s — peak-hold decay: a bad burst stretches the
+                            # lease, a recovered link relaxes back in ~10 s
+LINK_BIG_WINDOW   = 2.0     # s — de-twitch: an ISOLATED big gap (browser GC,
+                            # scheduler hiccup) must not modulate the jog speed —
+                            # it keeps the old fixed-lease behavior (at worst one
+                            # stutter). Only a SECOND big gap within this window
+                            # confirms real link degradation and feeds the peak.
+LINK_GAP_RESET    = 0.45    # s — gaps beyond this are ignored by the estimator:
+                            # just past the lease ceiling, so they are unbridgeable
+                            # anyway (already stuttered) and far more likely a
+                            # stream (re)start (jog toggle, tab flick, WS
+                            # reconnect) than jitter worth adapting to
 JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
                                               # 5 mm/s floor → sub-mm taps for fine work
 JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider);
@@ -323,7 +358,8 @@ _WEB_PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Telamoto motion tuning</title>
 <style>
- body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:auto;padding:1.2rem;max-width:560px}
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:auto;
+  padding:1.2rem 1.2rem 5.5rem;max-width:640px}
  h1{font-size:1.25rem;font-weight:600}
  #status{font-size:.85rem;padding:.3rem .6rem;border-radius:.4rem;display:inline-block;margin-bottom:.5rem}
  .ok{background:#13391b;color:#6ee787}.bad{background:#3a1414;color:#ff7b72}
@@ -333,28 +369,104 @@ _WEB_PAGE = """<!doctype html>
  input[type=range]{width:100%;height:2.2rem}
  .hint{color:#888;font-size:.8rem;margin-top:.25rem}
  button{background:#222;color:#eee;border:1px solid #444;border-radius:.5rem;padding:.6rem 1.1rem;font-size:.9rem;margin-top:.6rem}
+ /* Touch jog pads (mobile: no keyboard). touch-action:none stops scroll/zoom
+    gestures from stealing the press mid-jog. */
+ #pads{display:flex;gap:2rem;justify-content:center;align-items:center;margin:1rem 0}
+ #padgrid{display:grid;grid-template-areas:". q ." "a t d" ". e .";gap:.45rem}
+ #padz{display:flex;flex-direction:column;gap:.45rem}
+ .jb{width:64px;height:64px;margin:0;padding:0;font-size:.95rem;border-radius:.7rem;
+  background:#1c2733;border:1px solid #38506a;color:#cfe3ff;line-height:1.2;
+  touch-action:none;user-select:none;-webkit-user-select:none}
+ .jb.on{background:#2d5a8e;border-color:#4ea1ff}
+ #jb-q{grid-area:q}#jb-a{grid-area:a}#jb-d{grid-area:d}#jb-e{grid-area:e}
+ #jb-t{grid-area:t;border-radius:50%;background:#26203a;border-color:#7a5cff;color:#cdbfff}
+ #pads.off .jb{opacity:.35;pointer-events:none}
+ /* Big 3D view (mobile-first): most of the viewport, capped on desktop. */
+ #view3d{width:100%;height:min(56vh,560px);height:min(56dvh,560px);
+  background:#181818;border-radius:.5rem;display:none;overflow:hidden}
+ /* Fullscreen 3D (body.fs): the view owns the viewport; a translucent top bar
+    (status + frame/jog toggles + exit) and the jog pads overlay it. CSS-fixed
+    rather than the Fullscreen API — iPhone Safari doesn't allow that on divs. */
+ #viewwrap{position:relative}
+ #fsbtn,#wallbtn{display:none;position:absolute;top:.5rem;z-index:5;margin:0;
+  padding:.45rem .7rem;background:#1c2733cc;border:1px solid #38506a;color:#cfe3ff;
+  border-radius:.6rem;font-size:1rem}
+ #fsbtn{right:.5rem}
+ #wallbtn{right:3.3rem;font-size:.85rem;padding:.55rem .7rem}
+ #wallbtn.on{background:#2d5a8ecc;border-color:#4ea1ff}
+ #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;gap:.5rem;
+  padding:.6rem;align-items:center}
+ #fsbar button{margin:0;background:#1c2733cc;border:1px solid #38506a;color:#cfe3ff;
+  border-radius:.6rem;padding:.55rem .9rem}
+ #fsbar button.on{background:#2d5a8ecc;border-color:#4ea1ff}
+ #fsstat{margin-right:auto;font-size:.8rem;padding:.3rem .6rem;border-radius:.4rem}
+ body.fs{overflow:hidden}
+ body.fs #view3d{position:fixed;inset:0;z-index:25;height:100%;border-radius:0}
+ body.fs #fsbar{display:flex}
+ body.fs #fsbtn,body.fs #wallbtn{display:none!important}
+ body.fs #pads{position:fixed;left:0;right:0;bottom:0;z-index:27;margin:0;
+  justify-content:space-between;
+  padding:0 1.1rem calc(1.1rem + env(safe-area-inset-bottom));pointer-events:none}
+ body.fs #pads .jb{pointer-events:auto;background:#1c2733cc}
+ body.fs #pads.off .jb{pointer-events:none}
+ body.fs #jb-t{background:#26203acc}
+ body.fs #panel{z-index:28}
+ /* Tuning panel: bottom sheet toggled by the floating button — keeps every
+    slider one tap away while the 3D view + jog pads own the screen. */
+ #panelbtn{position:fixed;right:1rem;bottom:1rem;z-index:30;margin:0;
+  background:#2d5a8e;border:1px solid #4ea1ff;color:#fff;border-radius:2rem;
+  padding:.75rem 1.25rem;font-size:1rem;box-shadow:0 2px 12px #000a}
+ #panel{position:fixed;left:0;right:0;bottom:0;z-index:20;margin:auto;max-width:640px;
+  background:#191f26;border:1px solid #333;border-bottom:none;border-radius:1rem 1rem 0 0;
+  padding:0 1.2rem 1.2rem;max-height:75vh;max-height:75dvh;overflow-y:auto;
+  transform:translateY(105%);transition:transform .25s ease;box-shadow:0 -4px 24px #000c}
+ #panel.open{transform:none}
+ #panelhdr{position:sticky;top:0;z-index:1;background:#191f26;display:flex;
+  justify-content:space-between;align-items:center;padding:.8rem 0 .4rem}
+ #panelhdr button{margin:0;padding:.35rem .8rem}
+ #panel .row{margin:1.1rem 0}
 </style></head>
 <body>
  <h1>Telamoto &mdash; motion tuning</h1>
  <div id="status" class="bad">connecting&hellip;</div>
  <div id="pendant" class="hint">pendant speed slider: &mdash;</div>
  <div id="qd" class="hint">joint speed: &mdash; &nbsp;|&nbsp; 1.5s peak: &mdash; rad/s</div>
- <div class="row"><label>Speed <span class="val" id="speedv"></span></label>
-   <input type="range" id="speed" min="0.25" max="3" step="0.05">
-   <div class="hint">Overall move speed (also scales acceleration). Next move.</div></div>
- <div class="row"><label>Stiffness <span class="val" id="gainv"></span></label>
-   <input type="range" id="gain" min="100" max="2000" step="25">
-   <div class="hint">Higher = crisper tracking, lower = softer. Live.</div></div>
- <div class="row"><label>Smoothness <span class="val" id="lookaheadv"></span></label>
-   <input type="range" id="lookahead" min="0.03" max="0.2" step="0.005">
-   <div class="hint">Higher = smoother but more lag; raise if it buzzes. Live.</div></div>
- <button onclick="reset()">Reset to defaults</button>
+ <div id="link" class="hint">link: &mdash;</div>
+ <div class="row"><label>3D view <span><input type="checkbox" id="viewon"> show</span></label>
+   <div id="viewwrap">
+     <button id="fsbtn" title="fullscreen">&#x26F6;</button>
+     <button id="wallbtn" class="on" title="show/hide the safety walls (view only)">walls</button>
+     <div id="view3d"></div>
+   </div>
+   <div class="hint">Live twin (drag = orbit, wheel/pinch = zoom). Robot +
+     planning-scene walls + TCP trail; a few kB/s.</div></div>
+ <div id="fsbar"><span id="fsstat" class="bad">&hellip;</span>
+   <button id="fswalls" class="on">walls</button>
+   <button id="fsframe">base frame</button>
+   <button id="fsjog">jog</button>
+   <button id="fsexit">&#10005;</button></div>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
-   <label>Jog (WASD) <span>
+   <label>Jog <span>
      <input type="checkbox" id="basef"> base frame &nbsp;
      <input type="checkbox" id="jogon"> enable</span></label>
    <div class="hint" id="joghint"></div>
  </div>
+ <div id="pads" class="off">
+   <div id="padgrid">
+     <button class="jb" id="jb-q" data-k="q"></button>
+     <button class="jb" id="jb-a" data-k="a"></button>
+     <button class="jb" id="jb-t" data-k="t"></button>
+     <button class="jb" id="jb-d" data-k="d"></button>
+     <button class="jb" id="jb-e" data-k="e"></button>
+   </div>
+   <div id="padz">
+     <button class="jb" id="jb-w" data-k="w"></button>
+     <button class="jb" id="jb-s" data-k="s"></button>
+   </div>
+ </div>
+ <button id="panelbtn">&#9881; tuning</button>
+ <div id="panel">
+ <div id="panelhdr"><b>Tuning</b><button id="panelclose">&#10005; close</button></div>
  <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
    <input type="range" id="jspeed" min="0.005" max="0.5" step="0.005">
    <div class="hint">Cartesian jog velocity &mdash; lower for mm-precise work. Live.</div></div>
@@ -375,8 +487,25 @@ _WEB_PAGE = """<!doctype html>
      contact. Live.</div></div>
  <div class="row"><label>Wall distance <span class="val" id="walldv"></span></label>
    <input type="range" id="walld" min="0.01" max="1" step="0.01">
-   <div class="hint">Jog slows this far from scene objects (the test wall), stops at
-     contact. Live.</div></div>
+   <div class="hint">Jog slows this far from scene objects (the cage walls), stops at
+     contact. With the full cage keep this &le; ~10 cm or jog is permanently slowed.
+     Live.</div></div>
+ <div class="row"><label>Speed <span class="val" id="speedv"></span></label>
+   <input type="range" id="speed" min="0.25" max="3" step="0.05">
+   <div class="hint">Overall move speed (also scales acceleration). Next move.</div></div>
+ <div class="row"><label>Stiffness <span class="val" id="gainv"></span></label>
+   <input type="range" id="gain" min="100" max="2000" step="25">
+   <div class="hint">Higher = crisper tracking, lower = softer. Live.</div></div>
+ <div class="row"><label>Smoothness <span class="val" id="lookaheadv"></span></label>
+   <input type="range" id="lookahead" min="0.03" max="0.2" step="0.005">
+   <div class="hint">Higher = smoother but more lag; raise if it buzzes. Live.</div></div>
+ <button onclick="reset()">Reset to defaults</button>
+ </div>
+<script type="importmap">
+{"imports":{"three":"/static/three.module.js",
+ "three/examples/jsm/loaders/STLLoader.js":"/static/STLLoader.js",
+ "three/examples/jsm/loaders/ColladaLoader.js":"/static/ColladaLoader.js"}}
+</script>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
    jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" m/s\\u00b2",
@@ -386,53 +515,185 @@ _WEB_PAGE = """<!doctype html>
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
    document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
- async function refreshStatus(){try{const s=await(await fetch("/api/state")).json();
+ async function refreshStatus(){try{const t0=performance.now();
+   const s=await(await fetch("/api/state")).json();
+   const rtt=Math.round(performance.now()-t0);
    const st=document.getElementById("status");
    st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
    st.className=s.connected?"ok":"bad";
+   const fst=document.getElementById("fsstat");
+   fst.textContent=s.connected?"connected":"not connected";fst.className=st.className;
    document.getElementById("pendant").textContent="pendant speed slider: "
      +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");
    const qd=document.getElementById("qd");
    qd.textContent="joint speed: "+(s.qdnow==null?"\\u2014":s.qdnow.toFixed(3))
      +" \\u2014 1.5s peak: "+(s.qdpeak==null?"\\u2014":s.qdpeak.toFixed(3))+" rad/s";
-   qd.style.color=(s.qdpeak>0.02)?"#ff7b72":"#888";}catch(e){}}
+   qd.style.color=(s.qdpeak>0.02)?"#ff7b72":"#888";
+   // Link health: rtt is browser-measured (this fetch); gap/lease/scale come from
+   // the server's jog-frame estimator. Amber/red = laggy link, jog auto-slowed.
+   const lk=document.getElementById("link");
+   lk.textContent="link: rtt "+rtt+" ms \\u00b7 frame gap "+s.linkgap+" ms \\u00b7 lease "
+     +s.lease+" ms \\u00b7 jog speed \\u00d7"+s.linkscale.toFixed(2);
+   lk.style.color=s.linkscale>0.99?"#888":(s.linkscale>0.3?"#e3b341":"#ff7b72");}catch(e){}}
  const hints={tool:"<b>W/S</b> forward/back along the tool \\u00b7 <b>A/D</b> across \\u00b7 <b>Q/E</b> across (tool frame). Hold to move, release to stop.",
    base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z (robot BASE frame). Hold to move, release to stop."};
- function showHint(){document.getElementById("joghint").innerHTML=
-   hints[document.getElementById("basef").checked?"base":"tool"];}
+ function showHint(){const b=document.getElementById("basef").checked;
+   document.getElementById("joghint").innerHTML=hints[b?"base":"tool"];
+   document.getElementById("fsframe").classList.toggle("on",b);}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));
    document.getElementById("basef").checked=!!s.basef;}catch(e){}
    showHint();
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
-   document.getElementById("basef").addEventListener("change",e=>{showHint();
+   document.getElementById("basef").addEventListener("change",e=>{showHint();padRelabel();
      fetch("/api/jogframe?base="+(e.target.checked?1:0),{method:"POST"});});
    refreshStatus();setInterval(refreshStatus,300);}
  function reset(){show("speed",1);show("gain",300);show("lookahead",0.1);
    fetch("/api/set?speed=1&gain=300&lookahead=0.1",{method:"POST"});}
- // WASD jog: stream the direction as a CBOR binary frame at 30 Hz over a
- // WebSocket while a key is held, zero on release. WS is ordered + low-overhead.
+ // WASD jog: stream the direction as a CBOR binary frame at a fixed 30 Hz over a
+ // WebSocket the whole time jog mode is ON (zeros while no key is held) — the
+ // server measures the gap between frames to estimate link jitter and adapt the
+ // jog lease/speed for laggy (remote) connections, so the stream must run even at
+ // idle to keep that estimate warm. Paused while the tab is hidden: browsers
+ // throttle background timers to ~1 Hz, which would poison the estimate.
  let jogOn=false; const held=new Set(); let stream=null, ws=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
- function jogVec(){return {lx:(held.has("a")?1:0)-(held.has("d")?1:0),
-   ly:(held.has("q")?1:0)-(held.has("e")?1:0),lz:(held.has("w")?1:0)-(held.has("s")?1:0)};}
+ // Keys give ±1; the tilt pad adds analog values — the sum is clamped to [-1,1]
+ // (the server clamps again; never trust the client).
+ function jogVec(){const c=v=>Math.max(-1,Math.min(1,v));
+   return {lx:c((held.has("a")?1:0)-(held.has("d")?1:0)+tilt.x),
+     ly:c((held.has("q")?1:0)-(held.has("e")?1:0)+tilt.y),
+     lz:c((held.has("w")?1:0)-(held.has("s")?1:0))};}
  function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
  function cborInt(n){n=Math.round(n);const m=n<0?0x20:0x00,u=n<0?-1-n:n;
    if(u<24)return[m|u];if(u<256)return[m|24,u];return[m|25,(u>>8)&0xff,u&0xff];}
- function cborJog(v){return new Uint8Array([0x83].concat(cborInt(v.lx),cborInt(v.ly),cborInt(v.lz)));}
- function sendJog(){if(ws&&ws.readyState===1)ws.send(cborJog(jogVec()));}
- function startStream(){if(!stream)stream=setInterval(sendJog,33);}   // ~30 Hz
- function stopAll(){held.clear();if(stream){clearInterval(stream);stream=null;}sendJog();}  // sends zero
+ function cborNum(n){if(Number.isInteger(n))return cborInt(n);   // analog → float32
+   const d=new DataView(new ArrayBuffer(4));d.setFloat32(0,n);
+   return [0xfa,d.getUint8(0),d.getUint8(1),d.getUint8(2),d.getUint8(3)];}
+ function cborJog(v){return new Uint8Array([0x83].concat(cborNum(v.lx),cborNum(v.ly),cborNum(v.lz)));}
+ // Idle ticks send a 1-byte KEEPALIVE (CBOR empty array): it feeds the server's
+ // link-jitter estimator but never the jog command — so a second open tab can't
+ // fight the active tab's jog with a 30 Hz stream of zeros (= choppy motion).
+ // A real [0,0,0] is still sent on the moving->stopped transition (instant stop).
+ const KEEPALIVE=new Uint8Array([0x80]); let wasMoving=false;
+ function sendJog(){if(!ws||ws.readyState!==1)return;
+   const v=jogVec(),m=!!(v.lx||v.ly||v.lz);
+   ws.send(m||wasMoving?cborJog(v):KEEPALIVE);wasMoving=m;}
+ function startStream(){if(!stream&&!document.hidden)stream=setInterval(sendJog,33);}   // ~30 Hz
+ function stopStream(){if(stream){clearInterval(stream);stream=null;}}
+ function stopAll(){held.clear();clearPads();tiltStop();stopStream();sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
-   fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(!jogOn)stopAll();});
+   document.getElementById("pads").classList.toggle("off",!jogOn);
+   document.getElementById("fsjog").classList.toggle("on",jogOn);
+   fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(jogOn)startStream();else stopAll();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
    if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
  document.addEventListener("keyup",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
-   if(held.has(k)){held.delete(k);
-     if(held.size===0){clearInterval(stream);stream=null;sendJog();}else sendJog();}});
- window.addEventListener("blur",()=>{if(jogOn)stopAll();});
+   if(held.has(k)){held.delete(k);sendJog();}});
+ window.addEventListener("blur",()=>{if(jogOn){held.clear();clearPads();tiltStop();sendJog();}});
+ document.addEventListener("visibilitychange",()=>{if(document.hidden){held.clear();clearPads();
+   tiltStop();sendJog();stopStream();}else if(jogOn)startStream();});
+ // Touch jog pads (mobile): hold-to-jog buttons feeding the SAME `held` set and
+ // 30 Hz stream as the keyboard, so every fail-safe (lease, keepalive isolation,
+ // blur/hidden clearing) applies unchanged.
+ const padLabels={tool:{w:"\\u25b2 fwd",s:"\\u25bc back",a:"\\u25c0",d:"\\u25b6",q:"\\u2191 up",e:"\\u2193 down",t:"tilt"},
+   base:{w:"+Z \\u25b2",s:"\\u2212Z \\u25bc",a:"+X",d:"\\u2212X",q:"+Y",e:"\\u2212Y",t:"tilt"}};
+ function padRelabel(){const L=padLabels[document.getElementById("basef").checked?"base":"tool"];
+   document.querySelectorAll("#pads .jb").forEach(b=>b.textContent=L[b.dataset.k]);}
+ function clearPads(){document.querySelectorAll("#pads .jb.on").forEach(b=>b.classList.remove("on"));}
+ function press(k,on){if(!jogOn)return;
+   if(on&&!held.has(k)){held.add(k);sendJog();startStream();}
+   else if(!on&&held.has(k)){held.delete(k);sendJog();}}
+ document.querySelectorAll("#pads .jb").forEach(b=>{const k=b.dataset.k;
+   if(k==="t")return;                                  // tilt pad wired below
+   b.addEventListener("pointerdown",e=>{e.preventDefault();
+     try{b.setPointerCapture(e.pointerId);}catch(err){}
+     b.classList.add("on");press(k,true);});
+   const up=()=>{b.classList.remove("on");press(k,false);};
+   b.addEventListener("pointerup",up);b.addEventListener("pointercancel",up);
+   b.addEventListener("contextmenu",e=>e.preventDefault());});
+ padRelabel();
+ // Tilt-to-jog: HOLD the round center pad and tilt the phone — a dead-man
+ // control. Orientation deltas from the pose AT PRESS map to lx/ly in [-1,1]
+ // (4\\u00b0 deadzone, 25\\u00b0 full scale) and ride the same 30 Hz stream as the keys,
+ // so every fail-safe (lease, scaling, blur/hidden clearing) applies. Modern
+ // mobile browsers only deliver orientation events on HTTPS (use e.g.
+ // `tailscale serve` to front this UI); iOS additionally asks permission.
+ const tilt={x:0,y:0}; let tiltOn=false,tiltZero=null,tiltSeen=false;
+ const tiltBtn=document.getElementById("jb-t");
+ function tiltHint(m){const h=document.getElementById("joghint");
+   h.textContent=m;h.style.color="#e3b341";}
+ function tiltStop(){if(!tiltOn)return;
+   tiltOn=false;tiltZero=null;tilt.x=tilt.y=0;tiltBtn.classList.remove("on");sendJog();}
+ window.addEventListener("deviceorientation",e=>{tiltSeen=true;
+   if(!tiltOn||e.beta==null||e.gamma==null)return;
+   if(!tiltZero){tiltZero={b:e.beta,g:e.gamma};return;}  // hold pose = neutral
+   const map=d=>{const a=Math.abs(d);return a<4?0:Math.sign(d)*Math.min(1,(a-4)/21);};
+   tilt.x=map(-(e.beta-tiltZero.b));   // tilt away from you = forward (+lx)
+   tilt.y=map(-(e.gamma-tiltZero.g));  // tilt right = -ly; verify at LOW speed
+   sendJog();});
+ tiltBtn.addEventListener("pointerdown",async e=>{e.preventDefault();
+   if(!jogOn)return;
+   try{tiltBtn.setPointerCapture(e.pointerId);}catch(err){}
+   if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission){
+     try{if(await DeviceOrientationEvent.requestPermission()!=="granted")
+       return tiltHint("motion permission denied");}
+     catch(err){return tiltHint("motion permission: "+err.message);}}
+   tiltOn=true;tiltSeen=false;tiltBtn.classList.add("on");startStream();
+   setTimeout(()=>{if(tiltOn&&!tiltSeen)
+     tiltHint(window.isSecureContext?"no tilt sensor data on this device"
+       :"tilt needs HTTPS \\u2014 front the UI with `tailscale serve` and open the https:// URL");},900);});
+ tiltBtn.addEventListener("pointerup",tiltStop);
+ tiltBtn.addEventListener("pointercancel",tiltStop);
+ tiltBtn.addEventListener("contextmenu",e=>e.preventDefault());
+ // 3D twin: loaded lazily on first enable (the three.js stack is ~1.4 MB once,
+ // then browser-cached) — slider-only sessions never pay for it.
+ let twin=null;
+ document.getElementById("viewon").addEventListener("change",async e=>{
+   const d=document.getElementById("view3d");
+   for(const b of["fsbtn","wallbtn"])
+     document.getElementById(b).style.display=e.target.checked?"block":"none";
+   if(!e.target.checked)setFS(false);
+   if(e.target.checked){d.style.display="block";
+     try{if(twin)twin.resume();
+       // ?v= busts copies cached before viewer.js became no-cache.
+       else{twin=(await import("/static/viewer.js?v=2")).initTwin(d);
+         if(twin&&!wallsOn)twin.walls(false);}}
+     catch(err){d.style.height="auto";
+       d.innerHTML="<div style='padding:1rem;color:#ff7b72;font-size:.85rem'>3D view failed: "
+         +err.message+"</div>";}}
+   else{d.style.display="none";if(twin)twin.pause();}});
+ // Fullscreen 3D: the view fills the viewport, jog pads + a slim top bar
+ // (status, frame/jog toggles that proxy the real checkboxes, exit) overlay it.
+ function setFS(on){document.body.classList.toggle("fs",on);
+   if(on){const v=document.getElementById("viewon");
+     if(!v.checked){v.checked=true;v.dispatchEvent(new Event("change"));}}}
+ document.getElementById("fsbtn").addEventListener("click",()=>setFS(true));
+ document.getElementById("fsexit").addEventListener("click",()=>setFS(false));
+ // Safety-wall visibility (3D view ONLY — collision checking is unaffected).
+ let wallsOn=true;
+ function setWalls(on){wallsOn=on;
+   document.getElementById("wallbtn").classList.toggle("on",on);
+   document.getElementById("fswalls").classList.toggle("on",on);
+   if(twin&&twin.walls)twin.walls(on);}   // guard: a cache-stale twin has no walls()
+ document.getElementById("wallbtn").addEventListener("click",()=>setWalls(!wallsOn));
+ document.getElementById("fswalls").addEventListener("click",()=>setWalls(!wallsOn));
+ const fsProxy=(btn,box)=>document.getElementById(btn).addEventListener("click",()=>{
+   const c=document.getElementById(box);c.checked=!c.checked;
+   c.dispatchEvent(new Event("change"));});
+ fsProxy("fsjog","jogon");fsProxy("fsframe","basef");
+ // Tuning panel (bottom sheet): keeps the screen for the 3D view + jog pads.
+ const panel=document.getElementById("panel");
+ document.getElementById("panelbtn").addEventListener("click",()=>panel.classList.toggle("open"));
+ document.getElementById("panelclose").addEventListener("click",()=>panel.classList.remove("open"));
  wsOpen(); init();
+ // Deep links: …:8080/#3d opens with the 3D view on; #fs straight into
+ // fullscreen; #tune opens the tuning panel.
+ if(location.hash==="#3d"){const v=document.getElementById("viewon");
+   v.checked=true;v.dispatchEvent(new Event("change"));}
+ if(location.hash==="#fs")setFS(true);
+ if(location.hash==="#tune")panel.classList.add("open");
 </script>
 </body></html>
 """
@@ -450,6 +711,19 @@ def _pack(values, mode, gain, lookahead_s, t_s) -> bytes:
 
 def _clamp(lo, hi, v):
     return max(lo, min(hi, v))
+
+
+def _static_dir() -> str:
+    """Directory of the vendored web assets (three.js, urdf-loader, viewer.js):
+    the installed share dir, or the source tree when running uninstalled."""
+    try:
+        d = os.path.join(get_package_share_directory("telamoto_bringup"), "web", "static")
+        if os.path.isdir(d):
+            return d
+    except Exception:
+        pass
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir, "web", "static"))
 
 
 def _quat_mul(a, b):
@@ -520,8 +794,9 @@ def _quat_angle_deg(a, b):
 
 
 def _cbor_decode(buf, i=0):
-    """Minimal RFC 8949 decoder for the jog frame: ints and arrays (major
-    types 0, 1, 4). Returns (value, next_index)."""
+    """Minimal RFC 8949 decoder for the jog frame: ints, arrays, and floats
+    (major types 0, 1, 4, 7) — floats carry the analog tilt-jog axes.
+    Returns (value, next_index)."""
     head = buf[i]; major, minor = head >> 5, head & 0x1f; i += 1
     if minor < 24:
         val = minor
@@ -545,6 +820,10 @@ def _cbor_decode(buf, i=0):
             item, i = _cbor_decode(buf, i)
             out.append(item)
         return out, i
+    if major == 7 and minor == 26:                    # IEEE 754 single
+        return struct.unpack(">f", val.to_bytes(4, "big"))[0], i
+    if major == 7 and minor == 27:                    # IEEE 754 double
+        return struct.unpack(">d", val.to_bytes(8, "big"))[0], i
     raise ValueError(f"cbor: unsupported major type {major}")
 
 
@@ -642,6 +921,16 @@ class URServoController(Node):
         # human-in-the-loop teleop (no reference pose to snap back to).
         self._jog = [0.0] * 6
         self._jog_lease = 0.0                          # twist valid until this time
+        # Link-health estimator for the adaptive lease (see JOG_LEASE_MAX block):
+        # recent-max gap between received jog frames (peak-hold, decaying) and the
+        # lease/speed-scale derived from it. With several WS clients streaming at
+        # once the interleaved gaps look better than any single link — the same
+        # last-writer-wins ambiguity the jog command itself already has.
+        self._link_last_t = 0.0
+        self._link_big_t = 0.0
+        self._link_gap = LINK_GAP_NOMINAL
+        self._link_lease = JOG_LEASE
+        self._link_scale = 1.0
         self._jog_mode = False                         # web toggle: stay in jog mode
         self._jog_base = False                         # web toggle: jog axes in BASE
                                                        # frame (True) or TOOL (False)
@@ -710,6 +999,20 @@ class URServoController(Node):
         latched = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Float64, "/telamoto/speed_fraction", self._speed_cb, latched)
+        # 3D twin for the web UI: the browser renders the robot ITSELF (three.js +
+        # urdf-loader) from the URDF and a ~25 Hz binary joint/scene stream — a few
+        # kB/s instead of streaming pixels, so it stays smooth on the same laggy
+        # links the jog compensation targets. robot_state_publisher latches the
+        # URDF on /robot_description; scene_wall keepalives the wall as a BOX
+        # CollisionObject on /planning_scene (1 Hz).
+        self._urdf = None                  # served at /api/urdf
+        self._q_actual = None              # latest joint positions, UR_JOINT_ORDER
+        self._js_names = None              # joint-name → UR-order cache for _js_cb
+        self._js_map = None
+        self._scene_boxes = {}             # id → 10 floats: xyz quat(xyzw) size
+        self._web_static = _static_dir()
+        self.create_subscription(String, "/robot_description", self._urdf_cb, latched)
+        self.create_subscription(PlanningScene, "/planning_scene", self._scene_cb, 10)
         self._twist_pub = self.create_publisher(TwistStamped, SERVO_TWIST_TOPIC, ctrl_qos)
         # SAFETY SENTINEL: MoveIt Servo receives every jog twist and keeps evaluating
         # the kinematics, but its joint output is unused (the robot executes speedl) —
@@ -798,20 +1101,50 @@ class URServoController(Node):
 
     def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
         # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
-        # Lease model: each message renews the twist for JOG_LEASE; a zero msg
-        # (key release) stops instantly, and a stalled/closed socket lets the
-        # lease expire so the robot stops on its own.
+        # Lease model: each message renews the twist for the (link-adaptive) lease;
+        # a zero msg (key release) stops instantly, and a stalled/closed socket
+        # lets the lease expire so the robot stops on its own.
         # SERVER-side jog-mode gate: the browser also checks its toggle, but any
         # WS client can send frames — without this, jog would move the robot with
         # the sentinel feed off (no fresh Servo status). Never trust the client.
         if not self._jog_mode:
             lx = ly = lz = 0.0
-        sp = self._jog_speed
+        # Floats can arrive from the wire now (analog tilt): a NaN would slip
+        # THROUGH _clamp (NaN comparisons are false → full speed) — drop to zero.
+        if not (math.isfinite(lx) and math.isfinite(ly) and math.isfinite(lz)):
+            lx = ly = lz = 0.0
+        now = self._link_tick()
+        sp = self._jog_speed * self._link_scale
         self._jog = [sp * _clamp(-1.0, 1.0, lx),
                      sp * _clamp(-1.0, 1.0, ly),
                      sp * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
-        self._jog_lease = time.monotonic() + JOG_LEASE
+        self._jog_lease = now + self._link_lease
         self._publish_twist()                       # publish NOW, don't wait for the loop
+
+    def _link_tick(self) -> float:
+        """Feed the link-health estimator with one frame arrival (jog command or
+        idle keepalive) and refresh the adaptive lease/speed-scale — see the
+        JOG_LEASE_MAX block. Returns the current monotonic time. NEVER touches
+        the jog twist or its lease: a keepalive must not keep a stale command
+        alive. The Cartesian ramp (jog_accel) smooths any scale change mid-hold."""
+        now = time.monotonic()
+        gap = now - self._link_last_t
+        self._link_last_t = now
+        if gap < LINK_GAP_RESET:
+            decayed = self._link_gap * math.exp(-gap / LINK_GAP_TAU)
+            if gap > LINK_GAP_TOL:
+                # De-twitch: only the SECOND big gap inside LINK_BIG_WINDOW feeds
+                # the peak — an isolated spike costs at most one old-style lease
+                # expiry instead of seconds of reduced jog speed (= choppiness).
+                if now - self._link_big_t <= LINK_BIG_WINDOW:
+                    decayed = max(decayed, gap)
+                self._link_big_t = now
+            self._link_gap = max(LINK_GAP_NOMINAL, decayed)
+            excess = max(0.0, self._link_gap - LINK_GAP_TOL)
+            self._link_lease = _clamp(JOG_LEASE, JOG_LEASE_MAX,
+                                      JOG_LEASE + LINK_LEASE_FACTOR * excess)
+            self._link_scale = JOG_LEASE / self._link_lease
+        return now
 
     def _tcp_pose(self):
         """Live pose of JOG_FRAME (tool0) in BASE_FRAME: ((x,y,z), (qx,qy,qz,qw))
@@ -1043,18 +1376,62 @@ class URServoController(Node):
             protocol_version = "HTTP/1.1"              # required for the WS 101 upgrade
             def log_message(self, *_): pass
 
-            def _send(self, body, ctype="text/plain"):
-                self.send_response(200)
+            def _send(self, body, ctype="text/plain", code=200, cache=False):
+                self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                if cache:    # vendored JS + meshes are immutable per install
+                    self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):
-                if self.path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
-                    self._serve_ws()
+            # Static/mesh files for the 3D twin: /static/<file> (vendored JS,
+            # viewer) and /pkg/<package>/<path> (URDF mesh resources — URDFLoader
+            # maps package://ur_description/… here). Path-traversal guarded: the
+            # normalized relative part may not escape the root (realpath is NOT
+            # used — --symlink-install share dirs legitimately point elsewhere).
+            def _serve_file(self):
+                path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+                try:
+                    if path.startswith("/static/"):
+                        root, rel = node._web_static, path[len("/static/"):]
+                    else:                                  # /pkg/<package>/<path>
+                        _, _, pkg, rel = path.split("/", 3)
+                        root = get_package_share_directory(pkg)
+                    rel = os.path.normpath(rel)
+                    if os.path.isabs(rel) or rel.startswith(".."):
+                        raise FileNotFoundError(path)
+                    with open(os.path.join(root, rel), "rb") as f:
+                        body = f.read()
+                except Exception:
+                    self._send(b"not found", code=404)
                     return
-                if self.path.startswith("/api/state"):
+                ctype = (mimetypes.guess_type(rel)[0] or "application/octet-stream")
+                if rel.endswith(".js"):
+                    ctype = "text/javascript"          # modules need a JS MIME
+                elif rel.endswith(".dae"):
+                    ctype = "model/vnd.collada+xml"
+                # Vendored libs + meshes are immutable per install; viewer.js is
+                # OUR code and changes — a day-stale copy once made a new page
+                # call APIs the cached module didn't have yet (dead buttons).
+                self._send(body, ctype, cache=(rel != "viewer.js"))
+
+            def do_GET(self):
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    if self.path == "/ws3d":
+                        self._serve_ws(push=True)      # twin state stream (send-only)
+                    else:
+                        self._serve_ws()               # jog command stream
+                    return
+                if self.path == "/api/urdf":
+                    u = node._urdf
+                    if u is None:
+                        self._send(b"robot_description not received yet", code=503)
+                    else:
+                        self._send(u.encode(), "application/xml")
+                elif self.path.startswith(("/static/", "/pkg/")):
+                    self._serve_file()
+                elif self.path.startswith("/api/state"):
                     with node._conn_lock:
                         connected = node._conn is not None
                     sf = node._speed_fraction
@@ -1067,6 +1444,9 @@ class URServoController(Node):
                         "basef": node._jog_base,
                         "speedfrac": round(sf, 3) if sf is not None else None,
                         "qdnow": round(node._qd_now, 3), "qdpeak": round(node._qd_peak, 3),
+                        "linkgap": round(node._link_gap * 1000),
+                        "lease": round(node._link_lease * 1000),
+                        "linkscale": round(node._link_scale, 2),
                         "connected": connected}).encode(),
                         "application/json")
                 else:
@@ -1085,8 +1465,12 @@ class URServoController(Node):
                     pass
                 self._send(b"ok")
 
-            # ── WebSocket: ordered, low-overhead jog stream ────────────────────
-            def _serve_ws(self):
+            # ── WebSocket: ordered, low-overhead streams ───────────────────────
+            # /ws   — jog commands IN (CBOR), nothing out.
+            # /ws3d — twin state OUT (binary, ~25 Hz), incoming frames ignored —
+            #         keeps the viewer off the jog path AND out of the link-jitter
+            #         estimator (it never calls _apply_jog).
+            def _serve_ws(self, push=False):
                 self.close_connection = True               # this socket is now a WS
                 key = self.headers.get("Sec-WebSocket-Key", "")
                 accept = base64.b64encode(
@@ -1096,20 +1480,48 @@ class URServoController(Node):
                 self.send_header("Connection", "Upgrade")
                 self.send_header("Sec-WebSocket-Accept", accept)
                 self.end_headers()
+                stop = threading.Event()
+                if push:
+                    threading.Thread(target=self._ws_push, args=(stop,),
+                                     daemon=True, name="ri-ws3d").start()
                 try:
                     while True:
                         op, data = self._ws_read()
                         if op is None or op == 0x8:        # closed
                             break
-                        if op == 0x2:                      # binary frame = CBOR jog cmd
+                        if op == 0x2 and not push:         # binary frame = CBOR jog cmd
                             try:
                                 v, _ = _cbor_decode(data)
-                                node._apply_jog(float(v[0]), float(v[1]), float(v[2]))
+                                if len(v) >= 3:            # jog command (incl. stop zero)
+                                    node._apply_jog(float(v[0]), float(v[1]), float(v[2]))
+                                else:                      # empty array = idle KEEPALIVE:
+                                    node._link_tick()      # estimator only — never the
+                                                           # twist or its lease, so an
+                                                           # idle tab can't fight the
+                                                           # active tab's jog command
                             except (ValueError, IndexError, TypeError):
                                 pass
                 except Exception:
                     pass
-                node._apply_jog(0.0, 0.0, 0.0)             # stop on disconnect
+                stop.set()
+                if not push:
+                    node._apply_jog(0.0, 0.0, 0.0)         # stop on disconnect
+
+            def _ws_push(self, stop):
+                # Single writer per connection: the read loop never writes after
+                # the 101, so unlocked sequential writes are safe. Frames are
+                # server→client, hence unmasked (RFC 6455).
+                try:
+                    while not stop.is_set():
+                        payload = node._twin_frame()
+                        if payload is not None:
+                            n = len(payload)
+                            hdr = (bytes([0x82, n]) if n < 126
+                                   else bytes([0x82, 126]) + struct.pack(">H", n))
+                            self.wfile.write(hdr + payload)
+                        stop.wait(0.04)                    # ~25 Hz
+                except Exception:
+                    pass                                   # client gone → read loop ends too
 
             def _ws_read(self):
                 rd = self.rfile
@@ -1136,10 +1548,52 @@ class URServoController(Node):
     # ── Joint states: only gate startup (the robot holds its own pose via speedj
     #    when idle, so we don't track positions here) ──────────────────────────────
 
+    def _urdf_cb(self, msg: String) -> None:
+        if self._urdf is None:
+            self.get_logger().info(f"[web] robot_description received ({len(msg.data)} B)")
+        self._urdf = msg.data
+
+    def _scene_cb(self, msg: PlanningScene) -> None:
+        # Track world BOX collision objects (the draggable test wall) for the 3D
+        # twin. scene_wall replace-ADDs at 1 Hz, so a (re)started viewer converges.
+        for obj in msg.world.collision_objects:
+            if obj.operation == CollisionObject.REMOVE:
+                self._scene_boxes.pop(obj.id, None)
+            elif (obj.primitives and obj.primitive_poses
+                  and obj.primitives[0].type == SolidPrimitive.BOX):
+                p, dims = obj.primitive_poses[0], obj.primitives[0].dimensions
+                self._scene_boxes[obj.id] = (
+                    p.position.x, p.position.y, p.position.z,
+                    p.orientation.x, p.orientation.y, p.orientation.z,
+                    p.orientation.w, dims[0], dims[1], dims[2])
+
+    def _twin_frame(self) -> bytes | None:
+        """Binary 3D-twin state for the /ws3d push: 0x01, 6×f32 joint positions
+        (UR_JOINT_ORDER), box count, then 10×f32 per box (xyz quat-xyzw size).
+        Little-endian. None until the first joint state."""
+        q = self._q_actual
+        if q is None:
+            return None
+        boxes = list(self._scene_boxes.values())[:8]
+        return (struct.pack("<B6fB", 1, *q, len(boxes))
+                + b"".join(struct.pack("<10f", *b) for b in boxes))
+
     def _js_cb(self, msg: JointState) -> None:
         if not self._js_ready.is_set():
             self._js_ready.set()
             self.get_logger().info("[ctrl] first joint states received")
+        # Latest positions in UR order for the 3D twin (name→index map cached;
+        # names are stable per publisher).
+        if msg.position and msg.name:
+            names = list(msg.name)
+            if names != self._js_names:
+                self._js_names = names
+                try:
+                    self._js_map = [names.index(j) for j in UR_JOINT_ORDER]
+                except ValueError:
+                    self._js_map = None        # not a UR joint-state message
+            if self._js_map is not None and len(msg.position) >= 6:
+                self._q_actual = [msg.position[i] for i in self._js_map]
         # Kept subscribed (no longer self-destructs): track the actual measured
         # joint speed for the web readout. msg.velocity is RTDE actual_qd.
         if msg.velocity:

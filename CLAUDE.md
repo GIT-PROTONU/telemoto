@@ -34,10 +34,42 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
 - **Web tuning UI** on `http://<pc>:8080` — live sliders (speed/stiffness/jog
   speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision &
   wall distance — pushed to `/servo_node` params), Base/Tool frame toggle, WASD
-  jog over a WebSocket (CBOR frames).
-- **Collision testing**: `scene_wall.py` (launched by both bringups) puts a draggable
-  wall in the planning scene — move it via its RViz interactive marker
-  (namespace `/scene_wall`). Planned moves avoid it; the jog is gated by Servo's
+  jog over a WebSocket (CBOR frames), and an **embedded 3D twin** (three.js +
+  urdf-loader vendored in `web/static/`, lazy-loaded; deep link `/#3d`).
+  **Mobile-first layout**: big 3D view up top, **touch jog pads** (hold-to-jog
+  buttons feeding the same `held` set + 30 Hz stream as the keyboard, so every
+  jog fail-safe applies unchanged; labels follow the Base/Tool toggle), and all
+  sliders live in a bottom-sheet **tuning panel** (floating ⚙ button; deep link
+  `/#tune`). Twin: URDF from latched `/robot_description` via `/api/urdf`, meshes via
+  `/pkg/<package>/<path>` (traversal-guarded), robot + planning-scene walls + TCP
+  trail driven by a ~25 Hz binary stream on `/ws3d` (send-only — never touches
+  the jog path or the link-jitter estimator); boxes with a side >1.5 m render
+  extra-faint (the camera looks at the robot through the cage). **Fullscreen
+  mode** (⛶ on the view / deep link `/#fs`): CSS-fixed (iPhone Safari has no
+  element-fullscreen API), pads + a top bar (status, frame/jog toggles, exit)
+  overlay the view. **Tilt-to-jog**: HOLD the round center pad and tilt the
+  phone — dead-man control; orientation deltas from the hold pose (4° deadzone,
+  25° full scale) become analog lx/ly (CBOR float32 in the same jog frames —
+  the server clamps and rejects non-finite). Browsers only deliver orientation
+  events on HTTPS (front the UI with `tailscale serve`); iOS also asks
+  permission. E2E (incl. headless-Chromium render):
+  `pixi run python src/telamoto_bringup/test/test_twin_e2e.py`.
+- **Collision cage**: `scene_wall.py` (launched by both bringups) puts six movable
+  walls in the planning scene (`wall_front/back/left/right/top/floor`; defaults
+  x ±0.8, y ±0.8, top 1.6, floor −0.03 m) — drag each along its normal via its
+  RViz interactive marker (namespace `/scene_wall`). ⚠ The **floor** is published
+  only after the node fetches move_group's ACM (`/get_planning_scene`) and extends
+  it: floor↔{base_link, base_link_inertia, shoulder_link} allowed — those links
+  are permanently near z=0 and would otherwise pin Servo's collision monitor at
+  contact (jog bricked). The extended ACM rides every 1 Hz keepalive (PSM ACM
+  semantics = replace-on-non-empty; never publish a partial ACM). With the full
+  cage keep the wall-distance slider ≤ ~10 cm or jog is permanently slowed.
+  **Dragged poses persist** across restarts/reboots: saved on mouse-up to
+  `~/.ros/telamoto_cage_poses.yaml` (`pose_file` param; delete it for defaults).
+  The web 3D view has a "walls" button to hide the cage RENDERING only —
+  collision checking is unaffected.
+  Cage E2E: `pixi run python src/telamoto_bringup/test/test_cage_e2e.py`.
+  Planned moves avoid the walls; the jog is gated by Servo's
   collision monitor (`check_collisions` in `ur_servo.yaml`): decelerate inside the
   proximity threshold, halt at contact (self-collision too, via the SRDF ACM).
   **Collision-halt escape**: the halt is direction-blind (Servo scores state, not
@@ -51,6 +83,23 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   server-side when jog mode is off; jog is hard-blocked whenever Servo's status is
   >0.5 s stale (servo_node dead/not armed = no sentinel = no motion); web/param
   tunables reject non-finite values; jog twist leases expire in 0.1 s.
+- **Laggy-link compensation** (remote/VPN jogging): the browser streams at a fixed
+  30 Hz whenever jog mode is on — real `[lx,ly,lz]` frames while moving (+ one zero
+  on stop), **1-byte CBOR empty-array KEEPALIVES while idle** (paused when the tab
+  is hidden). Keepalives feed ONLY the link-jitter estimator — never the twist or
+  its lease — so an idle second tab can't fight the active tab's jog (was: 30 Hz
+  zero-flapping = choppy motion). The server peak-holds the frame-arrival gap and
+  stretches the lease (floor 0.1 s, ceiling 0.4 s, only the excess over a 50 ms
+  jitter tolerance counts; **de-twitch: an isolated big gap is ignored — only a
+  2nd big gap within 2 s feeds the peak**, so a single browser GC pause can't
+  modulate jog speed) while scaling jog speed down by the same factor — invariant:
+  `scaled_speed × lease = jog_speed × 0.1 s`, so worst-case blind travel never
+  exceeds the LAN case. Link stats (RTT/gap/lease/scale) live in the web UI.
+  E2E test (real node + real WS, no robot needed; isolated ROS domain + ports,
+  safe to run beside a live bringup):
+  `pixi run python src/telamoto_bringup/test/test_jog_lag_e2e.py` — verifies
+  sub-ms start/stop latency, LAN scale ×1.00, invariant, spike de-twitch,
+  keepalive isolation, recovery.
 - ⚠ **Launch gotcha**: never wrap `ur_moveit.launch.py` in a `TimerAction` —
   TimerAction push/pops launch configurations, and that file starts move_group from
   an `OnProcessExit` handler that fires after the pop → "launch configuration

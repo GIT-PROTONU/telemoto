@@ -228,7 +228,12 @@ JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider
 # distance the jog gate drops to ×0.25 (DECELERATE_FOR_COLLISION), at contact ×0
 # (HALT_FOR_COLLISION). Pushed live to /servo_node's parameters — the controller
 # owns the UI value, servo owns the check.
-SELF_COLL_MIN,  SELF_COLL_MAX,  SELF_COLL_DEF  = 0.01, 0.5, 0.30
+# ⚠ self default must stay < ~0.015: the UR10's forearm↔wrist_2 surfaces sit
+# 1.5–2 cm apart at EVERY pose (measured via test_selfcoll_e2e.py / servo's
+# collision monitor), so a bigger threshold = Servo permanently in
+# DECELERATE_FOR_COLLISION = jog stuck at ×0.25 with a constant warn banner
+# (the old 0.30 default did exactly that — the jog never ran at full speed).
+SELF_COLL_MIN,  SELF_COLL_MAX,  SELF_COLL_DEF  = 0.01, 0.5, 0.01
 SCENE_COLL_MIN, SCENE_COLL_MAX, SCENE_COLL_DEF = 0.01, 1.0, 0.50
 # Collision-halt ESCAPE: Servo's collision scale is computed from the robot's
 # ACTUAL state vs the scene (not from the command), so once the model touches a
@@ -355,7 +360,7 @@ textmsg("telamoto: external control stopped")
 
 _WEB_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Telamoto motion tuning</title>
 <style>
  body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:auto;
@@ -395,22 +400,44 @@ _WEB_PAGE = """<!doctype html>
  #fsbtn{right:.5rem}
  #wallbtn{right:3.3rem;font-size:.85rem;padding:.55rem .7rem}
  #wallbtn.on{background:#2d5a8ecc;border-color:#4ea1ff}
- #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;gap:.5rem;
-  padding:.6rem;align-items:center}
- #fsbar button{margin:0;background:#1c2733cc;border:1px solid #38506a;color:#cfe3ff;
-  border-radius:.6rem;padding:.55rem .9rem}
- #fsbar button.on{background:#2d5a8ecc;border-color:#4ea1ff}
- #fsstat{margin-right:auto;font-size:.8rem;padding:.3rem .6rem;border-radius:.4rem}
+ /* Fullscreen top bar: one glassy strip — status dot, compact equal buttons,
+    a jog-speed row, and (when active) the collision chip. */
+ #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;
+  gap:.45rem;row-gap:.4rem;flex-wrap:wrap;align-items:center;
+  padding:calc(.55rem + env(safe-area-inset-top)) .65rem .55rem;
+  background:#0e131adb;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid #ffffff14}
+ #fsbar button{flex:1 1 0;max-width:6.5rem;margin:0;padding:.55rem 0;text-align:center;
+  background:#1c2733;border:1px solid #38506a;color:#cfe3ff;
+  border-radius:.55rem;font-size:.85rem;white-space:nowrap}
+ #fsbar button.on{background:#2d5a8e;border-color:#4ea1ff}
+ #fsexit{flex:0 0 auto!important;width:2.6rem}
+ #fsstat{flex:0 0 auto;font-size:.8rem;white-space:nowrap;background:none!important;
+  padding:0 .2rem 0 0}
+ #fsstat.ok{color:#6ee787}#fsstat.bad{color:#ff7b72}
+ #fsping{flex:0 0 auto;font-size:.72rem;color:#9ab;white-space:nowrap;
+  font-variant-numeric:tabular-nums;padding-right:.1rem}
+ #fsspeed{flex-basis:100%;display:flex;align-items:center;gap:.6rem;
+  font-size:.75rem;color:#9ab}
+ #fsspeed input{flex:1;height:1.7rem;margin:0;width:auto}
+ #fsspeed .val{min-width:4.2rem;text-align:right}
+ #fsjoghint{display:none}
+ body.fs #fsjoghint.show{display:block;position:fixed;left:50%;transform:translateX(-50%);
+  bottom:calc(15rem + env(safe-area-inset-bottom));z-index:26;background:#000a;
+  color:#e3b341;padding:.5rem 1rem;border-radius:.6rem;font-size:.85rem;
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);white-space:nowrap}
  body.fs{overflow:hidden}
  body.fs #view3d{position:fixed;inset:0;z-index:25;height:100%;border-radius:0}
  body.fs #fsbar{display:flex}
- body.fs #fsbtn,body.fs #wallbtn{display:none!important}
+ body.fs #fsbtn,body.fs #wallbtn,body.fs #panelbtn{display:none!important}
  body.fs #pads{position:fixed;left:0;right:0;bottom:0;z-index:27;margin:0;
   justify-content:space-between;
-  padding:0 1.1rem calc(1.1rem + env(safe-area-inset-bottom));pointer-events:none}
- body.fs #pads .jb{pointer-events:auto;background:#1c2733cc}
+  padding:0 max(1rem,env(safe-area-inset-left)) calc(1rem + env(safe-area-inset-bottom))
+   max(1rem,env(safe-area-inset-right));pointer-events:none}
+ body.fs #pads .jb{pointer-events:auto;background:#1c2733e8;
+  width:clamp(58px,16vw,76px);height:clamp(58px,16vw,76px);font-size:1rem}
  body.fs #pads.off .jb{pointer-events:none}
- body.fs #jb-t{background:#26203acc}
+ body.fs #jb-t{background:#26203ae8}
  body.fs #panel{z-index:28}
  /* Tuning panel: bottom sheet toggled by the floating button — keeps every
     slider one tap away while the 3D view + jog pads own the screen. */
@@ -431,9 +458,8 @@ _WEB_PAGE = """<!doctype html>
  #collAlert.warn{display:block;background:#3d3000;border:1px solid #e3b341;color:#e3b341}
  #collAlert.halt{display:block;background:#3d1414;border:1px solid #ff7b72;color:#ff7b72}
  body.fs #collAlert{display:none!important}
- #fsbar{flex-wrap:wrap}
  #fsCollAlert{display:none;flex-basis:100%;font-size:.78rem;line-height:1.5;
-  padding:.3rem .7rem;border-top:1px solid transparent}
+  padding:.35rem .65rem;border-radius:.45rem;border:1px solid transparent}
  #fsCollAlert.warn{display:block;background:#3d3000;border-color:#e3b341;color:#e3b341}
  #fsCollAlert.halt{display:block;background:#3d1414;border-color:#ff7b72;color:#ff7b72}
 </style></head>
@@ -452,12 +478,17 @@ _WEB_PAGE = """<!doctype html>
    </div>
    <div class="hint">Live twin (drag = orbit, wheel/pinch = zoom). Robot +
      planning-scene walls + TCP trail; a few kB/s.</div></div>
- <div id="fsbar"><span id="fsstat" class="bad">&hellip;</span>
+ <div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
    <button id="fswalls">walls</button>
-   <button id="fsframe">base frame</button>
+   <button id="fsframe">tool</button>
    <button id="fsjog">jog</button>
+   <button id="fstune">&#9881;</button>
    <button id="fsexit">&#10005;</button>
+   <div id="fsspeed"><span>jog speed</span>
+     <input type="range" id="fsjspeed" min="0.005" max="0.5" step="0.005">
+     <span class="val" id="fsjspeedv"></span></div>
    <div id="fsCollAlert"></div></div>
+ <div id="fsjoghint" class="show">jog disabled &mdash; tap <b>jog</b> to enable</div>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
    <label>Jog <span>
      <input type="checkbox" id="basef"> base frame &nbsp;
@@ -525,9 +556,16 @@ _WEB_PAGE = """<!doctype html>
    okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1),
    selfd:v=>Math.round(+v*100)+" cm",walld:v=>Math.round(+v*100)+" cm"};
  const ids=["speed","gain","lookahead","jspeed","jaccel","okp","pkp","selfd","walld"];
- function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
+ function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);
+   if(k==="jspeed")syncFsSpeed();}
  function send(k){const v=document.getElementById(k).value;
-   document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
+   document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});
+   if(k==="jspeed")syncFsSpeed();}
+ // Fullscreen jog-speed slider: a proxy for #jspeed (same /api/set path) so speed
+ // is visible + adjustable without leaving fullscreen.
+ function syncFsSpeed(){const v=document.getElementById("jspeed").value;
+   document.getElementById("fsjspeed").value=v;
+   document.getElementById("fsjspeedv").textContent=fmt.jspeed(v);}
  async function refreshStatus(){try{const t0=performance.now();
    const s=await(await fetch("/api/state")).json();
    const rtt=Math.round(performance.now()-t0);
@@ -535,7 +573,7 @@ _WEB_PAGE = """<!doctype html>
    st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
    st.className=s.connected?"ok":"bad";
    const fst=document.getElementById("fsstat");
-   fst.textContent=s.connected?"connected":"not connected";fst.className=st.className;
+   fst.textContent=s.connected?"\\u25CF":"\\u25CF press Play";fst.className=st.className;
    document.getElementById("pendant").textContent="pendant speed slider: "
      +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");
    const qd=document.getElementById("qd");
@@ -548,6 +586,12 @@ _WEB_PAGE = """<!doctype html>
    lk.textContent="link: rtt "+rtt+" ms \\u00b7 frame gap "+s.linkgap+" ms \\u00b7 lease "
      +s.lease+" ms \\u00b7 jog speed \\u00d7"+s.linkscale.toFixed(2);
    lk.style.color=s.linkscale>0.99?"#888":(s.linkscale>0.3?"#e3b341":"#ff7b72");
+   // Fullscreen ping: browser-measured rtt; appends the auto-slow factor when
+   // the link estimator has scaled the jog down.
+   const fp=document.getElementById("fsping");
+   fp.textContent=rtt+" ms"+(s.linkscale>0.99?"":" \\u00d7"+s.linkscale.toFixed(2));
+   fp.style.color=(rtt>250||s.linkscale<=0.3)?"#ff7b72"
+     :(rtt>100||s.linkscale<=0.99)?"#e3b341":"#9ab";
    // Collision alert — updated in both normal and fullscreen elements.
    setCollAlert(s);}catch(e){}}
  // escInfo: base-frame key + pad label (base-frame pad) for each approach axis.
@@ -575,7 +619,7 @@ _WEB_PAGE = """<!doctype html>
  function setCollAlert(s){
    let msg="",cls="",escKey=null;
    if(s.collBlocked&&s.collAxis){
-     const wall=fmtWall(s.collWall)||"a wall";
+     const wall=fmtWall(s.collWall)||"collision";   // no wall that way = e.g. self-collision
      const dir=axLabel[s.collAxis]||s.collAxis;
      const baseMode=document.getElementById("basef").checked;
      const h=escHint(s.collAxis);
@@ -587,10 +631,15 @@ _WEB_PAGE = """<!doctype html>
      msg="\\u26D4 collision"+(near?" &mdash; nearest: "+near:"")
        +(isMobile?" &mdash; jog any direction to back out":" &mdash; jog any direction, or move wall in RViz");
      cls="halt";}
-   else if(held.size>0&&s.servoGate!=null&&s.servoGate<1.0&&s.nearWall){
-     msg="\\u26A0 approaching "+fmtWall(s.nearWall)+" &mdash; \\u00d7"+s.servoGate.toFixed(2);cls="warn";}
-   else if(held.size>0&&s.servoGate!=null&&s.servoGate<1.0){
-     msg="\\u26A0 jog slowed (singularity or joint limit)";cls="warn";}
+   else if((held.size>0||wasMoving)&&s.servoGate!=null&&s.servoGate<1.0){
+     // wasMoving covers tilt jog (analog, not in `held`). servoCode picks the
+     // honest reason: 4=collision decel (scene OR self), 1/3=singularity, 6=bound.
+     cls="warn";
+     if(s.servoCode===4)
+       msg="\\u26A0 collision slow-down"+(s.nearWall?" \\u2014 near "+fmtWall(s.nearWall):"")
+         +" \\u00d7"+s.servoGate.toFixed(2);
+     else if(s.servoCode===6)msg="\\u26A0 jog slowed \\u2014 joint limit";
+     else msg="\\u26A0 jog slowed \\u2014 near singularity";}
    setPadBlock(escKey);
    for(const id of["collAlert","fsCollAlert"]){
      const el=document.getElementById(id);
@@ -600,11 +649,12 @@ _WEB_PAGE = """<!doctype html>
    base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z (robot BASE frame). Hold to move, release to stop."};
  function showHint(){const b=document.getElementById("basef").checked;
    document.getElementById("joghint").innerHTML=hints[b?"base":"tool"];
-   document.getElementById("fsframe").classList.toggle("on",b);}
+   const fb=document.getElementById("fsframe");
+   fb.classList.toggle("on",b);fb.textContent=b?"base":"tool";}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));
    document.getElementById("basef").checked=!!s.basef;
    if(s.jogon){const jc=document.getElementById("jogon");jc.checked=true;jc.dispatchEvent(new Event("change"));}}catch(e){}
-   showHint();padRelabel();
+   showHint();padRelabel();syncFsSpeed();
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
    document.getElementById("basef").addEventListener("change",e=>{showHint();padRelabel();
      fetch("/api/jogframe?base="+(e.target.checked?1:0),{method:"POST"});});
@@ -648,6 +698,7 @@ _WEB_PAGE = """<!doctype html>
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
    document.getElementById("pads").classList.toggle("off",!jogOn);
    document.getElementById("fsjog").classList.toggle("on",jogOn);
+   document.getElementById("fsjoghint").classList.toggle("show",!jogOn);
    fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(jogOn)startStream();else stopAll();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
    if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
@@ -748,7 +799,10 @@ _WEB_PAGE = """<!doctype html>
  // Tuning panel (bottom sheet): keeps the screen for the 3D view + jog pads.
  const panel=document.getElementById("panel");
  document.getElementById("panelbtn").addEventListener("click",()=>panel.classList.toggle("open"));
+ document.getElementById("fstune").addEventListener("click",()=>panel.classList.toggle("open"));
  document.getElementById("panelclose").addEventListener("click",()=>panel.classList.remove("open"));
+ document.getElementById("fsjspeed").addEventListener("input",e=>{
+   document.getElementById("jspeed").value=e.target.value;send("jspeed");});
  wsOpen(); init();
  // Deep links: …:8080/#3d opens with the 3D view on; #fs straight into
  // fullscreen; #tune opens the tuning panel.
@@ -1500,7 +1554,11 @@ class URServoController(Node):
                     with node._conn_lock:
                         connected = node._conn is not None
                     sf = node._speed_fraction
-                    near_wall = node._nearest_cage_wall()
+                    # Name a wall only when it's actually inside the scene
+                    # threshold — otherwise a collision decel is more likely a
+                    # SELF-collision and must not claim "near front wall".
+                    nw = node._nearest_cage_wall()
+                    near_wall = nw[0] if nw and nw[1] <= node._scene_coll else None
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
@@ -1516,6 +1574,7 @@ class URServoController(Node):
                         "connected": connected,
                         "jogon": node._jog_mode,
                         "servoGate": round(node._servo_gate, 2),
+                        "servoCode": int(node._servo_code),
                         "collBlocked": node._servo_code == ServoStatus.HALT_FOR_COLLISION,
                         "collWall": node._coll_near_wall,
                         "collAxis": node._approach_axis(),
@@ -1702,20 +1761,36 @@ class URServoController(Node):
     def _speed_cb(self, msg: Float64) -> None:
         self._speed_fraction = msg.data            # pendant speed slider, display only
 
-    def _nearest_cage_wall(self) -> str | None:
-        """Return the id of the closest cage-wall box to the current TCP, or None."""
+    def _nearest_cage_wall(self, direction=None):
+        """(id, surface_distance_m) of the cage wall closest to the TCP, or None.
+        Distance to box centers is useless for the cage's huge slabs (the front
+        wall's center can be "nearest" from almost anywhere → every banner said
+        front wall). With `direction` (unit vector, base frame) only walls that
+        lie roughly that way from the TCP count — used at a collision halt to
+        name the wall the jog was actually moving toward."""
         pose = self._tcp_pose()
         if not pose or not self._scene_boxes:
             return None
-        tx, ty, tz = pose[0]
+        px, py, pz = pose[0]
         best, best_d = None, float("inf")
         for wid, box in self._scene_boxes.items():
             if not wid.startswith("wall_"):
                 continue
-            d = math.sqrt((tx - box[0]) ** 2 + (ty - box[1]) ** 2 + (tz - box[2]) ** 2)
+            bx, by, bz, qx, qy, qz, qw, sx, sy, sz = box
+            # TCP in the box frame → closest point on the box → offset back in base.
+            lx, ly, lz = _quat_rotate((-qx, -qy, -qz, qw), (px - bx, py - by, pz - bz))
+            ox, oy, oz = _quat_rotate((qx, qy, qz, qw),
+                                      (_clamp(-sx / 2, sx / 2, lx) - lx,
+                                       _clamp(-sy / 2, sy / 2, ly) - ly,
+                                       _clamp(-sz / 2, sz / 2, lz) - lz))
+            d = math.sqrt(ox * ox + oy * oy + oz * oz)
+            if direction is not None and d > 1e-9:
+                dot = (ox * direction[0] + oy * direction[1] + oz * direction[2]) / d
+                if dot < 0.5:                  # not the way the jog was moving
+                    continue
             if d < best_d:
                 best_d, best = d, wid
-        return best
+        return (best, best_d) if best is not None else None
 
     def _approach_axis(self) -> str | None:
         """Dominant base-frame axis of the captured collision-approach direction."""
@@ -1756,7 +1831,13 @@ class URServoController(Node):
                 mag = math.sqrt(lx * lx + ly * ly + lz * lz)
                 if mag > 1e-6:
                     self._coll_block_dir = (lx / mag, ly / mag, lz / mag)
-                    self._coll_near_wall = self._nearest_cage_wall()
+                    # Name the wall the jog was moving TOWARD — but only if it is
+                    # plausibly close (a self-collision halt must not get blamed
+                    # on some distant wall that happens to lie ahead).
+                    hit = self._nearest_cage_wall(self._coll_block_dir)
+                    self._coll_near_wall = (
+                        hit[0] if hit and hit[1] <= max(0.3, self._scene_coll)
+                        else None)
                     self.get_logger().warn(
                         "[jog] collision halt — approach dir captured, jog the "
                         "OPPOSITE way to back out (×%.2f crawl)" % COLL_ESCAPE_GATE)

@@ -65,5 +65,9 @@ status_topic: ~/status
 # (SELF_COLL_DEF / SCENE_COLL_DEF in ur_servo_controller.py).
 check_collisions: true
 collision_check_rate: 50.0
-self_collision_proximity_threshold: 0.30
+# ⚠ self threshold must stay < ~0.015: the UR10 forearm↔wrist_2 surfaces are
+# 1.5–2 cm apart at every pose — bigger values pin Servo in
+# DECELERATE_FOR_COLLISION (jog permanently ×0.25). Measured by
+# test_selfcoll_e2e.py. Keep in sync with SELF_COLL_DEF in ur_servo_controller.py.
+self_collision_proximity_threshold: 0.01
 scene_collision_proximity_threshold: 0.50

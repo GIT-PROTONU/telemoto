@@ -113,7 +113,7 @@ QD_ALLOW_BASE  = 0.3        # rad/s allowed at zero commanded speed
 QD_ALLOW_SLOPE = 2.5        # rad/s additional per m/s of commanded TCP speed
 QD_GATE_DOWN   = 0.20       # max gate decrease per 125 Hz cycle (~40 ms to full stop)
 QD_GATE_UP     = 0.02       # max gate increase per cycle (~0.4 s to full recovery)
-JOG_SPEED_DEF = 0.05       # m/s at full axis (default; low for fine work)
+JOG_SPEED_DEF = 0.5        # m/s at full axis (default)
 JOG_ACCEL_DEF = 1.0        # m/s^2 — CARTESIAN start/stop ramp rate (default; gentle).
                            # Ramps the TWIST magnitude (direction-preserving), never
                            # the per-joint velocity — a per-joint slew distorts the
@@ -381,6 +381,7 @@ _WEB_PAGE = """<!doctype html>
  #jb-q{grid-area:q}#jb-a{grid-area:a}#jb-d{grid-area:d}#jb-e{grid-area:e}
  #jb-t{grid-area:t;border-radius:50%;background:#26203a;border-color:#7a5cff;color:#cdbfff}
  #pads.off .jb{opacity:.35;pointer-events:none}
+ .jb:disabled{opacity:.15;pointer-events:none}
  /* Big 3D view (mobile-first): most of the viewport, capped on desktop. */
  #view3d{width:100%;height:min(56vh,560px);height:min(56dvh,560px);
   background:#181818;border-radius:.5rem;display:none;overflow:hidden}
@@ -425,26 +426,38 @@ _WEB_PAGE = """<!doctype html>
   justify-content:space-between;align-items:center;padding:.8rem 0 .4rem}
  #panelhdr button{margin:0;padding:.35rem .8rem}
  #panel .row{margin:1.1rem 0}
+ #collAlert{display:none;border-radius:.4rem;padding:.5rem .8rem;margin-top:.4rem;
+  font-size:.83rem;line-height:1.5}
+ #collAlert.warn{display:block;background:#3d3000;border:1px solid #e3b341;color:#e3b341}
+ #collAlert.halt{display:block;background:#3d1414;border:1px solid #ff7b72;color:#ff7b72}
+ body.fs #collAlert{display:none!important}
+ #fsbar{flex-wrap:wrap}
+ #fsCollAlert{display:none;flex-basis:100%;font-size:.78rem;line-height:1.5;
+  padding:.3rem .7rem;border-top:1px solid transparent}
+ #fsCollAlert.warn{display:block;background:#3d3000;border-color:#e3b341;color:#e3b341}
+ #fsCollAlert.halt{display:block;background:#3d1414;border-color:#ff7b72;color:#ff7b72}
 </style></head>
 <body>
  <h1>Telamoto &mdash; motion tuning</h1>
  <div id="status" class="bad">connecting&hellip;</div>
+ <div id="collAlert"></div>
  <div id="pendant" class="hint">pendant speed slider: &mdash;</div>
  <div id="qd" class="hint">joint speed: &mdash; &nbsp;|&nbsp; 1.5s peak: &mdash; rad/s</div>
  <div id="link" class="hint">link: &mdash;</div>
  <div class="row"><label>3D view <span><input type="checkbox" id="viewon"> show</span></label>
    <div id="viewwrap">
      <button id="fsbtn" title="fullscreen">&#x26F6;</button>
-     <button id="wallbtn" class="on" title="show/hide the safety walls (view only)">walls</button>
+     <button id="wallbtn" title="show/hide the safety walls (view only)">walls</button>
      <div id="view3d"></div>
    </div>
    <div class="hint">Live twin (drag = orbit, wheel/pinch = zoom). Robot +
      planning-scene walls + TCP trail; a few kB/s.</div></div>
  <div id="fsbar"><span id="fsstat" class="bad">&hellip;</span>
-   <button id="fswalls" class="on">walls</button>
+   <button id="fswalls">walls</button>
    <button id="fsframe">base frame</button>
    <button id="fsjog">jog</button>
-   <button id="fsexit">&#10005;</button></div>
+   <button id="fsexit">&#10005;</button>
+   <div id="fsCollAlert"></div></div>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
    <label>Jog <span>
      <input type="checkbox" id="basef"> base frame &nbsp;
@@ -534,15 +547,64 @@ _WEB_PAGE = """<!doctype html>
    const lk=document.getElementById("link");
    lk.textContent="link: rtt "+rtt+" ms \\u00b7 frame gap "+s.linkgap+" ms \\u00b7 lease "
      +s.lease+" ms \\u00b7 jog speed \\u00d7"+s.linkscale.toFixed(2);
-   lk.style.color=s.linkscale>0.99?"#888":(s.linkscale>0.3?"#e3b341":"#ff7b72");}catch(e){}}
+   lk.style.color=s.linkscale>0.99?"#888":(s.linkscale>0.3?"#e3b341":"#ff7b72");
+   // Collision alert — updated in both normal and fullscreen elements.
+   setCollAlert(s);}catch(e){}}
+ // escInfo: base-frame key + pad label (base-frame pad) for each approach axis.
+ const escInfo={
+   "+X":{key:"D",pad:"\\u2212X"},"-X":{key:"A",pad:"+X"},
+   "+Y":{key:"E",pad:"\\u2212Y"},"-Y":{key:"Q",pad:"+Y"},
+   "+Z":{key:"S",pad:"\\u2212Z"},"-Z":{key:"W",pad:"+Z"}};
+ const axLabel={"+X":"front","-X":"back","+Y":"left","-Y":"right","+Z":"up","-Z":"down"};
+ const fmtWall=w=>w?w.replace("wall_","").replace("_"," ")+" wall":null;
+ const isMobile=window.matchMedia("(pointer:coarse)").matches;
+ function escHint(axis){
+   const info=escInfo[axis];if(!info)return null;
+   return isMobile?"tap <b>"+info.pad+"</b>":"press <b>"+info.key+"</b>";}
+ // Disable all pad buttons except escKey (lowercase); re-enable all when escKey=null.
+ // Also evicts any blocked key from `held` so a held-button mid-halt stops instantly.
+ function setPadBlock(escKey){
+   let changed=false;
+   document.querySelectorAll("#pads .jb").forEach(b=>{
+     if(b.dataset.k==="t"){b.disabled=false;return;}
+     const block=!!(escKey&&b.dataset.k!==escKey);
+     b.disabled=block;
+     if(block&&held.has(b.dataset.k)){held.delete(b.dataset.k);changed=true;}
+   });
+   if(changed)sendJog();}
+ function setCollAlert(s){
+   let msg="",cls="",escKey=null;
+   if(s.collBlocked&&s.collAxis){
+     const wall=fmtWall(s.collWall)||"a wall";
+     const dir=axLabel[s.collAxis]||s.collAxis;
+     const baseMode=document.getElementById("basef").checked;
+     const h=escHint(s.collAxis);
+     const hint=h?(baseMode?h+" to back out":"switch to <b>Base frame</b> and "+h+" to back out"):null;
+     msg="\\u26D4 "+wall+" ("+dir+")"+(hint?" &mdash; "+hint:"");cls="halt";
+     escKey=(escInfo[s.collAxis]||{}).key?.toLowerCase()??null;}
+   else if(s.collBlocked){
+     const near=fmtWall(s.nearWall);
+     msg="\\u26D4 collision"+(near?" &mdash; nearest: "+near:"")
+       +(isMobile?" &mdash; jog any direction to back out":" &mdash; jog any direction, or move wall in RViz");
+     cls="halt";}
+   else if(held.size>0&&s.servoGate!=null&&s.servoGate<1.0&&s.nearWall){
+     msg="\\u26A0 approaching "+fmtWall(s.nearWall)+" &mdash; \\u00d7"+s.servoGate.toFixed(2);cls="warn";}
+   else if(held.size>0&&s.servoGate!=null&&s.servoGate<1.0){
+     msg="\\u26A0 jog slowed (singularity or joint limit)";cls="warn";}
+   setPadBlock(escKey);
+   for(const id of["collAlert","fsCollAlert"]){
+     const el=document.getElementById(id);
+     if(msg){el.className=cls;el.innerHTML=msg;}
+     else{el.className="";el.textContent="";}}}
  const hints={tool:"<b>W/S</b> forward/back along the tool \\u00b7 <b>A/D</b> across \\u00b7 <b>Q/E</b> across (tool frame). Hold to move, release to stop.",
    base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z (robot BASE frame). Hold to move, release to stop."};
  function showHint(){const b=document.getElementById("basef").checked;
    document.getElementById("joghint").innerHTML=hints[b?"base":"tool"];
    document.getElementById("fsframe").classList.toggle("on",b);}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));
-   document.getElementById("basef").checked=!!s.basef;}catch(e){}
-   showHint();
+   document.getElementById("basef").checked=!!s.basef;
+   if(s.jogon){const jc=document.getElementById("jogon");jc.checked=true;jc.dispatchEvent(new Event("change"));}}catch(e){}
+   showHint();padRelabel();
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
    document.getElementById("basef").addEventListener("change",e=>{showHint();padRelabel();
      fetch("/api/jogframe?base="+(e.target.checked?1:0),{method:"POST"});});
@@ -672,7 +734,7 @@ _WEB_PAGE = """<!doctype html>
  document.getElementById("fsbtn").addEventListener("click",()=>setFS(true));
  document.getElementById("fsexit").addEventListener("click",()=>setFS(false));
  // Safety-wall visibility (3D view ONLY — collision checking is unaffected).
- let wallsOn=true;
+ let wallsOn=false;
  function setWalls(on){wallsOn=on;
    document.getElementById("wallbtn").classList.toggle("on",on);
    document.getElementById("fswalls").classList.toggle("on",on);
@@ -694,6 +756,8 @@ _WEB_PAGE = """<!doctype html>
    v.checked=true;v.dispatchEvent(new Event("change"));}
  if(location.hash==="#fs")setFS(true);
  if(location.hash==="#tune")panel.classList.add("open");
+ // Auto-fullscreen on touch-primary devices (phones, tablets).
+ if(window.matchMedia("(pointer:coarse)").matches)setFS(true);
 </script>
 </body></html>
 """
@@ -931,8 +995,8 @@ class URServoController(Node):
         self._link_gap = LINK_GAP_NOMINAL
         self._link_lease = JOG_LEASE
         self._link_scale = 1.0
-        self._jog_mode = False                         # web toggle: stay in jog mode
-        self._jog_base = False                         # web toggle: jog axes in BASE
+        self._jog_mode = True                          # web toggle: stay in jog mode
+        self._jog_base = True                          # web toggle: jog axes in BASE
                                                        # frame (True) or TOOL (False)
         self._pub_lock = threading.Lock()              # serialise twist publishes
         self._jog_moving = False                        # for the moving/stopped log
@@ -1027,6 +1091,7 @@ class URServoController(Node):
         self._last_lin = (0.0, 0.0, 0.0)
         self._last_lin_t = 0.0
         self._coll_block_dir = None
+        self._coll_near_wall = None   # wall name at last collision halt
         self._servo_code = ServoStatus.NO_WARNING
         self._escape_log_t = 0.0
         # Sentinel liveness: jog is only allowed while Servo's status is FRESH.
@@ -1435,6 +1500,7 @@ class URServoController(Node):
                     with node._conn_lock:
                         connected = node._conn is not None
                     sf = node._speed_fraction
+                    near_wall = node._nearest_cage_wall()
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
@@ -1447,7 +1513,13 @@ class URServoController(Node):
                         "linkgap": round(node._link_gap * 1000),
                         "lease": round(node._link_lease * 1000),
                         "linkscale": round(node._link_scale, 2),
-                        "connected": connected}).encode(),
+                        "connected": connected,
+                        "jogon": node._jog_mode,
+                        "servoGate": round(node._servo_gate, 2),
+                        "collBlocked": node._servo_code == ServoStatus.HALT_FOR_COLLISION,
+                        "collWall": node._coll_near_wall,
+                        "collAxis": node._approach_axis(),
+                        "nearWall": near_wall}).encode(),
                         "application/json")
                 else:
                     self._send(_WEB_PAGE.encode(), "text/html; charset=utf-8")
@@ -1537,8 +1609,14 @@ class URServoController(Node):
                 data = rd.read(ln) if ln else b""
                 return hdr[0] & 0x0f, bytes(c ^ mask[i & 3] for i, c in enumerate(data))
 
+        class DualStackHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                super().server_bind()
+
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", self._web_port), Handler)
+            srv = DualStackHTTPServer(("::", self._web_port), Handler)
         except Exception as exc:
             self.get_logger().warn(f"[web] could not start on :{self._web_port}: {exc}")
             return
@@ -1624,6 +1702,35 @@ class URServoController(Node):
     def _speed_cb(self, msg: Float64) -> None:
         self._speed_fraction = msg.data            # pendant speed slider, display only
 
+    def _nearest_cage_wall(self) -> str | None:
+        """Return the id of the closest cage-wall box to the current TCP, or None."""
+        pose = self._tcp_pose()
+        if not pose or not self._scene_boxes:
+            return None
+        tx, ty, tz = pose[0]
+        best, best_d = None, float("inf")
+        for wid, box in self._scene_boxes.items():
+            if not wid.startswith("wall_"):
+                continue
+            d = math.sqrt((tx - box[0]) ** 2 + (ty - box[1]) ** 2 + (tz - box[2]) ** 2)
+            if d < best_d:
+                best_d, best = d, wid
+        return best
+
+    def _approach_axis(self) -> str | None:
+        """Dominant base-frame axis of the captured collision-approach direction."""
+        bd = self._coll_block_dir
+        if bd is None:
+            return None
+        x, y, z = bd
+        if max(abs(x), abs(y), abs(z)) < 1e-6:
+            return None
+        if abs(x) >= abs(y) and abs(x) >= abs(z):
+            return "+X" if x > 0 else "-X"
+        if abs(y) >= abs(x) and abs(y) >= abs(z):
+            return "+Y" if y > 0 else "-Y"
+        return "+Z" if z > 0 else "-Z"
+
     def _servo_status_cb(self, msg: ServoStatus) -> None:
         # Map Servo's kinematic assessment to a speedl gate: full speed when clean,
         # crawl while approaching/leaving a singularity or a joint bound, hard zero at
@@ -1649,11 +1756,13 @@ class URServoController(Node):
                 mag = math.sqrt(lx * lx + ly * ly + lz * lz)
                 if mag > 1e-6:
                     self._coll_block_dir = (lx / mag, ly / mag, lz / mag)
+                    self._coll_near_wall = self._nearest_cage_wall()
                     self.get_logger().warn(
                         "[jog] collision halt — approach dir captured, jog the "
                         "OPPOSITE way to back out (×%.2f crawl)" % COLL_ESCAPE_GATE)
         elif self._coll_block_dir is not None:
             self._coll_block_dir = None
+            self._coll_near_wall = None
             self.get_logger().info("[jog] collision cleared — full jog restored")
         if gate != self._servo_gate:
             self._servo_gate = gate
@@ -1936,15 +2045,27 @@ class URServoController(Node):
                                 "[jog] servo sentinel SILENT (no status for "
                                 f"{now - self._servo_status_t:.1f}s) — jog blocked")
                     bd = self._coll_block_dir
-                    if sentinel_fresh and g_servo == 0.0 and bd is not None and lin_mag > 1e-6:
-                        dot = (lin[0]*bd[0] + lin[1]*bd[1] + lin[2]*bd[2]) / lin_mag
-                        if dot <= -COLL_ESCAPE_DOT:
+                    if sentinel_fresh and g_servo == 0.0 and lin_mag > 1e-6:
+                        if bd is not None:
+                            dot = (lin[0]*bd[0] + lin[1]*bd[1] + lin[2]*bd[2]) / lin_mag
+                            if dot <= -COLL_ESCAPE_DOT:
+                                g_servo = COLL_ESCAPE_GATE
+                                if now - self._escape_log_t > 1.0:
+                                    self._escape_log_t = now
+                                    self.get_logger().info(
+                                        f"[jog] collision-halt escape: reversing out "
+                                        f"×{COLL_ESCAPE_GATE} (dot {dot:.2f})")
+                        elif self._servo_code == ServoStatus.HALT_FOR_COLLISION:
+                            # Halt appeared at startup/idle — no approach direction
+                            # captured, so no "bad" direction is known. Allow crawl
+                            # in any direction; Servo re-blocks instantly if the user
+                            # moves further into the collision rather than away.
                             g_servo = COLL_ESCAPE_GATE
                             if now - self._escape_log_t > 1.0:
                                 self._escape_log_t = now
                                 self.get_logger().info(
-                                    f"[jog] collision-halt escape: reversing out "
-                                    f"×{COLL_ESCAPE_GATE} (dot {dot:.2f})")
+                                    "[jog] collision-halt escape (no dir): "
+                                    f"crawl ×{COLL_ESCAPE_GATE} — all axes allowed")
                     g = g_servo * self._qd_gate
                     v6 = [-(lin[0] + lat[0]) * g, -(lin[1] + lat[1]) * g,
                           (lin[2] + lat[2]) * g, -ang[0] * g, -ang[1] * g, ang[2] * g]

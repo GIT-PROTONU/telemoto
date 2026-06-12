@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""Collision cage in the MoveIt planning scene — six movable walls.
+"""Collision cage in the MoveIt planning scene — six movable walls + a fixed
+base keep-out column.
 
 Publishes box CollisionObjects enclosing the workspace (wall_front/back/left/
 right/top/floor), each wrapped in an RViz interactive marker that slides along
-its own normal: drag a wall and the planning scene follows. Everything that
-reads the scene reacts:
+its own normal: drag a wall and the planning scene follows. wall_column is a
+FIXED square column on the base z-axis (floor→top, half-width `column_r`)
+guarding the shoulder-singularity amplification zone — only the wrist links
+are checked against it (see COLUMN_ALLOWED_LINKS). Everything that reads the
+scene reacts:
   - move_group  → planned moves route around / refuse to leave the cage
   - MoveIt Servo (check_collisions: true) → jog decelerates near a wall and
     halts on contact; ur_servo_controller turns that status into the speedl gate
   - RViz MotionPlanning display → walls visible under Scene Geometry
   - the web UI's 3D twin renders every BOX collision object
 
-⚠ The FLOOR needs special care: the robot's base and shoulder links are
-PERMANENTLY near z=0, which would pin Servo's collision monitor at "contact"
-and halt the jog forever. So the floor is collision-ALLOWED against
-base_link / base_link_inertia / shoulder_link through the planning-scene ACM:
-the current ACM is fetched from move_group (/get_planning_scene), extended
-with the floor entries, and included in every keepalive publish (the planning
-scene monitor replaces its ACM whenever a diff carries a non-empty one, so
-the SRDF self-collision entries ride along unchanged — never publish a
-partial ACM). Until that fetch succeeds the floor is NOT added: a cage
-without a floor jogs fine, a floor without the ACM bricks the jog.
+⚠ The FLOOR and the COLUMN need special care: links permanently near them
+(base/shoulder at z=0; base→forearm near the axis) would pin Servo's collision
+monitor at "contact" and halt the jog forever. So each is collision-ALLOWED
+against its ACM_EXCLUSIONS links through the planning-scene ACM: the current
+ACM is fetched from move_group (/get_planning_scene), extended, and included
+in every keepalive publish (the planning scene monitor replaces its ACM
+whenever a diff carries a non-empty one, so the SRDF self-collision entries
+ride along unchanged — never publish a partial ACM). Until that fetch succeeds
+neither is added: a cage without them jogs fine, either one without its ACM
+entries bricks the jog.
 
 The objects are re-ADDed (replace semantics) on every drag and on a 1 Hz
 keepalive, so a move_group restart re-acquires the cage automatically. On
@@ -59,9 +63,22 @@ from visualization_msgs.msg import (
 )
 
 FLOOR_ID = "wall_floor"
+COLUMN_ID = "wall_column"
 # Links that physically cannot reach the table the robot is bolted to — the
 # floor is excluded from collision against exactly these, nothing else.
 FLOOR_ALLOWED_LINKS = ("base_link", "base_link_inertia", "shoulder_link")
+# The base keep-out COLUMN guards the shoulder-singularity zone (the base
+# z-axis, where tiny TCP commands explode into huge base/shoulder joint
+# speeds — the 2026-06-12 protective stop). Only the WRIST links are
+# collision-checked against it: everything upstream lives near the axis at
+# ordinary poses and would pin Servo at permanent contact (the floor lesson),
+# and the singular quantity is the WRIST point's distance to the axis — the
+# forearm BODY sweeping over the base with the wrist far out is a perfectly
+# conditioned pose and must not halt.
+COLUMN_ALLOWED_LINKS = ("base_link", "base_link_inertia", "shoulder_link",
+                        "upper_arm_link", "forearm_link")
+# World object → links it is collision-ALLOWED against (via the fetched ACM).
+ACM_EXCLUSIONS = {FLOOR_ID: FLOOR_ALLOWED_LINKS, COLUMN_ID: COLUMN_ALLOWED_LINKS}
 # MOVE_AXIS moves along the control's X axis: quaternions rotating X onto each
 # world axis (s = 1/√2).
 _S = 1.0 / math.sqrt(2.0)
@@ -86,6 +103,11 @@ class SceneWall(Node):
         self.declare_parameter("floor_z",  -0.03)
         self.declare_parameter("thickness", 0.05)
         self.declare_parameter("include_floor", True)
+        # Base keep-out column half-width [m]: square column centered on the
+        # base axis, floor→top. Sized so the WRIST point stays out of the
+        # amplification zone (measured: TCP 0.28 m radial ⇒ qd 2.5 rad/s at a
+        # 100 mm/s command). 0 disables.
+        self.declare_parameter("column_r", 0.25)
         # Dragged wall poses persist here over restarts/reboots ("" = disable).
         self.declare_parameter("pose_file", "~/.ros/telamoto_cage_poses.yaml")
 
@@ -96,10 +118,12 @@ class SceneWall(Node):
         flo = float(self.get_parameter("floor_z").value)
         t = float(self.get_parameter("thickness").value)
         self._include_floor = bool(self.get_parameter("include_floor").value)
+        cr = float(self.get_parameter("column_r").value)
 
         sx, sy = 2 * hx + 2 * t, 2 * hy + 2 * t       # spans (corners overlap)
         h, zc = top - flo + 2 * t, (top + flo) / 2
-        # id → [size, position, drag axis]; inner faces at the configured offsets.
+        # id → [size, position, drag axis (None = fixed, no marker)]; inner
+        # faces at the configured offsets.
         self._walls = {
             "wall_front": [[t, sy, h], [+(hx + t / 2), 0.0, zc], "x"],
             "wall_back":  [[t, sy, h], [-(hx + t / 2), 0.0, zc], "x"],
@@ -107,9 +131,16 @@ class SceneWall(Node):
             "wall_right": [[sx, t, h], [0.0, -(hy + t / 2), zc], "y"],
             "wall_top":   [[sx, sy, t], [0.0, 0.0, top + t / 2], "z"],
             FLOOR_ID:     [[sx, sy, t], [0.0, 0.0, flo - t / 2], "z"],
+            # Fixed on the base axis (a drag would defeat its purpose) and
+            # full cage height: the singular zone exists directly ABOVE the
+            # base too — the incident TCP was at z 1.1 m.
+            COLUMN_ID:    [[2 * cr, 2 * cr, top - flo],
+                           [0.0, 0.0, (top + flo) / 2], None],
         }
         if not self._include_floor:
             del self._walls[FLOOR_ID]
+        if cr <= 0.0:
+            del self._walls[COLUMN_ID]
         self._poses = {}
         for wid, (size, xyz, _axis) in self._walls.items():
             p = Pose()
@@ -122,16 +153,19 @@ class SceneWall(Node):
 
         self._scene_pub = self.create_publisher(PlanningScene, "/planning_scene", 10)
 
-        # Floor ACM: fetched from move_group, extended, republished verbatim
-        # afterwards. None = not fetched yet = floor withheld from the scene.
+        # Floor/column ACM: fetched from move_group, extended, republished
+        # verbatim afterwards. None = not fetched yet = the ACM-dependent
+        # objects (floor, column) withheld from the scene.
         self._acm = None
         self._acm_pending = False
         self._acm_cli = self.create_client(GetPlanningScene, "/get_planning_scene")
-        if self._include_floor:
+        if any(wid in self._walls for wid in ACM_EXCLUSIONS):
             self.create_timer(2.0, self._fetch_acm)
 
         self._server = InteractiveMarkerServer(self, "scene_wall")
-        for wid in self._walls:
+        for wid, (_size, _xyz, axis) in self._walls.items():
+            if axis is None:
+                continue                              # fixed object, not draggable
             self._server.insert(self._make_marker(wid), feedback_callback=self._feedback)
         self._server.applyChanges()
 
@@ -141,8 +175,9 @@ class SceneWall(Node):
         self._publish_cage()
         self.get_logger().info(
             f"cage in '{self._frame}': x ±{hx} m, y ±{hy} m, top {top} m, "
-            f"floor {flo} m — drag walls in RViz (InteractiveMarkers, "
-            "namespace /scene_wall); floor appears once move_group's ACM is fetched")
+            f"floor {flo} m, base column ±{cr} m — drag walls in RViz "
+            "(InteractiveMarkers, namespace /scene_wall); floor + column appear "
+            "once move_group's ACM is fetched")
 
     # ── pose persistence ────────────────────────────────────────────────────
 
@@ -218,28 +253,29 @@ class SceneWall(Node):
             self.get_logger().warn("ACM from move_group is empty; floor withheld, retrying")
             return
         self._acm = self._extend_acm(acm)
+        added = [w for w in ACM_EXCLUSIONS if w in self._walls]
         self.get_logger().info(
-            f"ACM fetched ({len(acm.entry_names)} entries) — floor added, "
-            f"collision-allowed against {', '.join(FLOOR_ALLOWED_LINKS)}")
+            f"ACM fetched ({len(acm.entry_names)} entries) — {', '.join(added)} "
+            "added with their link exclusions")
         self._publish_cage()
 
-    @staticmethod
-    def _extend_acm(acm: AllowedCollisionMatrix) -> AllowedCollisionMatrix:
-        if FLOOR_ID in acm.entry_names:
-            return acm
-        floor_col = [n in FLOOR_ALLOWED_LINKS for n in acm.entry_names]
-        for entry, allowed in zip(acm.entry_values, floor_col):
-            entry.enabled.append(allowed)
-        acm.entry_names.append(FLOOR_ID)
-        acm.entry_values.append(AllowedCollisionEntry(enabled=floor_col + [False]))
+    def _extend_acm(self, acm: AllowedCollisionMatrix) -> AllowedCollisionMatrix:
+        for oid, allowed_links in ACM_EXCLUSIONS.items():
+            if oid not in self._walls or oid in acm.entry_names:
+                continue
+            col = [n in allowed_links for n in acm.entry_names]
+            for entry, allowed in zip(acm.entry_values, col):
+                entry.enabled.append(allowed)
+            acm.entry_names.append(oid)
+            acm.entry_values.append(AllowedCollisionEntry(enabled=col + [False]))
         return acm
 
     # ── planning scene ──────────────────────────────────────────────────────
 
     def _active_walls(self):
         for wid in self._walls:
-            if wid == FLOOR_ID and self._acm is None:
-                continue                              # never a floor without its ACM
+            if wid in ACM_EXCLUSIONS and self._acm is None:
+                continue          # never floor/column without their ACM entries
             yield wid
 
     def _collision_object(self, wid: str, operation: int) -> CollisionObject:

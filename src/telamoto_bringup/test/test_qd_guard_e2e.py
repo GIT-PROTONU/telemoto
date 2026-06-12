@@ -19,6 +19,11 @@ TF / joint states (with synthetic actual_qd) / fresh ServoStatus, verifying:
   Q7  escape with elevated qd (1.2 rad/s — would have latched a fresh tap) keeps
       running under the raised escape allowance/latch line
   Q8  5 cm of TCP travel clears the block; the inward direction works again
+  Q9  travel DURING the runaway must not clear the block (the 2026-06-12
+      protective stop: each lurch covered 5-30 cm, self-clearing the block
+      mid-excursion) — the anchor re-sets to the rest pose at latch release
+  Q10 the inward direction is still blocked at the rest pose
+  Q11 deliberate travel at honest joint speed clears it; inward works again
   S1  a singularity halt mid-jog captures the approach dir (singAxis in
       /api/state — drives the web escape-pad UI) and zeroes the stream
   S2  a sentinel feed flap mid-escape must NOT invert the captured direction
@@ -274,6 +279,45 @@ sm = recent()
 speedl = [m for _, mode, m in sm if mode == usc.MODE_SPEEDL]
 mag = sum(speedl) / max(1, len(speedl))
 check("Q8 travel clears block -> inward ok", ax is None and len(speedl) > 10
+      and mag > 0.05, f"qdBlockAxis={ax} mean={mag*1000:.1f}mm/s")
+VEC[0] = 0
+time.sleep(0.5)
+
+# Q9 ── runaway travel must NOT clear the block (anchor re-sets at release) ───
+VEC[0] = 1                                        # jog inward again
+time.sleep(0.6)
+QD[0] = 1.5                                       # runaway → latch (dir +X)
+time.sleep(0.8)
+POS[0] = 0.65                                     # 9 cm "lurch" WHILE latched
+time.sleep(0.5)
+VEC[0] = 0                                        # release…
+QD[0] = 0.0                                       # …joints settle → latch off,
+time.sleep(1.0)                                   # anchor re-set to rest (0.65)
+ax = state()["qdBlockAxis"]
+check("Q9 lurch does not clear the block", ax == "+X", f"qdBlockAxis={ax}")
+
+# Q10 ── inward still hard-blocked at the rest pose ───────────────────────────
+VEC[0] = 1
+time.sleep(1.2)
+sm = recent()
+mags = [m for _, mode, m in sm if mode == usc.MODE_SPEEDL]
+check("Q10 inward still blocked after lurch", len(mags) > 10
+      and max(mags) < 1e-6,
+      f"speedl={len(mags)} max={max(mags) if mags else 0:.6f}")
+VEC[0] = 0
+time.sleep(0.5)
+
+# Q11 ── deliberate post-settle travel clears it ──────────────────────────────
+VEC[0] = -1                                       # honest escape jog (qd 0)
+POS[0] = 0.59                                     # 6 cm from the 0.65 rest pose
+time.sleep(0.8)
+ax = state()["qdBlockAxis"]
+VEC[0] = 1
+time.sleep(1.2)
+sm = recent()
+speedl = [m for _, mode, m in sm if mode == usc.MODE_SPEEDL]
+mag = sum(speedl) / max(1, len(speedl))
+check("Q11 honest travel clears -> inward ok", ax is None and len(speedl) > 10
       and mag > 0.05, f"qdBlockAxis={ax} mean={mag*1000:.1f}mm/s")
 VEC[0] = 0
 time.sleep(0.5)

@@ -81,12 +81,20 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
 - **Collision cage**: `scene_wall.py` (launched in both twin modes) puts six movable
   walls in the planning scene (`wall_front/back/left/right/top/floor`; defaults
   x ±0.8, y ±0.8, top 1.6, floor −0.03 m) — drag each along its normal via its
-  RViz interactive marker (namespace `/scene_wall`). ⚠ The **floor** is published
-  only after the node fetches move_group's ACM (`/get_planning_scene`) and extends
-  it: floor↔{base_link, base_link_inertia, shoulder_link} allowed — those links
-  are permanently near z=0 and would otherwise pin Servo's collision monitor at
-  contact (jog bricked). The extended ACM rides every 1 Hz keepalive (PSM ACM
-  semantics = replace-on-non-empty; never publish a partial ACM). With the full
+  RViz interactive marker (namespace `/scene_wall`) — plus a FIXED
+  **`wall_column`** (square, half-width `column_r` = 0.25 m, floor→top, on the
+  base z-axis, no marker): the shoulder-singularity keep-out (2026-06-12
+  protective stop: TCP 0.28 m radial ⇒ qd 2.5 rad/s at a 100 mm/s command —
+  Servo's wrist-tuned singularity thresholds never fired there). Only the
+  WRIST links are checked against the column (base→forearm are ACM-allowed:
+  near the axis at ordinary poses + a forearm sweeping over the base with the
+  wrist out is well-conditioned). ⚠ The **floor** and the **column** are
+  published only after the node fetches move_group's ACM
+  (`/get_planning_scene`) and extends it (`ACM_EXCLUSIONS`): floor↔{base_link,
+  base_link_inertia, shoulder_link} allowed — those links are permanently near
+  z=0 and would otherwise pin Servo's collision monitor at contact (jog
+  bricked). The extended ACM rides every 1 Hz keepalive (PSM ACM semantics =
+  replace-on-non-empty; never publish a partial ACM). With the full
   cage keep the wall-distance slider ≤ ~10 cm or jog is permanently slowed.
   **Dragged poses persist** across restarts/reboots: saved on mouse-up to
   `~/.ros/telamoto_cage_poses.yaml` (`pose_file` param; delete it for defaults).
@@ -148,7 +156,10 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   2.5× allowance = proportional braking has lost (boundary/deep-singularity
   amplification is unbounded) → speedj-zero hold until key release + joints
   settle — a self-recovering host-side stop instead of UR's pendant-bound
-  protective stop (web banner: "joint-speed runaway"). The latch has
+  protective stop (web banner: "joint-speed runaway" — checked FIRST in
+  setCollAlert, ABOVE the collision banners: in the 2026-06-12 incident the
+  collision story outranked it and the operator kept tapping into the
+  amplification zone). The latch has
   **direction memory** (`QD_BLOCK_*`, 2nd on-robot run: re-pressing the inward
   key ratcheted deeper, escape taps re-latched ~5× before getting out): the
   inward cone stays HARD-blocked after release (banner names it + the escape
@@ -156,7 +167,11 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   latch line (1.5 rad/s) — direction judged from the live jog TARGET, never
   the stale sent twist, so an escape pressed while joints still ring counts
   as an escape from its first cycle; block clears after 5 cm of TCP travel
-  from the latch point (any route incl. planned moves); (4) the URScript
+  from the REST pose where the latch released (any route incl. planned moves),
+  and the travel counts ONLY while unlatched at honest joint speed (≤ the 0.8
+  escape-allowance floor) — measuring from the latch ONSET let the 2026-06-12
+  runaway lurches (5–30 cm each) self-clear the block mid-excursion, 6 taps
+  ratcheted in, qd 2.56 rad/s tripped UR's 120°/s base-joint limit; (4) the URScript
   miss-watchdog `stopj`; (5) UR's own safety limits. Same-gate Servo status-code
   changes are now logged too (a code-4↔code-1 flip used to be invisible).
   Guard E2E (fake robot pulling real packets, synthetic actual_qd):

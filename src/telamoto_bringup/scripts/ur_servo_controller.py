@@ -146,13 +146,17 @@ QD_LATCH_SETTLE = 0.15      # rad/s: joints considered settled → latch may rel
 # while the opposite (escape) cone runs with a raised allowance floor and a
 # raised latch line — outward motion monotonically leaves the amplification
 # zone and UR's own limits (~2.1+ rad/s) still backstop. Everything clears
-# after QD_BLOCK_CLEAR_M of TCP travel from the latch point (any route:
-# escape jog, lateral jog, planned move).
+# after QD_BLOCK_CLEAR_M of TCP travel from the REST pose where the latch
+# released (any route: escape jog, lateral jog, planned move). Measuring from
+# the latch ONSET was a hole (2026-06-12 protective stop): each runaway
+# excursion itself travels 5–30 cm, self-clearing the block mid-lurch — six
+# taps ratcheted in until qd 2.56 rad/s tripped UR's own joint-speed limit.
 QD_BLOCK_DOT     = 0.5      # cone half-angle cos: ≥ this aligned with the inward
                             # direction = blocked; ≤ −this = escaping
 QD_ESCAPE_ALLOW  = 0.8      # rad/s allowance floor while escaping
 QD_ESCAPE_LATCH  = 1.5      # rad/s latch line while escaping
-QD_BLOCK_CLEAR_M = 0.05     # m of TCP travel from the latch point → block clears
+QD_BLOCK_CLEAR_M = 0.05     # m of TCP travel from the latch-release rest pose
+                            # → block clears
 JOG_SPEED_DEF = 0.5        # m/s at full axis (default)
 JOG_ACCEL_DEF = 1.0        # m/s^2 — CARTESIAN start/stop ramp rate (default; gentle).
                            # Ramps the TWIST magnitude (direction-preserving), never
@@ -678,7 +682,8 @@ _WEB_PAGE = """<!doctype html>
    "+Y":{key:"E",pad:"\\u2212Y"},"-Y":{key:"Q",pad:"+Y"},
    "+Z":{key:"S",pad:"\\u2212Z"},"-Z":{key:"W",pad:"+Z"}};
  const axLabel={"+X":"front","-X":"back","+Y":"left","-Y":"right","+Z":"up","-Z":"down"};
- const fmtWall=w=>w?w.replace("wall_","").replace("_"," ")+" wall":null;
+ const fmtWall=w=>w?(w==="wall_column"?"base column"
+   :w.replace("wall_","").replace("_"," ")+" wall"):null;
  const isMobile=window.matchMedia("(pointer:coarse)").matches;
  function escHint(axis){
    const info=escInfo[axis];if(!info)return null;
@@ -706,7 +711,15 @@ _WEB_PAGE = """<!doctype html>
    if(changed)sendJog();}
  function setCollAlert(s){
    let msg="",cls="",escKey=null;
-   if(s.collBlocked&&s.collAxis){
+   if(s.qdLatch){
+     // Host-side runaway latch — checked FIRST: during the 2026-06-12 incident
+     // the collision banner outranked this one, so the operator was told to
+     // "back out of a wall" while the actual hazard was joint-speed
+     // amplification, and kept tapping into it. Runaway is always the story
+     // that must win the banner.
+     msg="\\u26D4 joint-speed runaway \\u2014 jog stopped; release all keys, then jog"
+       +" AWAY from the boundary";cls="halt";}
+   else if(s.collBlocked&&s.collAxis){
      const wall=fmtWall(s.collWall)||"collision";   // no wall that way = e.g. self-collision
      const e=escOut(s.collAxis);
      msg="\\u26D4 "+wall+" ("+(axLabel[s.collAxis]||s.collAxis)+")"
@@ -733,11 +746,6 @@ _WEB_PAGE = """<!doctype html>
      // leave, we can't know it client-side.
      msg="\\u26D4 singularity \\u2014 jog halted; reverse to back out"
        +" (if stuck: planned move in RViz)";cls="halt";}
-   else if(s.qdLatch){
-     // Host-side runaway latch: joint speed blew past the amplification
-     // allowance (workspace boundary / deep singularity) \\u2014 jog is zero-held.
-     msg="\\u26D4 joint-speed runaway \\u2014 jog stopped; release all keys, then jog"
-       +" AWAY from the boundary";cls="halt";}
    else if(s.qdBlockAxis){
      // Post-latch directional block: only the inward cone is dead; the
      // opposite direction escapes with a relaxed guard, lateral moves pass
@@ -2368,18 +2376,27 @@ class URServoController(Node):
                 # at a crawl — that was exactly the 2026-06-12 trip.
                 allowed = (QD_ALLOW_BASE + QD_ALLOW_SLOPE * self._sent_lin
                            + QD_ALLOW_ROT_SLOPE * self._sent_rot)
-                # Post-latch block bookkeeping: cleared once the TCP has left the
-                # latch point; while it stands, a command opposing the captured
-                # inward direction is an ESCAPE — raised allowance + latch line
-                # (one press must walk out, not five taps — see QD_BLOCK_*).
+                # Post-latch block bookkeeping: cleared once the TCP has left
+                # the rest pose; while it stands, a command opposing the
+                # captured inward direction is an ESCAPE — raised allowance +
+                # latch line (one press must walk out, not five taps — see
+                # QD_BLOCK_*). Travel counts ONLY while not latched and the
+                # joints move at honest speeds (≤ the escape allowance floor):
+                # in the 2026-06-12 incident the runaway lurches themselves
+                # covered 5–30 cm, self-clearing the block 50 ms before each
+                # re-latch — involuntary travel must never clear it. (The
+                # anchor is also re-set to the rest pose at latch release.)
                 bd_qd, escaping = self._qd_block_dir, False
-                if bd_qd is not None and pose is not None:
+                if (bd_qd is not None and pose is not None
+                        and not self._qd_latched
+                        and self._qd_now <= QD_ESCAPE_ALLOW):
                     bp = self._qd_block_pos
                     if (bp is not None and math.dist(pose[0], bp) > QD_BLOCK_CLEAR_M):
                         bd_qd = self._qd_block_dir = self._qd_block_pos = None
                         self.get_logger().info(
                             "[jog] singularity-boundary block cleared "
-                            f"(TCP moved {QD_BLOCK_CLEAR_M*1000:.0f}+ mm away)")
+                            f"(TCP moved {QD_BLOCK_CLEAR_M*1000:.0f}+ mm away "
+                            "at honest joint speed)")
                 # Current commanded direction (base frame) from the jog TARGET —
                 # not the last SENT twist: at the start of a tap nothing was sent
                 # yet, and an escape tap pressed while the joints still ring
@@ -2541,6 +2558,18 @@ class URServoController(Node):
                         self._qd_gate = 1.0          # fresh gate for the next jog
                         if self._qd_latched and self._qd_now < QD_LATCH_SETTLE:
                             self._qd_latched = False
+                            # Re-anchor the directional block at the REST pose:
+                            # a runaway excursion itself travels far more than
+                            # QD_BLOCK_CLEAR_M (2026-06-12 incident: 5–30 cm
+                            # lurches per tap), so measuring travel from the
+                            # LATCH point let the block self-clear before the
+                            # next tap and the operator ratcheted 6 excursions
+                            # deep. Clearing travel must be deliberate motion
+                            # made after the joints settled.
+                            if self._qd_block_dir is not None:
+                                p = self._tcp_pose()
+                                if p is not None:
+                                    self._qd_block_pos = p[0]
                             self.get_logger().info(
                                 f"[jog] runaway latch released "
                                 f"(qd {self._qd_now:.2f} rad/s, jog idle)")

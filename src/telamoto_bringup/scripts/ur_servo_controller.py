@@ -50,6 +50,7 @@ Reply packet — 11 x int32 big-endian, read as p[1..11]:
   3=speedl) . p[9] servoj gain OR accel x100 . p[10] lookahead x1000 (ms) .
   p[11] step duration x1e6 (us)
 """
+import asyncio
 import base64
 import gc
 import hashlib
@@ -87,6 +88,16 @@ from rcl_interfaces.msg import (
 from rcl_interfaces.srv import SetParameters
 from rclpy.parameter import Parameter as RclpyParameter
 
+try:
+    # WebRTC datachannel = the browser's only true-UDP transport (the jog rides
+    # an UNORDERED/NO-RETRANSMIT channel so a lossy WAN path drops stale twists
+    # instead of queueing them behind TCP retransmits). Optional: without
+    # aiortc the page's /api/rtc offer gets a 503 and the jog stays on the WS.
+    from aiortc import (RTCConfiguration, RTCIceServer, RTCPeerConnection,
+                        RTCSessionDescription)
+except ImportError:
+    RTCPeerConnection = None
+
 UR_JOINT_ORDER = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
@@ -94,6 +105,11 @@ UR_JOINT_ORDER = [
 REVERSE_PORT = 50001        # URCap requests the script here AND robot connects back
 WEB_PORT     = 8080
 _WS_GUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # RFC 6455 handshake magic
+RTC_STUN     = "stun:stun.l.google.com:19302"  # srflx candidates: the UI is used
+                                               # straight off the public IP (user
+                                               # decision 2026-06-12 — no VPN), so
+                                               # both ends usually sit behind NAT
+RTC_MAX_PCS  = 16           # refuse offers beyond this many live peer connections
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (the idle self-hold: exact zeros)
@@ -460,7 +476,14 @@ _WEB_PAGE = """<!doctype html>
  #pads.rot .jb{background:#2b2138;border-color:#7a5cff;color:#dccdff}
  #pads.rot .jb.on{background:#6e2da8;border-color:#c89bff}
  #jb-q{grid-area:q}#jb-a{grid-area:a}#jb-d{grid-area:d}#jb-e{grid-area:e}
- #pads.off .jb{opacity:.35;pointer-events:none}
+ /* Mode toggle in the grid CENTER (the old tilt-pad spot): one thumb-reach tap
+    flips linear/rotation jog. Round + dashed = "not a jog pad"; NOT class .jb,
+    so the collision-halt pad disabling and the pointer jog handlers skip it. */
+ #rotpad{grid-area:t;width:64px;height:64px;margin:0;padding:0;font-size:.8rem;
+  border-radius:50%;background:#15202b;border:1px dashed #4a5a70;color:#8fa8c8;
+  touch-action:none;user-select:none;-webkit-user-select:none}
+ #rotpad.on{background:#6e2da8;border:1px solid #c89bff;color:#dccdff}
+ #pads.off .jb,#pads.off #rotpad{opacity:.35;pointer-events:none}
  .jb:disabled{opacity:.15;pointer-events:none}
  /* Big 3D view (mobile-first): most of the viewport, capped on desktop. */
  #view3d{width:100%;height:min(56vh,560px);height:min(56dvh,560px);
@@ -475,8 +498,8 @@ _WEB_PAGE = """<!doctype html>
  #fsbtn{right:.5rem}
  #wallbtn{right:3.3rem;font-size:.85rem;padding:.55rem .7rem}
  #wallbtn.on{background:#2d5a8ecc;border-color:#4ea1ff}
- /* Fullscreen top bar: one glassy strip — status dot, compact equal buttons,
-    a jog-speed row, and (when active) the collision chip. */
+ /* Fullscreen top bar: one glassy strip — status dot, ping + transport,
+    compact equal buttons, and (when active) the collision chip. */
  #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;
   gap:.45rem;row-gap:.4rem;flex-wrap:wrap;align-items:center;justify-content:center;
   padding:calc(.55rem + env(safe-area-inset-top)) .65rem .55rem;
@@ -492,15 +515,6 @@ _WEB_PAGE = """<!doctype html>
  #fsstat.ok{color:#6ee787}#fsstat.bad{color:#ff7b72}
  #fsping{flex:0 0 auto;font-size:.72rem;color:#9ab;white-space:nowrap;
   font-variant-numeric:tabular-nums;padding-right:.1rem}
- #fsspeed{flex-basis:100%;display:flex;align-items:center;gap:.6rem;
-  font-size:.75rem;color:#9ab;max-width:560px;margin:0 auto}
- #fsspeed input{flex:1;height:1.7rem;margin:0;width:auto}
- #fsspeed .val{min-width:4.2rem;text-align:right}
- #fsjoghint{display:none}
- body.fs #fsjoghint.show{display:block;position:fixed;left:50%;transform:translateX(-50%);
-  bottom:calc(15rem + env(safe-area-inset-bottom));z-index:26;background:#000a;
-  color:#e3b341;padding:.5rem 1rem;border-radius:.6rem;font-size:.85rem;
-  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);white-space:nowrap}
  body.fs{overflow:hidden}
  body.fs #view3d{position:fixed;inset:0;z-index:25;height:100%;border-radius:0}
  body.fs #fsbar{display:flex}
@@ -509,10 +523,11 @@ _WEB_PAGE = """<!doctype html>
   justify-content:space-between;
   padding:0 max(1rem,env(safe-area-inset-left)) calc(1rem + env(safe-area-inset-bottom))
    max(1rem,env(safe-area-inset-right));pointer-events:none}
- body.fs #pads .jb{pointer-events:auto;background:#1c2733e8;
-  width:clamp(58px,16vw,76px);height:clamp(58px,16vw,76px);font-size:1rem}
+ body.fs #pads .jb,body.fs #pads #rotpad{pointer-events:auto;
+  width:clamp(58px,16vw,76px);height:clamp(58px,16vw,76px)}
+ body.fs #pads .jb{background:#1c2733e8;font-size:1rem}
  body.fs #pads.rot .jb{background:#2b2138e8}
- body.fs #pads.off .jb{pointer-events:none}
+ body.fs #pads.off .jb,body.fs #pads.off #rotpad{pointer-events:none}
  body.fs #panel{z-index:28}
  /* Tuning panel: bottom sheet toggled by the floating button — keeps every
     slider one tap away while the 3D view + jog pads own the screen. */
@@ -557,26 +572,24 @@ _WEB_PAGE = """<!doctype html>
  <div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
    <button id="fswalls">walls</button>
    <button id="fsframe">tool</button>
-   <button id="fsrot">rot</button>
-   <button id="fsjog">jog</button>
    <button id="fstune">&#9881;</button>
    <button id="fsexit">&#10005;</button>
-   <div id="fsspeed"><span>jog speed</span>
-     <input type="range" id="fsjspeed" min="0.005" max="0.5" step="0.005">
-     <span class="val" id="fsjspeedv"></span></div>
    <div id="fsCollAlert"></div></div>
- <div id="fsjoghint" class="show">jog disabled &mdash; tap <b>jog</b> to enable</div>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
    <label>Jog <span>
      <input type="checkbox" id="rotf"> rotate pads &nbsp;
-     <input type="checkbox" id="basef"> base frame &nbsp;
-     <input type="checkbox" id="jogon"> enable</span></label>
+     <input type="checkbox" id="basef"> base frame
+     <!-- jog mode has no UI toggle (always-on is the use case, 2026-06-12);
+          the hidden box keeps the state wiring + the server is told ON at
+          load. The SERVER-side jog-mode gate still exists for API/tests. -->
+     <input type="checkbox" id="jogon" style="display:none"></span></label>
    <div class="hint" id="joghint"></div>
  </div>
  <div id="pads" class="off">
    <div id="padgrid">
      <button class="jb" id="jb-q" data-k="q"></button>
      <button class="jb" id="jb-a" data-k="a"></button>
+     <button id="rotpad">rot</button>
      <button class="jb" id="jb-d" data-k="d"></button>
      <button class="jb" id="jb-e" data-k="e"></button>
    </div>
@@ -645,16 +658,9 @@ _WEB_PAGE = """<!doctype html>
    okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1),
    selfd:v=>Math.round(+v*100)+" cm",walld:v=>Math.round(+v*100)+" cm"};
  const ids=["speed","gain","lookahead","jspeed","jaccel","jrspeed","okp","pkp","selfd","walld"];
- function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);
-   if(k==="jspeed")syncFsSpeed();}
+ function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);}
  function send(k){const v=document.getElementById(k).value;
-   document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});
-   if(k==="jspeed")syncFsSpeed();}
- // Fullscreen jog-speed slider: a proxy for #jspeed (same /api/set path) so speed
- // is visible + adjustable without leaving fullscreen.
- function syncFsSpeed(){const v=document.getElementById("jspeed").value;
-   document.getElementById("fsjspeed").value=v;
-   document.getElementById("fsjspeedv").textContent=fmt.jspeed(v);}
+   document.getElementById(k+"v").textContent=fmt[k](v);fetch("/api/set?"+k+"="+v,{method:"POST"});}
  async function refreshStatus(){try{const t0=performance.now();
    const s=await(await fetch("/api/state")).json();
    const rtt=Math.round(performance.now()-t0);
@@ -673,12 +679,14 @@ _WEB_PAGE = """<!doctype html>
    // the server's jog-frame estimator. Amber/red = laggy link, jog auto-slowed.
    const lk=document.getElementById("link");
    lk.textContent="link: rtt "+rtt+" ms \\u00b7 frame gap "+s.linkgap+" ms \\u00b7 lease "
-     +s.lease+" ms \\u00b7 jog speed \\u00d7"+s.linkscale.toFixed(2);
+     +s.lease+" ms \\u00b7 jog speed \\u00d7"+s.linkscale.toFixed(2)
+     +" \\u00b7 "+trans();
    lk.style.color=s.linkscale>0.99?"#888":(s.linkscale>0.3?"#e3b341":"#ff7b72");
    // Fullscreen ping: browser-measured rtt; appends the auto-slow factor when
    // the link estimator has scaled the jog down.
    const fp=document.getElementById("fsping");
-   fp.textContent=rtt+" ms"+(s.linkscale>0.99?"":" \\u00d7"+s.linkscale.toFixed(2));
+   fp.textContent=rtt+" ms "+trans()
+     +(s.linkscale>0.99?"":" \\u00d7"+s.linkscale.toFixed(2));
    fp.style.color=(rtt>250||s.linkscale<=0.3)?"#ff7b72"
      :(rtt>100||s.linkscale<=0.99)?"#e3b341":"#9ab";
    // Collision alert — updated in both normal and fullscreen elements.
@@ -787,8 +795,13 @@ _WEB_PAGE = """<!doctype html>
    fb.classList.toggle("on",b);fb.textContent=b?"base":"tool";}
  async function init(){try{const s=await(await fetch("/api/state")).json();ids.forEach(k=>show(k,s[k]));
    document.getElementById("basef").checked=!!s.basef;
-   if(s.jogon){const jc=document.getElementById("jogon");jc.checked=true;jc.dispatchEvent(new Event("change"));}}catch(e){}
-   showHint();padRelabel();syncFsSpeed();
+   }catch(e){}
+   // Jog mode is ALWAYS ON from the page (no UI toggle since 2026-06-12): tell
+   // the server so even if another client turned it off — and do it OUTSIDE
+   // the state-fetch try, a failed first fetch must not leave jog dead.
+   const jc=document.getElementById("jogon");jc.checked=true;
+   jc.dispatchEvent(new Event("change"));
+   showHint();padRelabel();
    ids.forEach(k=>document.getElementById(k).addEventListener("input",()=>send(k)));
    document.getElementById("basef").addEventListener("change",e=>{showHint();padRelabel();
      fetch("/api/jogframe?base="+(e.target.checked?1:0),{method:"POST"});});
@@ -802,6 +815,8 @@ _WEB_PAGE = """<!doctype html>
  // idle to keep that estimate warm. Paused while the tab is hidden: browsers
  // throttle background timers to ~1 Hz, which would poison the estimate.
  let jogOn=false; const held=new Set(); let stream=null, ws=null;
+ let dc=null, rtcRetryT=null, seqN=0;          // UDP transport state (WebRTC)
+ const trans=()=>dc&&dc.readyState==="open"?"udp":"tcp";   // live jog transport
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
  // Keys give ±1, clamped (the server clamps again; never trust the client).
  // ax/ay/az are the ROTATION axes (I/K tilt, J/L pan, U/O roll — or the pads
@@ -817,29 +832,65 @@ _WEB_PAGE = """<!doctype html>
  // so a wss branch would only mask a misconfigured proxy.
  function wsOpen(){ws=new WebSocket("ws://"+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
+ // UDP transport: an unordered/no-retransmit WebRTC datachannel — on a lossy
+ // WAN path TCP queues stale twists behind retransmits (head-of-line blocking),
+ // UDP just loses them; the seq element lets the server drop reordered frames.
+ // The WS above stays connected as the automatic fallback (and is the only path
+ // when the server lacks aiortc: /api/rtc answers 503). Same frames, same
+ // server-side _handle_jog_frame — a 2nd transport, never a 2nd command path.
+ function rtcRetry(){if(!rtcRetryT)rtcRetryT=setTimeout(()=>{rtcRetryT=null;rtcOpen();},5000);}
+ function rtcOpen(){
+   if(!window.RTCPeerConnection)return;        // http page without RTC → WS only
+   let pc;
+   try{pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});}
+   catch(e){return;}
+   const ch=pc.createDataChannel("jog",{ordered:false,maxRetransmits:0});
+   ch.binaryType="arraybuffer";
+   let down=false;
+   const fail=()=>{if(down)return;down=true;if(dc===ch)dc=null;
+     try{pc.close();}catch(e){} rtcRetry();};
+   ch.onopen=()=>{dc=ch;};
+   ch.onclose=fail; ch.onerror=fail;
+   pc.onconnectionstatechange=()=>{
+     if(pc.connectionState==="failed"||pc.connectionState==="closed")fail();};
+   pc.createOffer().then(o=>pc.setLocalDescription(o))
+     .then(()=>new Promise(res=>{              // non-trickle: wait for the full
+       if(pc.iceGatheringState==="complete")return res();   // candidate set,
+       const t=setTimeout(res,2000);           // but cap the wait (srflx is slow)
+       pc.addEventListener("icegatheringstatechange",
+         ()=>{if(pc.iceGatheringState==="complete"){clearTimeout(t);res();}});}))
+     .then(()=>fetch("/api/rtc",{method:"POST",
+       body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})}))
+     .then(r=>{if(!r.ok)throw 0;return r.json();})
+     .then(a=>pc.setRemoteDescription(a)).catch(fail);}
+ rtcOpen();
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
  function cborInt(n){n=Math.round(n);const m=n<0?0x20:0x00,u=n<0?-1-n:n;
    if(u<24)return[m|u];if(u<256)return[m|24,u];return[m|25,(u>>8)&0xff,u&0xff];}
  function cborNum(n){if(Number.isInteger(n))return cborInt(n);   // analog → float32
    const d=new DataView(new ArrayBuffer(4));d.setFloat32(0,n);
    return [0xfa,d.getUint8(0),d.getUint8(1),d.getUint8(2),d.getUint8(3)];}
- function cborJog(v){return new Uint8Array([0x86].concat(cborNum(v.lx),cborNum(v.ly),cborNum(v.lz),
-   cborNum(v.ax),cborNum(v.ay),cborNum(v.az)));}
+ // 7th element: mod-2^16 sequence number — the server drops a frame older than
+ // the newest seen, so UDP reordering can't replay a pre-release twist after
+ // the keyup zero (harmless no-op on the ordered WS path).
+ function cborJog(v){seqN=(seqN+1)&0xffff;
+   return new Uint8Array([0x87].concat(cborNum(v.lx),cborNum(v.ly),cborNum(v.lz),
+   cborNum(v.ax),cborNum(v.ay),cborNum(v.az),cborInt(seqN)));}
  // Idle ticks send a 1-byte KEEPALIVE (CBOR empty array): it feeds the server's
  // link-jitter estimator but never the jog command — so a second open tab can't
  // fight the active tab's jog with a 30 Hz stream of zeros (= choppy motion).
  // A real [0,0,0] is still sent on the moving->stopped transition (instant stop).
  const KEEPALIVE=new Uint8Array([0x80]); let wasMoving=false;
- function sendJog(){if(!ws||ws.readyState!==1)return;
+ function sendJog(){
    const v=jogVec(),m=!!(v.lx||v.ly||v.lz||v.ax||v.ay||v.az);
-   ws.send(m||wasMoving?cborJog(v):KEEPALIVE);wasMoving=m;}
+   const f=m||wasMoving?cborJog(v):KEEPALIVE;wasMoving=m;
+   if(dc&&dc.readyState==="open"){try{dc.send(f);return;}catch(e){}}  // UDP first,
+   if(ws&&ws.readyState===1)ws.send(f);}                              // WS fallback
  function startStream(){if(!stream&&!document.hidden)stream=setInterval(sendJog,33);}   // ~30 Hz
  function stopStream(){if(stream){clearInterval(stream);stream=null;}}
  function stopAll(){held.clear();clearPads();stopStream();sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
    document.getElementById("pads").classList.toggle("off",!jogOn);
-   document.getElementById("fsjog").classList.toggle("on",jogOn);
-   document.getElementById("fsjoghint").classList.toggle("show",!jogOn);
    fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(jogOn)startStream();else stopAll();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
    if("wasdqeikjluo".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
@@ -880,7 +931,7 @@ _WEB_PAGE = """<!doctype html>
                                                                 // release the same key
  document.getElementById("rotf").addEventListener("change",e=>{rotOn=e.target.checked;
    document.getElementById("pads").classList.toggle("rot",rotOn);
-   document.getElementById("fsrot").classList.toggle("on",rotOn);
+   document.getElementById("rotpad").classList.toggle("on",rotOn);
    held.clear();clearPads();sendJog();              // never carry motion across a remap
    padRelabel();});
  padRelabel();
@@ -922,14 +973,12 @@ _WEB_PAGE = """<!doctype html>
  const fsProxy=(btn,box)=>document.getElementById(btn).addEventListener("click",()=>{
    const c=document.getElementById(box);c.checked=!c.checked;
    c.dispatchEvent(new Event("change"));});
- fsProxy("fsjog","jogon");fsProxy("fsframe","basef");fsProxy("fsrot","rotf");
+ fsProxy("fsframe","basef");fsProxy("rotpad","rotf");
  // Tuning panel (bottom sheet): keeps the screen for the 3D view + jog pads.
  const panel=document.getElementById("panel");
  document.getElementById("panelbtn").addEventListener("click",()=>panel.classList.toggle("open"));
  document.getElementById("fstune").addEventListener("click",()=>panel.classList.toggle("open"));
  document.getElementById("panelclose").addEventListener("click",()=>panel.classList.remove("open"));
- document.getElementById("fsjspeed").addEventListener("input",e=>{
-   document.getElementById("jspeed").value=e.target.value;send("jspeed");});
  wsOpen(); init();
  // Deep links: …:8080/#3d opens with the 3D view on; #fs straight into
  // fullscreen; #tune opens the tuning panel.
@@ -1087,6 +1136,7 @@ class URServoController(Node):
         self.declare_parameter("robot_ip", "192.168.10.2")
         self.declare_parameter("reverse_port", REVERSE_PORT)
         self.declare_parameter("web_port", WEB_PORT)
+        self.declare_parameter("rtc_stun", RTC_STUN)   # "" = host candidates only
         # gain/lookahead stream in every packet → tunable live (web UI / params).
         self.declare_parameter("servoj_gain", 300, ParameterDescriptor(
             description="servoj gain / stiffness (live)",
@@ -1140,6 +1190,7 @@ class URServoController(Node):
         self._robot_ip = g("robot_ip").get_parameter_value().string_value
         self._port     = g("reverse_port").get_parameter_value().integer_value
         self._web_port = g("web_port").get_parameter_value().integer_value
+        self._rtc_stun = g("rtc_stun").get_parameter_value().string_value
         self._gain      = g("servoj_gain").get_parameter_value().integer_value
         self._lookahead = g("servoj_lookahead").get_parameter_value().double_value
         self._speed     = g("speed_scale").get_parameter_value().double_value
@@ -1307,6 +1358,18 @@ class URServoController(Node):
         self._sentinel_warn_t = 0.0
         self._https_warn_t = 0.0     # throttle for refused-HTTPS log lines
         self._web_seen = {}          # client ip -> last-seen t (connect logging)
+        # WebRTC jog transport: a dedicated asyncio loop thread for aiortc —
+        # signaling requests hop onto it via run_coroutine_threadsafe. None =
+        # aiortc missing, /api/rtc answers 503 and the page stays on the WS.
+        self._rtc_pcs = set()
+        self._rtc_loop = None
+        if RTCPeerConnection is not None:
+            self._rtc_loop = asyncio.new_event_loop()
+            threading.Thread(target=self._rtc_loop.run_forever,
+                             daemon=True, name="ri-rtc").start()
+        else:
+            self.get_logger().warn(
+                "[web] aiortc not installed — jog runs WS-only (TCP)")
         self.create_subscription(ServoStatus, SERVO_STATUS_TOPIC, self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
@@ -1421,6 +1484,34 @@ class URServoController(Node):
                                       JOG_LEASE + LINK_LEASE_FACTOR * excess)
             self._link_scale = JOG_LEASE / self._link_lease
         return now
+
+    def _handle_jog_frame(self, data: bytes, st: dict) -> None:
+        """One binary jog frame from EITHER transport — the /ws read loop and
+        the RTC datachannel share this single decode path so every fail-safe
+        (jog-mode gate, NaN rejection, lease, link estimator) stays transport-
+        agnostic. `st` is per-connection state: the RTC channel is unordered/
+        no-retransmit by design, so frames carry a 7th element — a mod-2^16
+        sequence number — and a frame older than the newest seen is DROPPED
+        (a reordered pre-release twist must never resurrect motion after the
+        keyup zero). WS frames carry the seq too, but TCP ordering means the
+        check can never trip there."""
+        try:
+            v, _ = _cbor_decode(data)
+            if len(v) >= 7:
+                seq, last = int(v[6]) & 0xffff, st.get("seq")
+                if last is not None and (seq - last) & 0xffff >= 0x8000:
+                    return                     # older than the newest seen
+                st["seq"] = seq
+            if len(v) >= 6:                    # linear + rotation axes
+                self._apply_jog(*(float(x) for x in v[:6]))
+            elif len(v) >= 3:                  # legacy linear-only frame
+                self._apply_jog(float(v[0]), float(v[1]), float(v[2]))
+            else:                              # empty array = idle KEEPALIVE:
+                self._link_tick()              # estimator only — never the twist
+                                               # or its lease, so an idle second
+                                               # tab can't fight the active jog
+        except (ValueError, IndexError, TypeError):
+            pass
 
     def _tcp_pose(self):
         """Live pose of JOG_FRAME (tool0) in BASE_FRAME: ((x,y,z), (qx,qy,qz,qw))
@@ -1671,11 +1762,75 @@ class URServoController(Node):
             # _apply_jog for low latency.
             self._publish_twist()
 
+    # ── WebRTC jog transport (browser UDP) ──────────────────────────────────────
+    # The page opens an UNORDERED, NO-RETRANSMIT datachannel ("jog") carrying the
+    # same CBOR frames as /ws: on a lossy WAN path TCP queues stale twists behind
+    # retransmits (head-of-line blocking), UDP just loses them and the next frame
+    # arrives 33 ms later. Signaling is one POST /api/rtc (offer in, answer out —
+    # aiortc gathers ICE before answering, no trickle). The channel feeds
+    # _handle_jog_frame → the same jog-mode gate / lease / estimator / sentinel
+    # machinery: a new TRANSPORT, never a 2nd command path.
+
+    def _rtc_offer(self, body: dict, ip: str) -> dict | None:
+        """Blocking signaling entry, called from an HTTP handler thread."""
+        if self._rtc_loop is None:
+            return None
+        fut = asyncio.run_coroutine_threadsafe(
+            self._rtc_answer(str(body["sdp"]), str(body["type"]), ip),
+            self._rtc_loop)
+        return fut.result(timeout=10.0)
+
+    async def _rtc_answer(self, sdp: str, typ: str, ip: str) -> dict:
+        if len(self._rtc_pcs) >= RTC_MAX_PCS:
+            raise RuntimeError(f"{len(self._rtc_pcs)} peer connections open")
+        # Empty rtc_stun param = host candidates only (the loopback E2E uses it
+        # so an unreachable STUN server can't stall the answer).
+        pc = RTCPeerConnection(RTCConfiguration(
+            iceServers=[RTCIceServer(urls=self._rtc_stun)]
+                       if self._rtc_stun else []))
+        self._rtc_pcs.add(pc)
+        st = {}                                # per-connection seq state
+
+        @pc.on("datachannel")
+        def on_channel(ch):
+            # Unthrottled, like the WS jog stream: this is a CONTROL channel —
+            # knowing exactly who held it and when matters.
+            self.get_logger().info(f"[web] rtc jog stream connected from {ip}")
+
+            @ch.on("message")
+            def on_message(data):
+                if isinstance(data, (bytes, bytearray)):
+                    self._handle_jog_frame(bytes(data), st)
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            # "disconnected" can be transient (ICE consent blips) — only
+            # failed/closed is terminal. Mirrors the WS disconnect semantics:
+            # zero the jog, let the lease machinery do the rest.
+            if pc.connectionState in ("failed", "closed"):
+                self._rtc_pcs.discard(pc)
+                self.get_logger().info(
+                    f"[web] rtc jog stream disconnected from {ip} "
+                    f"({pc.connectionState})")
+                self._apply_jog(0.0, 0.0, 0.0)
+                await pc.close()
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=typ))
+        await pc.setLocalDescription(await pc.createAnswer())
+        # aiortc resolves setLocalDescription only after ICE gathering, so the
+        # localDescription below already carries the full candidate set.
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
     def _web_loop(self) -> None:
         node = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"              # required for the WS 101 upgrade
+            # Nagle + delayed ACK turns the 25 Hz /ws3d push into RTT-paced
+            # bursts once the link RTT exceeds the frame interval (VPN) —
+            # the twin stutters while the jog itself is fine (browsers
+            # already set TCP_NODELAY on their end of every WebSocket).
+            disable_nagle_algorithm = True
             def log_message(self, *_): pass
 
             def handle(self):
@@ -1804,6 +1959,22 @@ class URServoController(Node):
             def do_POST(self):
                 node._log_web_client(self._client_ip(), self.path,
                                      self.headers.get("User-Agent", ""))
+                if self.path.startswith("/api/rtc"):
+                    # WebRTC signaling: JSON offer in the body, JSON answer
+                    # back. Any failure (no aiortc, bad SDP, ICE trouble) is a
+                    # 503 — the page silently stays on the WS fallback.
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        ans = node._rtc_offer(json.loads(self.rfile.read(n)),
+                                              self._client_ip())
+                    except Exception as exc:
+                        node.get_logger().warn(f"[web] rtc offer failed: {exc}")
+                        ans = None
+                    if ans is None:
+                        self._send(b"rtc unavailable", code=503)
+                    else:
+                        self._send(json.dumps(ans).encode(), "application/json")
+                    return
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
                     if self.path.startswith("/api/set"):
@@ -1840,25 +2011,14 @@ class URServoController(Node):
                 if push:
                     threading.Thread(target=self._ws_push, args=(stop,),
                                      daemon=True, name="ri-ws3d").start()
+                st = {}                                    # per-connection seq state
                 try:
                     while True:
                         op, data = self._ws_read()
                         if op is None or op == 0x8:        # closed
                             break
                         if op == 0x2 and not push:         # binary frame = CBOR jog cmd
-                            try:
-                                v, _ = _cbor_decode(data)
-                                if len(v) >= 6:            # linear + rotation axes
-                                    node._apply_jog(*(float(x) for x in v[:6]))
-                                elif len(v) >= 3:          # legacy linear-only frame
-                                    node._apply_jog(float(v[0]), float(v[1]), float(v[2]))
-                                else:                      # empty array = idle KEEPALIVE:
-                                    node._link_tick()      # estimator only — never the
-                                                           # twist or its lease, so an
-                                                           # idle tab can't fight the
-                                                           # active tab's jog command
-                            except (ValueError, IndexError, TypeError):
-                                pass
+                            node._handle_jog_frame(data, st)
                 except Exception:
                     pass
                 stop.set()

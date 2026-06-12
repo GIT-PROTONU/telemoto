@@ -57,12 +57,31 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   serve time = real port); every WebSocket is pinned to `ws://` — live sliders (speed/stiffness/
   jog speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision
   & wall distance — pushed to `/servo_node` params), Base/Tool frame toggle,
-  WASD jog over a WebSocket (CBOR frames), and an **embedded 3D twin** (three.js
+  WASD jog over **UDP first** — a WebRTC datachannel (unordered/no-retransmit;
+  aiortc server-side on asyncio thread `ri-rtc`; signaling = one POST
+  `/api/rtc`, offer in/answer out; STUN via the `rtc_stun` param (default
+  Google, `''` = host-only) for the public-internet deployment, link line
+  shows `udp`/`tcp`) with the WebSocket as automatic
+  fallback (sole path when aiortc is missing → `/api/rtc` 503). Same CBOR
+  frames either way, now 7 elements: a mod-2^16 **seq** (7th) lets the server
+  drop reordered frames — a stale pre-release twist must never resurrect
+  motion after the keyup zero. Both transports feed ONE `_handle_jog_frame`,
+  so every jog fail-safe is transport-agnostic. The web server also sets
+  `disable_nagle_algorithm = True` (Nagle + delayed ACK turned the 25 Hz
+  /ws3d push into RTT-paced bursts on remote links). RTC E2E:
+  `pixi run python src/telamoto_bringup/test/test_rtc_jog_e2e.py`.
+  And an **embedded 3D twin** (three.js
   + urdf-loader vendored in `web/static/`; deep link `/#3d`). **Fullscreen
   layout is the default on EVERY device** (`<body class="fs">`; ✕ exits to the
   classic scroll page with full diagnostics): full-viewport 3D view, glassy top
-  bar (status dot, ping + auto-slow readout, walls/frame/rot/jog/⚙/exit, inline
-  jog-speed slider, collision-alert chip), **touch jog pads** overlaid bottom
+  bar (status dot, ping + udp/tcp transport + auto-slow readout,
+  walls/frame/⚙/exit, collision-alert chip — UI slimmed 2026-06-12: the inline
+  jog-speed slider is gone, jog speed lives only in the ⚙ tuning panel; the
+  **rot** toggle moved to the round CENTER pad of the jog grid (`#rotpad`,
+  deliberately NOT class `.jb` so pad handlers/halt-disabling skip it); the
+  jog enable button is gone — the page forces jog mode ON at load (always the
+  use case; the SERVER-side jog-mode gate still exists for API/tests)),
+  **touch jog pads** overlaid bottom
   (hold-to-jog buttons feeding the same `held` set + 30 Hz stream as the
   keyboard, so every jog fail-safe applies unchanged; labels follow the
   Base/Tool toggle; desktop shows the WASD key above each label), sliders in a
@@ -74,8 +93,11 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   frame ON, walls hidden. Twin: URDF from latched `/robot_description` via
   `/api/urdf`, meshes via `/pkg/<package>/<path>` (traversal-guarded), robot +
   planning-scene walls + TCP trail on a ~25 Hz binary `/ws3d` stream (send-only
-  — never touches the jog path or the link-jitter estimator); boxes with a side
-  >1.5 m render extra-faint. Fullscreen is CSS-fixed (iPhone Safari has no
+  — never touches the jog path or the link-jitter estimator); boxes large in
+  ≥2 dimensions (>1.5 m) render extra-faint — PANELS only: a slim tall box
+  like the base keep-out column stays at full 0.45 opacity (the old
+  any-side rule made the column near-invisible, found 2026-06-12).
+  Fullscreen is CSS-fixed (iPhone Safari has no
   element-fullscreen API; deep link `/#fs`). **Tilt-to-jog: REMOVED 2026-06-12**
   (the round center pad + deviceorientation handling are gone from the page);
   the server still accepts analog float axes (CBOR float32, clamped, non-finite
@@ -129,11 +151,13 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   domain 79): `pixi run python src/telamoto_bringup/test/test_selfcoll_e2e.py`
   — in tests always aggregate `/servo_node/status` over a window, never
   point-sample (a jittery feed interleaves NO_WARNING between collision codes).
-- **Jog fail-safes** (verified by fake-robot E2E): WS jog frames are ignored
-  server-side when jog mode is off; jog is hard-blocked whenever Servo's status is
-  >0.5 s stale (servo_node dead/not armed = no sentinel = no motion); web/param
-  tunables reject non-finite values; jog twist leases expire in 0.1 s.
-- **Laggy-link compensation** (remote/VPN jogging): the browser streams at a fixed
+- **Jog fail-safes** (verified by fake-robot E2E): jog frames (WS and RTC alike)
+  are ignored server-side when jog mode is off; jog is hard-blocked whenever
+  Servo's status is >0.5 s stale (servo_node dead/not armed = no sentinel = no
+  motion); web/param tunables reject non-finite values; jog twist leases expire
+  in 0.1 s; an RTC peer disconnect zeroes the twist like a WS drop.
+- **Laggy-link compensation** (remote jogging — the UI is used straight off the
+  public IP, user decision 2026-06-12, no VPN): the browser streams at a fixed
   30 Hz whenever jog mode is on — real `[lx,ly,lz]` frames while moving (+ one zero
   on stop), **1-byte CBOR empty-array KEEPALIVES while idle** (paused when the tab
   is hidden). Keepalives feed ONLY the link-jitter estimator — never the twist or

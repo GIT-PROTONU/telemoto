@@ -44,6 +44,9 @@ ros-jazzy-xacro              = "*"
 ros-jazzy-rviz2              = "*"
 colcon-common-extensions     = "*"
 colcon-mixin                 = "*"
+aiortc                       = "*"   # WebRTC datachannel = the browser's only UDP
+                                     # (jog stream over the public internet; WS is
+                                     # the fallback transport)
 
 # ---------------------------------------------------------------------------
 # Build tools

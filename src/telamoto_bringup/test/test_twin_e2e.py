@@ -133,6 +133,15 @@ except socket.timeout:
 tls.close()
 check("A TLS probe refused instantly", closed,
       "(plain server must close, not answer, a ClientHello)")
+# Abrupt mid-request reset (internet scanners do this constantly): must be
+# swallowed silently — socketserver used to dump a full traceback — and the
+# server must stay healthy.
+rst = socket.create_connection(("127.0.0.1", 8094), timeout=5)
+rst.sendall(b"GET / HTTP/1.1\r\nHost: x")                     # partial request…
+rst.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+rst.close()                                                   # …then a hard RST
+time.sleep(0.3)
+check("A survives mid-request RST", get("/")[0] == 200)
 
 st, _, body = get("/api/urdf")
 check("B /api/urdf", st == 200 and b"<robot name='t'>" in body, f"status={st}")

@@ -1291,6 +1291,7 @@ class URServoController(Node):
         self._servo_status_t = 0.0
         self._sentinel_warn_t = 0.0
         self._https_warn_t = 0.0     # throttle for refused-HTTPS log lines
+        self._web_seen = {}          # client ip -> last-seen t (connect logging)
         self.create_subscription(ServoStatus, SERVO_STATUS_TOPIC, self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
@@ -1677,7 +1678,17 @@ class URServoController(Node):
                 if first == b"\x16":
                     node._log_https_refused()
                     return                             # close → browser retries as http
-                super().handle()
+                try:
+                    super().handle()
+                except (ConnectionResetError, ConnectionAbortedError,
+                        BrokenPipeError, TimeoutError):
+                    pass    # client vanished mid-request — routine (scanners,
+                            # phones changing networks), not a server error;
+                            # socketserver would dump a full traceback otherwise
+
+            def _client_ip(self):
+                ip = self.client_address[0]
+                return ip[7:] if ip.startswith("::ffff:") else ip  # dual-stack v4
 
             def _send(self, body, ctype="text/plain", code=200, cache=False):
                 self.send_response(code)
@@ -1720,6 +1731,8 @@ class URServoController(Node):
                 self._send(body, ctype, cache=(rel != "viewer.js"))
 
             def do_GET(self):
+                node._log_web_client(self._client_ip(), self.path,
+                                     self.headers.get("User-Agent", ""))
                 if self.headers.get("Upgrade", "").lower() == "websocket":
                     if self.path == "/ws3d":
                         self._serve_ws(push=True)      # twin state stream (send-only)
@@ -1774,6 +1787,8 @@ class URServoController(Node):
                         "text/html; charset=utf-8")
 
             def do_POST(self):
+                node._log_web_client(self._client_ip(), self.path,
+                                     self.headers.get("User-Agent", ""))
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
                     if self.path.startswith("/api/set"):
@@ -1793,6 +1808,11 @@ class URServoController(Node):
             #         estimator (it never calls _apply_jog).
             def _serve_ws(self, push=False):
                 self.close_connection = True               # this socket is now a WS
+                # WS connects are logged UNthrottled: /ws is the jog CONTROL
+                # channel — knowing exactly who held it and when matters.
+                ip = self._client_ip()
+                kind = "3D-twin stream" if push else "jog stream"
+                node.get_logger().info(f"[web] {kind} connected from {ip}")
                 key = self.headers.get("Sec-WebSocket-Key", "")
                 accept = base64.b64encode(
                     hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
@@ -1827,6 +1847,7 @@ class URServoController(Node):
                 except Exception:
                     pass
                 stop.set()
+                node.get_logger().info(f"[web] {kind} disconnected from {ip}")
                 if not push:
                     node._apply_jog(0.0, 0.0, 0.0)         # stop on disconnect
 
@@ -2105,6 +2126,19 @@ class URServoController(Node):
             except OSError:
                 continue
         return "localhost"
+
+    def _log_web_client(self, ip: str, path: str, ua: str) -> None:
+        """One "client connected" line per IP per 10-min idle gap — a single
+        page load fires dozens of requests (assets, meshes, /api polls), so
+        per-request logging would be pure noise. Shows what they fetched first
+        and their browser; an unexpected IP here = check who has access."""
+        now = time.monotonic()
+        last = self._web_seen.get(ip)
+        self._web_seen[ip] = now
+        if last is None or now - last > 600.0:
+            self.get_logger().info(
+                f"[web] client connected: {ip} → {path}"
+                + (f" — {ua}" if ua else ""))
 
     def _log_https_refused(self) -> None:
         """Throttled notice that a TLS handshake hit the plain-HTTP web port."""

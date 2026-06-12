@@ -101,10 +101,13 @@ export function initTwin(container) {
   }
   loadRobot();
 
-  // ── planning-scene boxes (the draggable test wall) ─────────────────────
-  // Small obstacles stay clearly visible; large cage walls are made faint —
+  // ── planning-scene boxes (cage walls, base column, obstacles) ──────────
+  // Small obstacles stay clearly visible; large cage PANELS are made faint —
   // the camera usually looks at the robot THROUGH 2-3 of them, and stacked
-  // 0.45-opacity panels wash the whole scene out.
+  // 0.45-opacity panels wash the whole scene out. "Panel" = large in at
+  // least TWO dimensions: a slim tall box (the base keep-out column, only
+  // its HEIGHT exceeds the cutoff) never blocks the view and must stay
+  // clearly visible.
   const boxMat = new THREE.MeshStandardMaterial(
     { color: 0xc4a24a, transparent: true, opacity: 0.45, depthWrite: false });
   const cageMat = new THREE.MeshStandardMaterial(
@@ -130,7 +133,8 @@ export function initTwin(container) {
       m.scale.set(view.getFloat32(off + 28, true) || 1e-4,
                   view.getFloat32(off + 32, true) || 1e-4,
                   view.getFloat32(off + 36, true) || 1e-4);
-      m.material = Math.max(m.scale.x, m.scale.y, m.scale.z) > 1.5 ? cageMat : boxMat;
+      const mid = [m.scale.x, m.scale.y, m.scale.z].sort((a, b) => a - b)[1];
+      m.material = mid > 1.5 ? cageMat : boxMat;
     }
   }
 

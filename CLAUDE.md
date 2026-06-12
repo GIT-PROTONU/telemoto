@@ -84,10 +84,15 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   walls in the planning scene (`wall_front/back/left/right/top/floor`; defaults
   x ±0.8, y ±0.8, top 1.6, floor −0.03 m) — drag each along its normal via its
   RViz interactive marker (namespace `/scene_wall`) — plus a FIXED
-  **`wall_column`** (square, half-width `column_r` = 0.25 m, floor→top, on the
+  **`wall_column`** (square, half-width `column_r` = 0.18 m, floor→top, on the
   base z-axis, no marker): the shoulder-singularity keep-out (2026-06-12
   protective stop: TCP 0.28 m radial ⇒ qd 2.5 rad/s at a 100 mm/s command —
-  Servo's wrist-tuned singularity thresholds never fired there). Only the
+  Servo's wrist-tuned singularity thresholds never fired there). Full height
+  is correct (the singular locus is the whole vertical axis; the incident was
+  at z 1.1 m) — the RADIUS is the tuning knob: hard stop at the surface, the
+  wall-distance decel band then starts ≈0.28 m where it measurably turned
+  violent. Kept tight because the column also blocks PLANNED moves through
+  the core, which are joint-space and inherently safe near the axis. Only the
   WRIST links are checked against the column (base→forearm are ACM-allowed:
   near the axis at ordinary poses + a forearm sweeping over the base with the
   wrist out is well-conditioned). ⚠ The **floor** and the **column** are

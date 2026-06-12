@@ -143,7 +143,7 @@ if got is not None:
     dims = col.primitives[0].dimensions
     p = col.primitive_poses[0].position
     check("B column geometry on the axis",
-          abs(dims[0] - 0.5) < 1e-9 and abs(dims[1] - 0.5) < 1e-9
+          abs(dims[0] - 0.36) < 1e-9 and abs(dims[1] - 0.36) < 1e-9
           and abs(dims[2] - 1.63) < 1e-9 and abs(p.x) < 1e-9 and abs(p.y) < 1e-9
           and abs(p.z - (1.6 - 0.03) / 2) < 1e-9,
           f"dims={list(dims)} center z={p.z:.3f}")

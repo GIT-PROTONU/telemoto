@@ -104,10 +104,15 @@ class SceneWall(Node):
         self.declare_parameter("thickness", 0.05)
         self.declare_parameter("include_floor", True)
         # Base keep-out column half-width [m]: square column centered on the
-        # base axis, floor→top. Sized so the WRIST point stays out of the
-        # amplification zone (measured: TCP 0.28 m radial ⇒ qd 2.5 rad/s at a
-        # 100 mm/s command). 0 disables.
-        self.declare_parameter("column_r", 0.25)
+        # base axis, floor→top (the singular locus is the whole vertical axis —
+        # height is NOT the tuning knob, the radius is). Sized so Servo's hard
+        # stop sits at the column surface and the decel band (wall-distance
+        # slider, ~0.1 m) begins right where amplification was MEASURED to turn
+        # violent: TCP 0.28 m radial ⇒ qd 2.5 rad/s at a 100 mm/s command
+        # (2026-06-12). 0 disables. NB the column also blocks PLANNED moves
+        # through the core (collateral: they are joint-space and safe near the
+        # axis) — keep the radius tight for that reason too.
+        self.declare_parameter("column_r", 0.18)
         # Dragged wall poses persist here over restarts/reboots ("" = disable).
         self.declare_parameter("pose_file", "~/.ros/telamoto_cage_poses.yaml")
 

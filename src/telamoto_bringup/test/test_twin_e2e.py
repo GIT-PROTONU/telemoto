@@ -112,6 +112,27 @@ check("A fullscreen bar + deep links (tilt pad removed)",
       and b'location.hash==="#fs"' in body and b"deviceorientation" not in body)
 check("A wall-visibility toggles",
       b'id="wallbtn"' in body and b'id="fswalls"' in body)
+# The UI is plain-HTTP-only by design: the page must carry the https→http
+# bounce with the REAL configured port injected (8094 here, not the 8080
+# default), every WebSocket must be pinned to ws://, and a TLS handshake
+# against the port must be closed immediately (that fast failure is what
+# makes a browser's HTTPS-First mode fall back to http).
+check("A https bounce with injected port",
+      b'location.protocol==="https:"' in body
+      and b':8094"+location.pathname' in body and b"__WEB_PORT__" not in body)
+check("A WebSockets pinned to ws://",
+      b'"ws://"+location.host' in body and b"wss://" not in body
+      and b"'ws://' + location.host" in get("/static/viewer.js")[2])
+tls = socket.create_connection(("127.0.0.1", 8094), timeout=5)
+tls.sendall(bytes([0x16, 0x03, 0x01, 0x00, 0x05]) + b"hello")  # fake ClientHello
+tls.settimeout(3)
+try:
+    closed = tls.recv(64) == b""
+except socket.timeout:
+    closed = False
+tls.close()
+check("A TLS probe refused instantly", closed,
+      "(plain server must close, not answer, a ClientHello)")
 
 st, _, body = get("/api/urdf")
 check("B /api/urdf", st == 200 and b"<robot name='t'>" in body, f"status={st}")

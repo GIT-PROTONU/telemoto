@@ -2,6 +2,7 @@
 
 Fake hardware (default):  pixi run twin
 Real robot:               pixi run twin-real
+                          (append launch_rviz:=false for headless jog-tuning)
 
 Fake mode — full ros2_control stack (no robot needed):
   ur_control.launch.py    ur_robot_driver mock + controllers
@@ -28,7 +29,12 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    AndSubstitution,
+    LaunchConfiguration,
+    NotSubstitution,
+    PathJoinSubstitution,
+)
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -52,11 +58,16 @@ def generate_launch_description():
             "initial_joint_controller",
             default_value="scaled_joint_trajectory_controller",
         ),
+        DeclareLaunchArgument(
+            "launch_rviz", default_value="true",
+            description="false = headless (jog-tuning via the web UI only)",
+        ),
     ]
 
     robot_ip           = LaunchConfiguration("robot_ip")
     use_mock_hardware  = LaunchConfiguration("use_mock_hardware")
     initial_joint_ctrl = LaunchConfiguration("initial_joint_controller")
+    launch_rviz        = LaunchConfiguration("launch_rviz")
 
     # ═══════════════════════════════════════════════════════════════════════
     # FAKE MODE
@@ -169,7 +180,8 @@ def generate_launch_description():
             # dies with "launch configuration 'warehouse_sqlite_path' does not
             # exist" when the handler finally fires.
             ur_moveit_fake,
-            TimerAction(period=8.0, actions=[_rviz(fake=True)],  condition=IfCondition(use_mock_hardware)),
+            TimerAction(period=8.0, actions=[_rviz(fake=True)],
+                        condition=IfCondition(AndSubstitution(launch_rviz, use_mock_hardware))),
             # Real mode
             ur_rsp_real,
             rtde_joint_pub,
@@ -177,6 +189,7 @@ def generate_launch_description():
             TimerAction(period=3.0,  actions=[ur_moveit_real],     condition=UnlessCondition(use_mock_hardware)),
             # 15 s gives move_group time to receive /joint_states and publish
             # a populated planning scene so the goal marker starts at the real pose.
-            TimerAction(period=15.0, actions=[_rviz(fake=False)],  condition=UnlessCondition(use_mock_hardware)),
+            TimerAction(period=15.0, actions=[_rviz(fake=False)],
+                        condition=IfCondition(AndSubstitution(launch_rviz, NotSubstitution(use_mock_hardware)))),
         ]
     )

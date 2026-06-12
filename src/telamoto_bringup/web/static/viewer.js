@@ -160,8 +160,9 @@ export function initTwin(container) {
   let ws = null, closed = false;
   function wsOpen() {
     if (closed) return;
-    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://')
-                       + location.host + '/ws3d');
+    // ws:// unconditionally — the UI is plain HTTP by design and the page
+    // redirects itself off https before this module ever loads.
+    ws = new WebSocket('ws://' + location.host + '/ws3d');
     ws.binaryType = 'arraybuffer';
     ws.onmessage = ev => {
       const v = new DataView(ev.data);

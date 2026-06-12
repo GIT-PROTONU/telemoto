@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Wait for ur_robot_driver to listen on port 50001, then play ext.urp via Dashboard Server.
+"""Play ext.urp via the Dashboard Server (port 29999) once the script-sender is up.
+
+Manual convenience: replaces pressing Play on the pendant. Waits until the
+local script-sender (ur_servo_controller.py's reverse port) is listening so the
+External Control URCap has something to fetch, then loads + plays the program.
 
 Usage: ur_dashboard_autoplay.py <robot_ip> [program_name] [reverse_port]
 Defaults: robot_ip=192.168.10.2  program=ext.urp  reverse_port=50001
@@ -10,7 +14,7 @@ import time
 
 
 def wait_for_driver(port: int, timeout: float = 60.0) -> bool:
-    """Block until ur_robot_driver opens its reverse-connection port."""
+    """Block until the controller's script-sender opens its reverse port."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -64,16 +68,16 @@ def main() -> None:
     prog         = sys.argv[2] if len(sys.argv) > 2 else "ext.urp"
     reverse_port = int(sys.argv[3]) if len(sys.argv) > 3 else 50001
 
-    print(f"[autoplay] waiting for driver on port {reverse_port} ...", flush=True)
+    print(f"[autoplay] waiting for the script-sender on port {reverse_port} ...", flush=True)
     if not wait_for_driver(reverse_port, timeout=60.0):
         print(
-            f"[autoplay] ERROR: ur_robot_driver never opened port {reverse_port} after 60 s.\n"
-            "           Check that on_configure() succeeded (look for recipe_id errors above).",
+            f"[autoplay] ERROR: nothing listening on port {reverse_port} after 60 s.\n"
+            "           Is the bringup (ur_servo_controller.py) running?",
             file=sys.stderr, flush=True,
         )
         sys.exit(1)
 
-    print(f"[autoplay] driver ready — playing {prog} on {ip}", flush=True)
+    print(f"[autoplay] script-sender ready — playing {prog} on {ip}", flush=True)
     try:
         dashboard_play(ip, prog)
         print(f"[autoplay] {prog} started", flush=True)

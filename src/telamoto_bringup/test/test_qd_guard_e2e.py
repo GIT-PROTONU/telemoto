@@ -19,6 +19,10 @@ TF / joint states (with synthetic actual_qd) / fresh ServoStatus, verifying:
   Q7  escape with elevated qd (1.2 rad/s — would have latched a fresh tap) keeps
       running under the raised escape allowance/latch line
   Q8  5 cm of TCP travel clears the block; the inward direction works again
+  S1  a singularity halt mid-jog captures the approach dir (singAxis in
+      /api/state — drives the web escape-pad UI) and zeroes the stream
+  S2  a sentinel feed flap mid-escape must NOT invert the captured direction
+  S3  the halt clearing drops singAxis
 
 The 2026-06-12 boundary-stall trip is the regression scenario: allowance computed
 from the pre-gate target let qd reach 3.2 rad/s → UR protective stop.
@@ -61,11 +65,12 @@ helper.create_service(ServoCommandType, "/servo_node/switch_command_type",
 
 QD = [0.0]                      # synthetic measured joint speed, mutated per phase
 POS = [0.5]                     # synthetic TCP x (TF), mutated to simulate travel
+CODE = [ServoStatus.NO_WARNING]  # synthetic Servo verdict, mutated per phase
 
 
 def feeder():
     """30 Hz: joint states (with synthetic actual_qd), TF base_link→tool0,
-    fresh NO_WARNING ServoStatus — everything the jog stack needs to run."""
+    fresh ServoStatus (CODE) — everything the jog stack needs to run."""
     while rclpy.ok():
         m = JointState()
         m.header.stamp = helper.get_clock().now().to_msg()
@@ -80,7 +85,7 @@ def feeder():
         t.transform.translation.x, t.transform.translation.z = POS[0], 0.5
         t.transform.rotation.w = 1.0
         tf_pub.publish(TFMessage(transforms=[t]))
-        st_pub.publish(ServoStatus(code=ServoStatus.NO_WARNING))
+        st_pub.publish(ServoStatus(code=CODE[0]))
         time.sleep(1 / 30)
 
 
@@ -271,6 +276,43 @@ mag = sum(speedl) / max(1, len(speedl))
 check("Q8 travel clears block -> inward ok", ax is None and len(speedl) > 10
       and mag > 0.05, f"qdBlockAxis={ax} mean={mag*1000:.1f}mm/s")
 VEC[0] = 0
+time.sleep(0.5)
+
+# S1 ── singularity halt mid-jog: approach dir captured for the web escape UI ─
+VEC[0] = 1
+time.sleep(0.8)                                   # ramp up, _last_lin fresh
+CODE[0] = ServoStatus.HALT_FOR_SINGULARITY
+time.sleep(0.6)
+st = state()
+sm = recent()
+mags = [m for _, mode, m in sm if mode == usc.MODE_SPEEDL]
+check("S1 sing halt captures approach dir",
+      st["servoCode"] == int(ServoStatus.HALT_FOR_SINGULARITY)
+      and st["singAxis"] == "+X" and (not mags or max(mags) < 1e-6),
+      f"servoCode={st['servoCode']} singAxis={st['singAxis']} "
+      f"maxlin={max(mags) if mags else 0:.6f}")
+
+# S2 ── feed flap mid-escape must NOT invert the captured direction ───────────
+# A jittery sentinel can interleave clears between halt codes; re-capturing
+# from the ESCAPE stream would flip singAxis and the web UI would disable the
+# very pad backing the arm out (_halt_dir anti-inversion guard).
+VEC[0] = -1                                       # escaping
+CODE[0] = ServoStatus.NO_WARNING                  # brief clear…
+time.sleep(0.4)
+CODE[0] = ServoStatus.HALT_FOR_SINGULARITY        # …flaps back mid-escape
+time.sleep(0.6)
+st = state()
+check("S2 flap mid-escape keeps inward dir", st["singAxis"] == "+X",
+      f"singAxis={st['singAxis']} (escape stream was -X)")
+
+# S3 ── halt clears -> hint gone ──────────────────────────────────────────────
+CODE[0] = ServoStatus.NO_WARNING
+VEC[0] = 0
+time.sleep(0.6)
+st = state()
+check("S3 clear drops singAxis",
+      st["singAxis"] is None and st["servoCode"] == int(ServoStatus.NO_WARNING),
+      f"singAxis={st['singAxis']} servoCode={st['servoCode']}")
 
 print("RESULT: " + ("ALL PASS" if fails == 0 else f"{fails} FAILED"))
 node.destroy_node()

@@ -621,6 +621,13 @@ _WEB_PAGE = """<!doctype html>
  "three/examples/jsm/loaders/ColladaLoader.js":"/static/ColladaLoader.js"}}
 </script>
 <script>
+ // The UI is plain HTTP by DESIGN (LAN/VPN, no certs — see CLAUDE.md). If an
+ // HTTPS proxy or a browser upgrade ever lands us here over https, bounce to
+ // the http origin (the jog/twin WebSockets are pinned to ws:// and would be
+ // mixed-content-blocked under https anyway). __WEB_PORT__ is injected by the
+ // server at serve time = the real configured port.
+ if(location.protocol==="https:")
+   location.replace("http://"+location.hostname+":__WEB_PORT__"+location.pathname+location.hash);
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
    jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" m/s\\u00b2",
    jrspeed:v=>Math.round(+v*57.2958)+"\\u00b0/s",
@@ -676,6 +683,14 @@ _WEB_PAGE = """<!doctype html>
  function escHint(axis){
    const info=escInfo[axis];if(!info)return null;
    return isMobile?"tap <b>"+info.pad+"</b>":"press <b>"+info.key+"</b>";}
+ // Escape info for backing out along base-frame `axis`: hint text (pointing
+ // tool-frame users at the Base toggle first — escape keys are base-frame)
+ // + the key for setPadBlock. null when the axis is unknown.
+ function escOut(axis){
+   const h=escHint(axis);if(!h)return null;
+   const base=document.getElementById("basef").checked;
+   return {hint:(base?h:"switch to <b>Base frame</b> and "+h)+" to back out",
+     key:(escInfo[axis]||{}).key?.toLowerCase()??null};}
  // Disable all pad buttons except escKey (lowercase); re-enable all when escKey=null.
  // Also evicts any blocked key from `held` so a held-button mid-halt stops instantly.
  // Pads are compared via their EFFECTIVE key (padKey): in rotate mode every pad
@@ -693,25 +708,29 @@ _WEB_PAGE = """<!doctype html>
    let msg="",cls="",escKey=null;
    if(s.collBlocked&&s.collAxis){
      const wall=fmtWall(s.collWall)||"collision";   // no wall that way = e.g. self-collision
-     const dir=axLabel[s.collAxis]||s.collAxis;
-     const baseMode=document.getElementById("basef").checked;
-     const h=escHint(s.collAxis);
-     const hint=h?(baseMode?h+" to back out":"switch to <b>Base frame</b> and "+h+" to back out"):null;
-     msg="\\u26D4 "+wall+" ("+dir+")"+(hint?" &mdash; "+hint:"");cls="halt";
-     escKey=(escInfo[s.collAxis]||{}).key?.toLowerCase()??null;}
+     const e=escOut(s.collAxis);
+     msg="\\u26D4 "+wall+" ("+(axLabel[s.collAxis]||s.collAxis)+")"
+       +(e?" &mdash; "+e.hint:"");cls="halt";escKey=e?.key??null;}
    else if(s.collBlocked){
      const near=fmtWall(s.nearWall);
      msg="\\u26D4 collision"+(near?" &mdash; nearest: "+near:"")
        +(isMobile?" &mdash; jog any direction to back out":" &mdash; jog any direction, or move wall in RViz");
      cls="halt";}
+   else if(s.servoCode===2&&s.singAxis){
+     // HALT_FOR_SINGULARITY with the approach direction captured (the JOG drove
+     // in, so the halt fired at the boundary): same UI as a wall hit \\u2014 name the
+     // direction and disable every pad except the escape. The reverse jog really
+     // moves: Servo re-evaluates it as DECELERATE_FOR_LEAVING (\\u00d70.25) because
+     // the sentinel feed is pre-gate.
+     const e=escOut(s.singAxis);
+     msg="\\u26D4 singularity ("+(axLabel[s.singAxis]||s.singAxis)+")"
+       +(e?" &mdash; "+e.hint:"");cls="halt";escKey=e?.key??null;}
    else if(s.servoCode===2){
-     // HALT_FOR_SINGULARITY (gate \\u00d70). Shown even with nothing held \\u2014 the pose
-     // itself is the condition and the operator must know why the pads are dead.
-     // Servo is direction-aware: when the JOG drove in, the halt fires at the
-     // boundary and the reverse jog passes as DECELERATE_FOR_LEAVING (\\u00d70.25).
-     // A DEEP halt (arm parked near the singularity by a planned move) blocks
-     // every direction \\u2014 only a planned move (RViz) gets out. Pads stay enabled:
-     // Servo arbitrates which direction may leave, we can't know it client-side.
+     // DEEP singularity halt (no approach direction \\u2014 the arm was parked here
+     // by a planned move): EVERY direction halts by design and only a planned
+     // move gets out. Shown even with nothing held \\u2014 the pose itself is the
+     // condition. Pads stay enabled: Servo arbitrates which direction may
+     // leave, we can't know it client-side.
      msg="\\u26D4 singularity \\u2014 jog halted; reverse to back out"
        +" (if stuck: planned move in RViz)";cls="halt";}
    else if(s.qdLatch){
@@ -721,13 +740,11 @@ _WEB_PAGE = """<!doctype html>
        +" AWAY from the boundary";cls="halt";}
    else if(s.qdBlockAxis){
      // Post-latch directional block: only the inward cone is dead; the
-     // opposite direction escapes with a relaxed guard, lateral moves pass.
-     const dir=axLabel[s.qdBlockAxis]||s.qdBlockAxis;
-     const baseMode=document.getElementById("basef").checked;
-     const h=escHint(s.qdBlockAxis);
-     const hint=h?(baseMode?h+" to back out":"switch to <b>Base frame</b> and "+h+" to back out"):null;
-     msg="\\u26A0 singularity boundary \\u2014 "+dir+" blocked"
-       +(hint?"; "+hint:"")+" (clears after 5 cm of travel)";cls="warn";}
+     // opposite direction escapes with a relaxed guard, lateral moves pass
+     // \\u2014 so pads stay enabled here (no escKey), unlike the full halts.
+     const e=escOut(s.qdBlockAxis);
+     msg="\\u26A0 singularity boundary \\u2014 "+(axLabel[s.qdBlockAxis]||s.qdBlockAxis)
+       +" blocked"+(e?"; "+e.hint:"")+" (clears after 5 cm of travel)";cls="warn";}
    else if((held.size>0||wasMoving)&&s.servoGate!=null&&s.servoGate<1.0){
      // wasMoving covers the just-stopped frame. servoCode picks the
      // honest reason: 4=collision decel (scene OR self), 1/3=singularity, 6=bound.
@@ -781,7 +798,9 @@ _WEB_PAGE = """<!doctype html>
      ax:c((held.has("i")?1:0)-(held.has("k")?1:0)),
      ay:c((held.has("j")?1:0)-(held.has("l")?1:0)),
      az:c((held.has("u")?1:0)-(held.has("o")?1:0))};}
- function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
+ // ws:// unconditionally: the page redirects itself off https (top of script),
+ // so a wss branch would only mask a misconfigured proxy.
+ function wsOpen(){ws=new WebSocket("ws://"+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
  function cborInt(n){n=Math.round(n);const m=n<0?0x20:0x00,u=n<0?-1-n:n;
@@ -1252,13 +1271,18 @@ class URServoController(Node):
                                      # post-latch directional block (QD_BLOCK_*)
         self._qd_block_log_t = 0.0
         self._code_log_t = 0.0       # throttle for same-gate status-code changes
-        # Collision-halt escape state: the base_link-frame jog linear command last
-        # streamed (pre-gate) + its time, the captured approach direction while
-        # halted-for-collision (None = no escape allowed), and a log throttle.
+        # Halt-escape state: the base_link-frame jog linear command last
+        # streamed (pre-gate) + its time, the approach direction captured at a
+        # collision/singularity halt (None = no escape direction known), the
+        # just-cleared direction (anti-inversion guard in _halt_dir), and a
+        # log throttle.
         self._last_lin = (0.0, 0.0, 0.0)
         self._last_lin_t = 0.0
         self._coll_block_dir = None
+        self._coll_prev = None        # (dir, t) at the last collision-halt clear
         self._coll_near_wall = None   # wall name at last collision halt
+        self._sing_block_dir = None   # approach dir at a singularity halt (web UI
+        self._sing_prev = None        # escape hint only — Servo gates the motion)
         self._servo_code = ServoStatus.NO_WARNING
         self._escape_log_t = 0.0
         # Sentinel liveness: jog is only allowed while Servo's status is FRESH.
@@ -1266,6 +1290,7 @@ class URServoController(Node):
         # servo_node fails SAFE (gate 0) instead of coasting on the last verdict.
         self._servo_status_t = 0.0
         self._sentinel_warn_t = 0.0
+        self._https_warn_t = 0.0     # throttle for refused-HTTPS log lines
         self.create_subscription(ServoStatus, SERVO_STATUS_TOPIC, self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
         ActionServer(
@@ -1637,6 +1662,23 @@ class URServoController(Node):
             protocol_version = "HTTP/1.1"              # required for the WS 101 upgrade
             def log_message(self, *_): pass
 
+            def handle(self):
+                # The UI is plain HTTP by design. A browser auto-upgrading to
+                # HTTPS (HTTPS-First mode / stale HSTS / a typed https://) opens
+                # a TLS handshake here — first byte 0x16 (ClientHello), which
+                # the plain server can't answer. Close immediately: a FAST TLS
+                # failure is exactly what makes the browser fall back to
+                # http:// on its own; parsing it as a request would instead
+                # stall the upgrade and show a cryptic 400. Log the right URL.
+                try:
+                    first = self.connection.recv(1, socket.MSG_PEEK)
+                except OSError:
+                    return
+                if first == b"\x16":
+                    node._log_https_refused()
+                    return                             # close → browser retries as http
+                super().handle()
+
             def _send(self, body, ctype="text/plain", code=200, cache=False):
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
@@ -1722,11 +1764,14 @@ class URServoController(Node):
                         "qdBlockAxis": node._dominant_axis(node._qd_block_dir),
                         "collBlocked": node._servo_code == ServoStatus.HALT_FOR_COLLISION,
                         "collWall": node._coll_near_wall,
-                        "collAxis": node._approach_axis(),
+                        "collAxis": node._dominant_axis(node._coll_block_dir),
+                        "singAxis": node._dominant_axis(node._sing_block_dir),
                         "nearWall": near_wall}).encode(),
                         "application/json")
                 else:
-                    self._send(_WEB_PAGE.encode(), "text/html; charset=utf-8")
+                    self._send(_WEB_PAGE.replace(
+                        "__WEB_PORT__", str(node._web_port)).encode(),
+                        "text/html; charset=utf-8")
 
             def do_POST(self):
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1939,9 +1984,25 @@ class URServoController(Node):
                 best_d, best = d, wid
         return (best, best_d) if best is not None else None
 
-    def _approach_axis(self) -> str | None:
-        """Dominant base-frame axis of the captured collision-approach direction."""
-        return self._dominant_axis(self._coll_block_dir)
+    def _halt_dir(self, prev):
+        """Approach direction for a halt that just fired: the normalized last
+        streamed jog command. `prev` is the (dir, t) remembered when the same
+        halt class last cleared: a jittery sentinel feed can flap halt↔clear
+        mid-escape, and re-capturing then would record the ESCAPE direction as
+        "inward" — inverting the block and disabling the very pad backing the
+        arm out. If the fresh direction opposes a direction cleared moments
+        ago, the remembered inward direction is restored instead."""
+        lx, ly, lz = self._last_lin
+        mag = math.sqrt(lx * lx + ly * ly + lz * lz)
+        if mag <= 1e-6:
+            return None
+        d = (lx / mag, ly / mag, lz / mag)
+        if prev is not None:
+            pd, pt = prev
+            if (time.monotonic() - pt < 2.0
+                    and d[0] * pd[0] + d[1] * pd[1] + d[2] * pd[2] <= -0.5):
+                return pd
+        return d
 
     @staticmethod
     def _dominant_axis(bd) -> str | None:
@@ -1968,20 +2029,22 @@ class URServoController(Node):
         else:
             gate = 0.25
         self._servo_status_t = time.monotonic()
-        # Collision-halt escape bookkeeping. Capture the approach direction ONLY on
-        # the transition into the halt, and only if a jog was actually streaming
-        # (≤0.5 s old) — a halt that appears while idle (e.g. the wall dragged onto
-        # the robot in RViz) has no trustworthy "out" direction, so it stays fully
-        # blocked: fix the scene instead. Cleared as soon as Servo reports anything
-        # other than a collision halt (= the model separated).
+        # Halt-escape bookkeeping (collision AND singularity). Capture the approach
+        # direction ONLY on the transition into the halt, and only if a jog was
+        # actually streaming (≤0.5 s old) — a halt that appears while idle (e.g.
+        # the wall dragged onto the robot in RViz, or a planned move parking the
+        # arm deep in a singular zone) has no trustworthy "out" direction, so no
+        # escape hint: fix the scene / plan out instead. Cleared as soon as Servo
+        # reports anything other than that halt class. The collision direction
+        # also relaxes the gate for opposing commands (jog loop); the singularity
+        # direction is a WEB-UI HINT only — Servo itself re-evaluates the reversed
+        # twist as DECELERATE_FOR_LEAVING (the sentinel feed is pre-gate).
         prev, self._servo_code = self._servo_code, msg.code
+        jog_fresh = time.monotonic() - self._last_lin_t < 0.5
         if msg.code == ServoStatus.HALT_FOR_COLLISION:
-            if (prev != ServoStatus.HALT_FOR_COLLISION
-                    and time.monotonic() - self._last_lin_t < 0.5):
-                lx, ly, lz = self._last_lin
-                mag = math.sqrt(lx * lx + ly * ly + lz * lz)
-                if mag > 1e-6:
-                    self._coll_block_dir = (lx / mag, ly / mag, lz / mag)
+            if prev != ServoStatus.HALT_FOR_COLLISION and jog_fresh:
+                self._coll_block_dir = self._halt_dir(self._coll_prev)
+                if self._coll_block_dir is not None:
                     # Name the wall the jog was moving TOWARD — but only if it is
                     # plausibly close (a self-collision halt must not get blamed
                     # on some distant wall that happens to lie ahead).
@@ -1993,9 +2056,21 @@ class URServoController(Node):
                         "[jog] collision halt — approach dir captured, jog the "
                         "OPPOSITE way to back out (×%.2f crawl)" % COLL_ESCAPE_GATE)
         elif self._coll_block_dir is not None:
+            self._coll_prev = (self._coll_block_dir, time.monotonic())
             self._coll_block_dir = None
             self._coll_near_wall = None
             self.get_logger().info("[jog] collision cleared — full jog restored")
+        if msg.code == ServoStatus.HALT_FOR_SINGULARITY:
+            if prev != ServoStatus.HALT_FOR_SINGULARITY and jog_fresh:
+                self._sing_block_dir = self._halt_dir(self._sing_prev)
+                if self._sing_block_dir is not None:
+                    self.get_logger().warn(
+                        "[jog] singularity halt — approach dir captured, jog the "
+                        "OPPOSITE way to back out (Servo crawls it ×0.25)")
+        elif self._sing_block_dir is not None:
+            self._sing_prev = (self._sing_block_dir, time.monotonic())
+            self._sing_block_dir = None
+            self.get_logger().info("[jog] singularity halt cleared")
         if gate != self._servo_gate:
             self._servo_gate = gate
             self.get_logger().warn(
@@ -2030,6 +2105,15 @@ class URServoController(Node):
             except OSError:
                 continue
         return "localhost"
+
+    def _log_https_refused(self) -> None:
+        """Throttled notice that a TLS handshake hit the plain-HTTP web port."""
+        now = time.monotonic()
+        if now - self._https_warn_t > 5.0:
+            self._https_warn_t = now
+            self.get_logger().warn(
+                "[web] HTTPS connection attempt refused — the tuning UI is "
+                f"plain HTTP only: http://{self._pc_ip()}:{self._web_port}")
 
     def _serve_script(self, conn, addr) -> None:
         host = self._pc_ip()
@@ -2340,7 +2424,9 @@ class URServoController(Node):
                     # genuinely opposing the captured approach direction passes at
                     # the crawl gate so the operator can back out of the (virtual)
                     # wall. Anything else stays hard-blocked. Singularity halts
-                    # never set _coll_block_dir, so they are unaffected.
+                    # never set _coll_block_dir, so they are unaffected here —
+                    # their captured direction (_sing_block_dir) is a web-UI hint
+                    # only; Servo itself lets the reverse out (pre-gate feed).
                     g_servo = self._servo_gate
                     # SENTINEL LIVENESS: with the steady 50 Hz feed Servo verdicts
                     # arrive continuously; a silent sentinel (servo_node dead, not

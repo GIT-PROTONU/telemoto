@@ -46,7 +46,11 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   conventions not yet verified on the real robot — first jog at LOW speed. E2E:
   `pixi run python src/telamoto_bringup/test/test_rot_jog_e2e.py`.
 - **Web tuning UI** on `http://<pc>:8080` (IPv6 dual-stack; comes up with the
-  robot OFF too — `_pc_ip()` must never raise) — live sliders (speed/stiffness/
+  robot OFF too — `_pc_ip()` must never raise). **Plain HTTP ONLY by design**
+  (no certs on the LAN/VPN): a TLS hello on the port is closed instantly so a
+  browser's HTTPS-First falls back to http on its own (throttled log names the
+  http URL); the page bounces itself off https (`__WEB_PORT__` injected at
+  serve time = real port); every WebSocket is pinned to `ws://` — live sliders (speed/stiffness/
   jog speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision
   & wall distance — pushed to `/servo_node` params), Base/Tool frame toggle,
   WASD jog over a WebSocket (CBOR frames), and an **embedded 3D twin** (three.js
@@ -74,7 +78,7 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   rejected) in the jog frame, so an analog input source can return without a
   protocol change. E2E (incl. headless-Chromium render):
   `pixi run python src/telamoto_bringup/test/test_twin_e2e.py`.
-- **Collision cage**: `scene_wall.py` (launched by both bringups) puts six movable
+- **Collision cage**: `scene_wall.py` (launched in both twin modes) puts six movable
   walls in the planning scene (`wall_front/back/left/right/top/floor`; defaults
   x ±0.8, y ±0.8, top 1.6, floor −0.03 m) — drag each along its normal via its
   RViz interactive marker (namespace `/scene_wall`). ⚠ The **floor** is published
@@ -162,11 +166,16 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   servo_node, isolated domain 75): approach decel band → gate ×0.25, hard stop
   → gate ×0. Servo is direction-aware: a halt the JOG caused fires at the
   boundary, where the reversed twist re-evaluates as DECELERATE_FOR_LEAVING
-  (×0.25) — the escape works because the sentinel feed is PRE-gate. Deep in
-  the singular zone (reachable only by a planned move) EVERY direction halts —
-  deliberate, recover with a planned move; the web banner says all of this
-  (code 2 = halt-class banner, pads stay enabled, Servo arbitrates the way
-  out). ⚠ E2E flake: this host (realtime kernel) intermittently blacks out
+  (×0.25) — the escape works because the sentinel feed is PRE-gate. A halt the
+  JOG caused captures the approach direction (`singAxis` in `/api/state`;
+  `_halt_dir` is anti-inversion-guarded against sentinel-feed flaps mid-escape
+  and shared with the collision capture) → wall-style escape UI: the banner
+  names the direction + escape key/pad, all pads disabled except the escape
+  (UI hint only — Servo still gates the motion). Deep in the singular zone
+  (reachable only by a planned move) EVERY direction halts and no direction is
+  captured — deliberate, recover with a planned move; banner says so, pads stay
+  enabled, Servo arbitrates the way out. Capture E2E: S1–S3 in
+  test_qd_guard_e2e.py. ⚠ E2E flake: this host (realtime kernel) intermittently blacks out
   loopback-UDP delivery into a fresh servo_node for tens of seconds (both
   RMWs; `grep Udp: /proc/net/snmp` RcvbufErrors climbs; also hits
   test_selfcoll_e2e.py) — the tests gate/resync on observed tracking and
@@ -184,9 +193,10 @@ pull-loop and logs `PROTECTIVE STOP`, classified MID-MOTION / ON-RELEASE / IDLE.
 ## Common commands
 ```bash
 pixi run build            # colcon build (RelWithDebInfo)
-pixi run bringup-fake     # launch with mock hardware, no physical robot
-pixi run bringup robot_ip:=192.168.10.2   # real robot (add launch_rviz:=false when jog-tuning)
+pixi run twin             # launch with mock hardware, no physical robot
+pixi run twin-real        # real robot (add launch_rviz:=false when jog-tuning)
 pixi run rviz             # RViz2 + MoveIt2 plugin only
+pixi run tune             # open the :8080 web tuning UI
 pixi run shell            # sourced bash shell inside the pixi env
 ```
 
@@ -216,4 +226,5 @@ Before first use on the real robot, extract the calibration:
 ros2 launch ur_calibration calibration_correction.launch.py \
   robot_ip:=192.168.1.10 target_filename:=config/ur10_calibration.yaml
 ```
-Then pass `kinematics_params_file` in `ur10_bringup.launch.py`.
+`digital_twin.launch.py` picks up `config/ur10_calibration.yaml` automatically
+when the file exists.

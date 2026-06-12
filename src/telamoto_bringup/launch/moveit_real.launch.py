@@ -85,6 +85,14 @@ def generate_launch_description():
         package="moveit_ros_move_group",
         executable="move_group",
         output="screen",
+        # Robot-off cold start: with no RTDE there are no /joint_states, the
+        # planning scene monitor times out (wait_for_initial_state_timeout)
+        # and move_group exits FATAL — permanently for the session, taking
+        # planned moves AND scene_wall's ACM fetch (floor + base column) with
+        # it. Respawn until the robot comes up; once joint states flow it
+        # configures and stays.
+        respawn=True,
+        respawn_delay=5.0,
         parameters=[
             # Builder provides: planning pipeline (OMPL), trajectory execution,
             # planning scene monitor options, joint limits, kinematics.

@@ -1928,10 +1928,11 @@ class URServoController(Node):
     def _twin_frame(self) -> bytes | None:
         """Binary 3D-twin state for the /ws3d push: 0x01, 6×f32 joint positions
         (UR_JOINT_ORDER), box count, then 10×f32 per box (xyz quat-xyzw size).
-        Little-endian. None until the first joint state."""
-        q = self._q_actual
-        if q is None:
-            return None
+        Little-endian. With the robot OFF (no joint states yet) the joints are
+        zeros — the stream must still run or the cage walls never render
+        ("walls disappeared" bug: returning None here starved /ws3d entirely
+        whenever the UI was opened before pressing Play)."""
+        q = self._q_actual or [0.0] * 6
         boxes = list(self._scene_boxes.values())[:8]
         return (struct.pack("<B6fB", 1, *q, len(boxes))
                 + b"".join(struct.pack("<10f", *b) for b in boxes))

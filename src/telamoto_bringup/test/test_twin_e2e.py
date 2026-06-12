@@ -82,10 +82,9 @@ pose.position.x, pose.position.z, pose.orientation.w = 0.8, 0.6, 1.0
 wall.primitive_poses = [pose]
 scene = PlanningScene(is_diff=True)
 scene.world.collision_objects = [wall]
-for _ in range(10):                       # ride over discovery
-    js_pub.publish(js)
-    sc_pub.publish(scene)
-    time.sleep(0.1)
+for _ in range(10):                       # ride over discovery — SCENE ONLY:
+    sc_pub.publish(scene)                 # joint states stay off (robot-off
+    time.sleep(0.1)                       # cold start) until phase F0 passed
 
 fails = 0
 def check(name, cond, detail=""):
@@ -185,17 +184,48 @@ def ws_recv():
     while len(data) < n:
         data += s.recv(n - len(data))
     return hdr[0] & 0x0f, data
+# F0: robot OFF (no joint states ever published yet) — the stream must still
+# run, with zero joints, and carry the wall: returning None until the first
+# joint state starved /ws3d entirely, so the cage vanished from the UI
+# whenever it was opened before pressing Play ("walls disappeared" bug).
 op, frame = ws_recv()
 ok = op == 0x2 and frame[0] == 1
 qf = struct.unpack("<6f", frame[1:25])
 nbox = frame[25]
-check("F twin frame joints", ok and all(abs(a - b) < 1e-5 for a, b in zip(qf, Q)),
+bx = struct.unpack("<10f", frame[26:66]) if nbox == 1 else None
+check("F0 robot-off frame: zero joints", ok and all(abs(v) < 1e-9 for v in qf),
+      f"op={op} q={[round(v, 2) for v in qf]}")
+check("F0 robot-off frame: wall present", nbox == 1 and bx is not None
+      and abs(bx[0] - 0.8) < 1e-5 and abs(bx[9] - 1.2) < 1e-5,
+      f"boxes={nbox} box={[round(v, 2) for v in bx] if bx else None}")
+
+# Robot comes up: joint states start flowing, frames must follow.
+for _ in range(10):
+    js_pub.publish(js)
+    time.sleep(0.05)
+deadline = time.monotonic() + 3.0
+while time.monotonic() < deadline:
+    op, frame = ws_recv()
+    qf = struct.unpack("<6f", frame[1:25])
+    nbox = frame[25]
+    if all(abs(a - b) < 1e-5 for a, b in zip(qf, Q)):
+        break
+check("F twin frame joints", all(abs(a - b) < 1e-5 for a, b in zip(qf, Q)),
       f"op={op} q={[round(v, 2) for v in qf]}")
 bx = struct.unpack("<10f", frame[26:66]) if nbox == 1 else None
 check("F twin frame wall box", nbox == 1 and bx is not None
       and abs(bx[0] - 0.8) < 1e-5 and abs(bx[9] - 1.2) < 1e-5,
       f"boxes={nbox} box={[round(v, 2) for v in bx] if bx else None}")
-# stream keeps flowing at ~25 Hz
+# stream keeps flowing at ~25 Hz. Frames buffered in the socket during the
+# phases above return back-to-back — drain until a frame actually took >20 ms
+# to arrive (= live stream), then measure.
+prev = time.monotonic()
+while True:
+    ws_recv()
+    now = time.monotonic()
+    if now - prev > 0.02:
+        break
+    prev = now
 t0 = time.monotonic()
 for _ in range(5):
     ws_recv()

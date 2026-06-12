@@ -46,7 +46,9 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   conventions not yet verified on the real robot — first jog at LOW speed. E2E:
   `pixi run python src/telamoto_bringup/test/test_rot_jog_e2e.py`.
 - **Web tuning UI** on `http://<pc>:8080` (IPv6 dual-stack; comes up with the
-  robot OFF too — `_pc_ip()` must never raise). **Plain HTTP ONLY by design**
+  robot OFF too — `_pc_ip()` must never raise, and `/ws3d` streams zero-joint
+  frames before the first joint state or the cage never renders — "walls
+  disappeared" bug 2026-06-12). **Plain HTTP ONLY by design**
   (no certs on the LAN/VPN): a TLS hello on the port is closed instantly so a
   browser's HTTPS-First falls back to http on its own (throttled log names the
   http URL); the page bounces itself off https (`__WEB_PORT__` injected at
@@ -142,7 +144,11 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   TimerAction push/pops launch configurations, and that file starts move_group from
   an `OnProcessExit` handler that fires after the pop → "launch configuration
   'warehouse_sqlite_path' does not exist". Its `wait_for_robot_description` node
-  already provides the start ordering.
+  already provides the start ordering. Real-mode move_group **respawns**
+  (`respawn=True`, 5 s): on a robot-off cold start there are no /joint_states,
+  the planning scene monitor times out (10 s) and move_group exits FATAL —
+  without respawn that permanently killed planned moves AND the ACM fetch
+  (floor + base column withheld) for the whole session.
 - ⚠ **SAFETY** (past incident: singularity amplification made the arm shoot) —
   layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
   (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);

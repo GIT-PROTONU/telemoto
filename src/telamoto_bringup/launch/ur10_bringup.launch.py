@@ -63,7 +63,9 @@ def launch_setup(context, *args, **kwargs):
     moveit = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
-                FindPackageShare("ur_moveit_config"),
+                # Vendored copy of ur_moveit_config's launcher: identical except
+                # move_group gets TRAC-IK from telamoto_bringup/config/kinematics.yaml.
+                FindPackageShare("telamoto_bringup"),
                 "launch", "ur_moveit.launch.py",
             ])
         ),

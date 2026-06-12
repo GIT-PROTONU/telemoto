@@ -26,6 +26,7 @@ Isolated: ROS_DOMAIN_ID=79 — safe to run beside a live bringup.
 Run:  pixi run python src/telamoto_bringup/test/test_selfcoll_e2e.py
 """
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -119,10 +120,18 @@ def main():
         tw_pub.publish(t)
     node.create_timer(0.02, tick)
 
+    # Launch the binary directly in its own process group (killed with
+    # killpg below): `ros2 run` does not reliably forward SIGTERM, and a
+    # leaked servo_node poisons every later run on this domain with a
+    # second status publisher (observed: stray survived terminate()).
+    servo_bin = os.path.join(
+        subprocess.run(["ros2", "pkg", "prefix", "moveit_servo"],
+                       capture_output=True, text=True, check=True).stdout.strip(),
+        "lib", "moveit_servo", "servo_node")
     servo = subprocess.Popen(
-        ["ros2", "run", "moveit_servo", "servo_node",
-         "--ros-args", "--params-file", pfile.name],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        [servo_bin, "--ros-args", "--params-file", pfile.name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
 
     def spin(sec):
         end = time.monotonic() + sec
@@ -188,11 +197,8 @@ def main():
               and n > 0,
               f"codes={sorted(codes)} n={n}")
     finally:
-        servo.terminate()
-        try:
-            servo.wait(5)
-        except subprocess.TimeoutExpired:
-            servo.kill()
+        os.killpg(servo.pid, signal.SIGKILL)
+        servo.wait(5)
         node.destroy_node()
         rclpy.shutdown()
         os.unlink(pfile.name)

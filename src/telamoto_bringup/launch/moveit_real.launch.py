@@ -89,6 +89,11 @@ def generate_launch_description():
             # Builder provides: planning pipeline (OMPL), trajectory execution,
             # planning scene monitor options, joint limits, kinematics.
             _moveit_cfg.to_dict(),
+            # TRAC-IK for planned moves (overrides the builder's KDL per-key).
+            # servo_node below deliberately keeps the builder kinematics: Servo
+            # is the jog safety sentinel — don't change what it was tuned with.
+            {"robot_description_kinematics": ParameterBuilder("telamoto_bringup")
+                .yaml("config/kinematics.yaml").to_dict()},
             # Override robot_description with the real-hardware URDF.
             {"robot_description":          robot_description_content},
             {"robot_description_semantic": robot_description_semantic_content},

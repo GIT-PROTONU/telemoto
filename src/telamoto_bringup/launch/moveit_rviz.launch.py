@@ -18,6 +18,7 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from launch_param_builder import ParameterBuilder
 from moveit_configs_utils import MoveItConfigsBuilder
 
 _CALIBRATION_FILE = os.path.normpath(
@@ -92,6 +93,9 @@ def generate_launch_description():
             # knows which planners are available without querying the service.
             _moveit_cfg.planning_pipelines,
             _moveit_cfg.joint_limits,
+            # TRAC-IK for the interactive-marker IK (same file move_group loads).
+            {"robot_description_kinematics": ParameterBuilder("telamoto_bringup")
+                .yaml("config/kinematics.yaml").to_dict()},
             {"robot_description":          robot_description_content},
             {"robot_description_semantic": robot_description_semantic_content},
         ],

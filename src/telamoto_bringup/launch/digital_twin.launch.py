@@ -82,7 +82,8 @@ def generate_launch_description():
 
     ur_moveit_fake = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
-            FindPackageShare("ur_moveit_config"), "launch", "ur_moveit.launch.py",
+            # Vendored launcher: move_group gets TRAC-IK (config/kinematics.yaml).
+            FindPackageShare("telamoto_bringup"), "launch", "ur_moveit.launch.py",
         ])),
         launch_arguments={"ur_type": "ur10", "launch_rviz": "false"}.items(),
         condition=IfCondition(use_mock_hardware),

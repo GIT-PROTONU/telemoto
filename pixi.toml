@@ -36,6 +36,7 @@ ros-jazzy-ur-moveit-config  = "*"
 ros-jazzy-ur-calibration    = "*"
 ros-jazzy-moveit             = "*"
 ros-jazzy-moveit-planners-ompl = "*"
+ros-jazzy-trac-ik-kinematics-plugin = "*"   # IK for planned moves (kinematics.yaml)
 ros-jazzy-ros2-control       = "*"
 ros-jazzy-ros2-controllers   = "*"
 ros-jazzy-joint-state-publisher-gui = "*"

@@ -276,7 +276,9 @@ JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider
 # re-locks at the new pose when the rotation stops; the straight-line hold
 # degenerates to a POSITION hold (start point, no direction) so a pure rotation
 # pivots about tool0 even if the pendant TCP is set elsewhere.
-JOG_ROT_SPEED_DEF = 0.25    # rad/s at full axis (~14°/s)
+JOG_ROT_SPEED_DEF = 0.5     # rad/s at full axis (~29°/s). Was 0.25 while the
+                            # axis signs were unverified on the robot; verified
+                            # 2026-06-12, raised — the slider still caps at 1.0.
 JOG_ROT_SPEED_MIN, JOG_ROT_SPEED_MAX = 0.01, 1.0  # ≤ ur_servo.yaml rotational cap
 JOG_ROT_RAMP = 2.0          # rad/s² of rotational ramp per m/s² of jog_accel —
                             # one accel knob drives both ramps
@@ -292,8 +294,13 @@ QD_ALLOW_ROT_SLOPE = 2.0    # rad/s of amplification-guard allowance per rad/s o
 # collision monitor), so a bigger threshold = Servo permanently in
 # DECELERATE_FOR_COLLISION = jog stuck at ×0.25 with a constant warn banner
 # (the old 0.30 default did exactly that — the jog never ran at full speed).
+# ⚠ scene default must stay ≤ ~0.10 for the same reason: with the full cage
+# (6 walls + floor + base column) some surface is nearly always within 0.5 m,
+# so the old 0.50 default pinned Servo at DECELERATE_FOR_COLLISION for entire
+# sessions (2026-06-12: 403 gate-log entries at ×0.25, ZERO at ×1.0 — the
+# user's "rotation is very slow" was the whole jog quartered).
 SELF_COLL_MIN,  SELF_COLL_MAX,  SELF_COLL_DEF  = 0.01, 0.5, 0.01
-SCENE_COLL_MIN, SCENE_COLL_MAX, SCENE_COLL_DEF = 0.01, 1.0, 0.50
+SCENE_COLL_MIN, SCENE_COLL_MAX, SCENE_COLL_DEF = 0.01, 1.0, 0.10
 # Collision-halt ESCAPE: Servo's collision scale is computed from the robot's
 # ACTUAL state vs the scene (not from the command), so once the model touches a
 # scene object the status pins at HALT_FOR_COLLISION in every direction and a

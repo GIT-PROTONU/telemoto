@@ -42,8 +42,10 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   hold stands DOWN (the user owns the orientation; re-locks at the new pose on
   stop) and the line hold degenerates to a POSITION hold (TCP pivots in place even
   if the pendant TCP ≠ tool0). Speed via the `jrspeed` slider / `jog_rot_speed`
-  param (default 0.25 rad/s, max 1.0 = servo.yaml rotational cap). ⚠ axis sign
-  conventions not yet verified on the real robot — first jog at LOW speed. E2E:
+  param (default 0.5 rad/s ≈ 29°/s, max 1.0 = servo.yaml rotational cap). Axis
+  signs VERIFIED on the real robot 2026-06-12 (the "rotation is very slow"
+  report was the old 0.50 m wall-distance DEFAULT pinning Servo at ×0.25 for
+  the whole session — now defaults to 0.10 m). E2E:
   `pixi run python src/telamoto_bringup/test/test_rot_jog_e2e.py`.
 - **Web tuning UI** on `http://<pc>:8080` (IPv6 dual-stack; comes up with the
   robot OFF too — `_pc_ip()` must never raise, and `/ws3d` streams zero-joint
@@ -102,7 +104,10 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   z=0 and would otherwise pin Servo's collision monitor at contact (jog
   bricked). The extended ACM rides every 1 Hz keepalive (PSM ACM semantics =
   replace-on-non-empty; never publish a partial ACM). With the full
-  cage keep the wall-distance slider ≤ ~10 cm or jog is permanently slowed.
+  cage keep the wall-distance slider ≤ ~10 cm or jog is permanently slowed
+  (now the DEFAULT: `SCENE_COLL_DEF` 0.10 m — the old 0.50 default pinned
+  every session at ×0.25; root cause of the 2026-06-12 "rotation very slow"
+  report and a misleading factor in the protective-stop incident).
   **Dragged poses persist** across restarts/reboots: saved on mouse-up to
   `~/.ros/telamoto_cage_poses.yaml` (`pose_file` param; delete it for defaults).
   The web 3D view has a "walls" button to hide the cage RENDERING only —

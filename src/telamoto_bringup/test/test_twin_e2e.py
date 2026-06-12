@@ -105,11 +105,11 @@ st, _, body = get("/")
 check("A page embeds viewer",
       st == 200 and b"importmap" in body and b"view3d" in body and b"viewer.js" in body)
 check("A mobile jog pads + tuning panel",
-      all(f'data-k="{k}"'.encode() in body for k in "wasdqet")
+      all(f'data-k="{k}"'.encode() in body for k in "wasdqe")
       and b'id="pads"' in body and b'id="panelbtn"' in body and b'id="panel"' in body)
-check("A fullscreen bar + tilt + deep links",
-      b'id="fsbar"' in body and b'id="fsbtn"' in body and b'id="jb-t"' in body
-      and b'location.hash==="#fs"' in body and b"deviceorientation" in body)
+check("A fullscreen bar + deep links (tilt pad removed)",
+      b'id="fsbar"' in body and b'id="fsbtn"' in body and b'id="jb-t"' not in body
+      and b'location.hash==="#fs"' in body and b"deviceorientation" not in body)
 check("A wall-visibility toggles",
       b'id="wallbtn"' in body and b'id="fswalls"' in body)
 

@@ -6,7 +6,8 @@ no Remote Control mode to release them). Joint states come from ur_rtde_joint_pu
 (RTDE outputs, 125 Hz); this node provides:
 
   • a FollowJointTrajectory action server (planned MoveIt moves → servoj), and
-  • WASD Cartesian jogging from a web UI on :8080 (→ speedl).
+  • Cartesian jogging from a web UI on :8080 (→ speedl): WASD/QE translation +
+    I/K (tilt) J/L (pan) U/O (roll) TCP rotation, both also on the touch pads.
 
 Transport: pressing Play on the pendant makes the URCap connect to REVERSE_PORT
 and send "request_program"; we reply with a URScript that connects back to the
@@ -25,16 +26,21 @@ median off-axis). Riding on the commanded twist as trim:
     start (re-captured after REORIENT_IDLE of standstill),
   • straight-line hold — PI lock (KI = KP²/4, critically damped) on the line
     through the jog-start point along the commanded direction.
-Jog axes are tool-frame or base-frame (web toggle).
+Jog axes are tool-frame or base-frame (web toggle). ROTATION jog rides the speedl
+angular slots; while it is active the orientation hold stands down (re-locks at the
+new pose on stop) and the line hold degenerates to a position hold (TCP pivots in
+place).
 
 SAFETY (layered — see the singularity incident in the project notes):
   1. MoveIt Servo runs as a kinematic SENTINEL: it receives the jog twist and its
      /servo_node/status gates the speedl command (×1 clean, ×0.25 decelerate,
      ×0 halt) — its own joint output is unused.
   2. Amplification guard: measured joint speed (RTDE actual_qd) beyond what the
-     commanded TCP speed justifies (QD_ALLOW_BASE + QD_ALLOW_SLOPE·|cmd|) shrinks
-     a smooth slew-limited gate — tight at low speed where J⁻¹ blowup lives,
-     permissive at honest high speed, and physically unable to limit-cycle.
+     SENT TCP speed justifies (QD_ALLOW_BASE + QD_ALLOW_SLOPE·|sent|) shrinks a
+     smooth slew-limited gate — tight at low speed where J⁻¹ blowup lives,
+     permissive at honest high speed. Beyond QD_LATCH_FACTOR × allowance the
+     gate has lost (boundary/singular amplification is unbounded): latch to the
+     speedj-zero hold until key release + joint settle.
   3. The URScript stopj's after ~8 missed replies (~64 ms) — dead-host watchdog.
   4. UR's own safety limits backstop everything.
 
@@ -104,15 +110,49 @@ SPEEDL_ACCEL = 2.5          # m/s² — robot-side tool accel for speedl: must o
 # bang-banged at 500 mm/s where joints LEGITIMATELY need >0.5 rad/s → stutter). The
 # danger signature from the incident is a SMALL Cartesian command producing LARGE
 # joint speeds (J⁻¹ blowup near a singularity), so the allowance scales with the
-# commanded TCP speed: allowed_qd = BASE + SLOPE·|cmd|. At 20 mm/s that allows only
-# 0.35 rad/s (tight protection exactly where the incident lives); at 500 mm/s it
-# allows 1.55 rad/s (normal fast-jog joint speeds; UR's own safety limit ~3.3 rad/s
-# still backstops). Applied as a SMOOTH gate — brakes fast, recovers gently — never a
-# hard cut, so no limit-cycle stutter.
+# TCP speed actually SENT to the robot last cycle (post-gate):
+#   allowed_qd = BASE + SLOPE·|sent lin| + ROT_SLOPE·|sent ang|.
+# SENT, not the operator's pre-gate target: in the 2026-06-12 boundary-stall trip
+# Servo had the jog at ×0.25 (62 mm/s sent) while the allowance was computed from
+# the 248 mm/s target — 4× too blind exactly when another layer was already
+# braking (guard fired at 1.71 rad/s instead of ~0.5; UR tripped at 3.2). Judging
+# against the sent speed also makes the gate self-tightening under amplification
+# (gate ↓ → sent ↓ → allowance ↓): honest motion (qd ∝ sent, slope < SLOPE) always
+# recovers, amplified motion spirals down to a crawl — DELIBERATE, the operator
+# prefers a slowed/deviating jog over a stop. Applied as a SMOOTH gate — brakes
+# fast, recovers gently — never a hard cut, so no limit-cycle stutter.
 QD_ALLOW_BASE  = 0.3        # rad/s allowed at zero commanded speed
-QD_ALLOW_SLOPE = 2.5        # rad/s additional per m/s of commanded TCP speed
+QD_ALLOW_SLOPE = 2.5        # rad/s additional per m/s of SENT linear TCP speed
 QD_GATE_DOWN   = 0.20       # max gate decrease per 125 Hz cycle (~40 ms to full stop)
 QD_GATE_UP     = 0.02       # max gate increase per cycle (~0.4 s to full recovery)
+# RUNAWAY latch — the guard's last resort. The proportional gate can only scale
+# the command, never zero it (tgt = allowed/qd > 0), and at a workspace boundary /
+# deep singularity the onboard speedl IK amplifies ANY nonzero twist without bound
+# (2026-06-12: qd kept climbing 2.6 → 3.2 rad/s with only 20 mm/s sent → UR
+# protective stop). If measured qd exceeds LATCH_FACTOR × allowance the jog drops
+# to the exact speedj-zero hold and stays there until the operator releases the
+# key AND the joints settle — a self-recovering host-side stop instead of UR's
+# pendant-bound protective stop. Honest motion can't reach it (at 0.5 m/s sent
+# the latch sits at ~3.9 rad/s, beyond UR's own limits).
+QD_LATCH_FACTOR = 2.5       # × allowance: beyond this the gate has lost — latch
+QD_LATCH_SETTLE = 0.15      # rad/s: joints considered settled → latch may release
+# Latch DIRECTION memory (2026-06-12 second on-robot run): a plain latch forgets
+# which way the trouble was — releasing and re-pressing the same key ratcheted
+# the arm DEEPER into the boundary, and escape taps kept re-latching (at the
+# singular pose even OUTWARD motion needs ~1 rad/s for the first few cm, far
+# over a fresh tap's 0.75 rad/s latch line → "tap five times to get out"). So
+# the latch captures the inward direction (base frame, from the pre-gate
+# command) and the TCP position: afterwards the inward cone is HARD-blocked,
+# while the opposite (escape) cone runs with a raised allowance floor and a
+# raised latch line — outward motion monotonically leaves the amplification
+# zone and UR's own limits (~2.1+ rad/s) still backstop. Everything clears
+# after QD_BLOCK_CLEAR_M of TCP travel from the latch point (any route:
+# escape jog, lateral jog, planned move).
+QD_BLOCK_DOT     = 0.5      # cone half-angle cos: ≥ this aligned with the inward
+                            # direction = blocked; ≤ −this = escaping
+QD_ESCAPE_ALLOW  = 0.8      # rad/s allowance floor while escaping
+QD_ESCAPE_LATCH  = 1.5      # rad/s latch line while escaping
+QD_BLOCK_CLEAR_M = 0.05     # m of TCP travel from the latch point → block clears
 JOG_SPEED_DEF = 0.5        # m/s at full axis (default)
 JOG_ACCEL_DEF = 1.0        # m/s^2 — CARTESIAN start/stop ramp rate (default; gentle).
                            # Ramps the TWIST magnitude (direction-preserving), never
@@ -224,6 +264,21 @@ JOG_SPEED_MIN,  JOG_SPEED_MAX  = 0.005, 0.5   # m/s at full axis (web slider);
                                               # 5 mm/s floor → sub-mm taps for fine work
 JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider);
                                               # lower = gentler start/stop
+# Rotational jog (pan/tilt/roll of the TCP): three more axes in the SAME CBOR jog
+# frame, through the same lease/ramp/gate machinery as the linear jog (sentinel
+# feed, amplification guard, link scaling — the blind-travel invariant holds for
+# rotation too: scaled_rot_speed × lease = jog_rot_speed × 0.1 s). While a rotation
+# is commanded the orientation hold stands DOWN (the user owns the orientation) and
+# re-locks at the new pose when the rotation stops; the straight-line hold
+# degenerates to a POSITION hold (start point, no direction) so a pure rotation
+# pivots about tool0 even if the pendant TCP is set elsewhere.
+JOG_ROT_SPEED_DEF = 0.25    # rad/s at full axis (~14°/s)
+JOG_ROT_SPEED_MIN, JOG_ROT_SPEED_MAX = 0.01, 1.0  # ≤ ur_servo.yaml rotational cap
+JOG_ROT_RAMP = 2.0          # rad/s² of rotational ramp per m/s² of jog_accel —
+                            # one accel knob drives both ramps
+QD_ALLOW_ROT_SLOPE = 2.0    # rad/s of amplification-guard allowance per rad/s of
+                            # commanded TCP rotation (a pure wrist roll needs ~1:1;
+                            # margin for poses where pan/tilt recruit big joints)
 # Servo collision-monitor proximity thresholds [m] (web sliders): inside the
 # distance the jog gate drops to ×0.25 (DECELERATE_FOR_COLLISION), at contact ×0
 # (HALT_FOR_COLLISION). Pushed live to /servo_node's parameters — the controller
@@ -242,7 +297,12 @@ SCENE_COLL_MIN, SCENE_COLL_MAX, SCENE_COLL_DEF = 0.01, 1.0, 0.50
 # approach direction at the moment of the halt; commands that genuinely REVERSE
 # (within a 60° cone of the exact opposite) pass at the crawl gate, everything
 # else stays hard-blocked. Singularity halts are NOT escapable this way — Servo
-# itself is direction-aware there (DECELERATE_FOR_LEAVING_SINGULARITY).
+# itself is direction-aware there: a jog-caused halt fires at the hard-stop
+# boundary, where the REVERSED twist re-evaluates as DECELERATE_FOR_LEAVING
+# (×0.25 via the normal gate map) and backs out (verified by
+# test_singularity_e2e.py). Past the boundary (arm parked deep by a planned
+# move) Servo halts EVERY direction — deliberate: blind crawling where J⁻¹
+# amplification lives is the original incident; recover with a planned move.
 COLL_ESCAPE_GATE = 0.25     # crawl factor while backing out of a collision halt
 COLL_ESCAPE_DOT  = 0.5      # cos(60°): how opposed to the approach a command must be
 STEP_T_MIN,     STEP_T_MAX     = 0.008, 0.05  # s speedl/servoj duration per cycle.
@@ -264,6 +324,8 @@ _TUNE = (
     ("servoj_lookahead", "lookahead", "_lookahead", LOOKAHEAD_MIN, LOOKAHEAD_MAX, float),
     ("jog_speed",        "jspeed",    "_jog_speed", JOG_SPEED_MIN, JOG_SPEED_MAX, float),
     ("jog_accel",        "jaccel",    "_jog_accel", JOG_ACCEL_MIN, JOG_ACCEL_MAX, float),
+    ("jog_rot_speed",    "jrspeed",   "_jog_rot_speed",
+                                                    JOG_ROT_SPEED_MIN, JOG_ROT_SPEED_MAX, float),
     ("step_t",           "stept",     "_step_t",    STEP_T_MIN,    STEP_T_MAX,    float),
     ("orient_lock_kp",   "okp",       "_orient_kp", ORIENT_KP_MIN, ORIENT_KP_MAX, float),
     ("path_lock_kp",     "pkp",       "_path_kp",   PATH_KP_MIN,   PATH_KP_MAX,   float),
@@ -383,8 +445,10 @@ _WEB_PAGE = """<!doctype html>
   background:#1c2733;border:1px solid #38506a;color:#cfe3ff;line-height:1.2;
   touch-action:none;user-select:none;-webkit-user-select:none}
  .jb.on{background:#2d5a8e;border-color:#4ea1ff}
+ /* Rotate mode: the SAME pads drive the angular axes — purple tint as the cue. */
+ #pads.rot .jb{background:#2b2138;border-color:#7a5cff;color:#dccdff}
+ #pads.rot .jb.on{background:#6e2da8;border-color:#c89bff}
  #jb-q{grid-area:q}#jb-a{grid-area:a}#jb-d{grid-area:d}#jb-e{grid-area:e}
- #jb-t{grid-area:t;border-radius:50%;background:#26203a;border-color:#7a5cff;color:#cdbfff}
  #pads.off .jb{opacity:.35;pointer-events:none}
  .jb:disabled{opacity:.15;pointer-events:none}
  /* Big 3D view (mobile-first): most of the viewport, capped on desktop. */
@@ -436,8 +500,8 @@ _WEB_PAGE = """<!doctype html>
    max(1rem,env(safe-area-inset-right));pointer-events:none}
  body.fs #pads .jb{pointer-events:auto;background:#1c2733e8;
   width:clamp(58px,16vw,76px);height:clamp(58px,16vw,76px);font-size:1rem}
+ body.fs #pads.rot .jb{background:#2b2138e8}
  body.fs #pads.off .jb{pointer-events:none}
- body.fs #jb-t{background:#26203ae8}
  body.fs #panel{z-index:28}
  /* Tuning panel: bottom sheet toggled by the floating button — keeps every
     slider one tap away while the 3D view + jog pads own the screen. */
@@ -482,6 +546,7 @@ _WEB_PAGE = """<!doctype html>
  <div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
    <button id="fswalls">walls</button>
    <button id="fsframe">tool</button>
+   <button id="fsrot">rot</button>
    <button id="fsjog">jog</button>
    <button id="fstune">&#9881;</button>
    <button id="fsexit">&#10005;</button>
@@ -492,6 +557,7 @@ _WEB_PAGE = """<!doctype html>
  <div id="fsjoghint" class="show">jog disabled &mdash; tap <b>jog</b> to enable</div>
  <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
    <label>Jog <span>
+     <input type="checkbox" id="rotf"> rotate pads &nbsp;
      <input type="checkbox" id="basef"> base frame &nbsp;
      <input type="checkbox" id="jogon"> enable</span></label>
    <div class="hint" id="joghint"></div>
@@ -500,7 +566,6 @@ _WEB_PAGE = """<!doctype html>
    <div id="padgrid">
      <button class="jb" id="jb-q" data-k="q"></button>
      <button class="jb" id="jb-a" data-k="a"></button>
-     <button class="jb" id="jb-t" data-k="t"></button>
      <button class="jb" id="jb-d" data-k="d"></button>
      <button class="jb" id="jb-e" data-k="e"></button>
    </div>
@@ -518,6 +583,10 @@ _WEB_PAGE = """<!doctype html>
  <div class="row"><label>Jog acceleration <span class="val" id="jaccelv"></span></label>
    <input type="range" id="jaccel" min="0.3" max="20" step="0.1">
    <div class="hint">Cartesian start/stop ramp &mdash; lower = gentler start/stop. Live.</div></div>
+ <div class="row"><label>Rotate speed <span class="val" id="jrspeedv"></span></label>
+   <input type="range" id="jrspeed" min="0.01" max="1" step="0.01">
+   <div class="hint">TCP rotation jog speed (pan/tilt/roll &mdash; <b>I/K</b> <b>J/L</b> <b>U/O</b>
+     or the pads with <b>rot</b> on). Live.</div></div>
  <div class="row"><label>Orientation hold <span class="val" id="okpv"></span></label>
    <input type="range" id="okp" min="0" max="30" step="0.5">
    <div class="hint">TCP orientation-hold stiffness &mdash; raise for tighter hold, lower if it
@@ -554,9 +623,10 @@ _WEB_PAGE = """<!doctype html>
 <script>
  const fmt={speed:v=>(+v).toFixed(2)+"\\u00d7",gain:v=>Math.round(v),lookahead:v=>(+v).toFixed(3)+" s",
    jspeed:v=>Math.round(+v*1000)+" mm/s",jaccel:v=>(+v).toFixed(1)+" m/s\\u00b2",
+   jrspeed:v=>Math.round(+v*57.2958)+"\\u00b0/s",
    okp:v=>(+v).toFixed(1),pkp:v=>(+v).toFixed(1),
    selfd:v=>Math.round(+v*100)+" cm",walld:v=>Math.round(+v*100)+" cm"};
- const ids=["speed","gain","lookahead","jspeed","jaccel","okp","pkp","selfd","walld"];
+ const ids=["speed","gain","lookahead","jspeed","jaccel","jrspeed","okp","pkp","selfd","walld"];
  function show(k,v){document.getElementById(k).value=v;document.getElementById(k+"v").textContent=fmt[k](v);
    if(k==="jspeed")syncFsSpeed();}
  function send(k){const v=document.getElementById(k).value;
@@ -608,13 +678,15 @@ _WEB_PAGE = """<!doctype html>
    return isMobile?"tap <b>"+info.pad+"</b>":"press <b>"+info.key+"</b>";}
  // Disable all pad buttons except escKey (lowercase); re-enable all when escKey=null.
  // Also evicts any blocked key from `held` so a held-button mid-halt stops instantly.
+ // Pads are compared via their EFFECTIVE key (padKey): in rotate mode every pad
+ // sends a rotation key, none of which can be the (linear) escape.
  function setPadBlock(escKey){
    let changed=false;
    document.querySelectorAll("#pads .jb").forEach(b=>{
-     if(b.dataset.k==="t"){b.disabled=false;return;}
-     const block=!!(escKey&&b.dataset.k!==escKey);
+     const ek=padKey(b.dataset.k);
+     const block=!!(escKey&&ek!==escKey);
      b.disabled=block;
-     if(block&&held.has(b.dataset.k)){held.delete(b.dataset.k);changed=true;}
+     if(block&&held.has(ek)){held.delete(ek);changed=true;}
    });
    if(changed)sendJog();}
  function setCollAlert(s){
@@ -632,22 +704,51 @@ _WEB_PAGE = """<!doctype html>
      msg="\\u26D4 collision"+(near?" &mdash; nearest: "+near:"")
        +(isMobile?" &mdash; jog any direction to back out":" &mdash; jog any direction, or move wall in RViz");
      cls="halt";}
+   else if(s.servoCode===2){
+     // HALT_FOR_SINGULARITY (gate \\u00d70). Shown even with nothing held \\u2014 the pose
+     // itself is the condition and the operator must know why the pads are dead.
+     // Servo is direction-aware: when the JOG drove in, the halt fires at the
+     // boundary and the reverse jog passes as DECELERATE_FOR_LEAVING (\\u00d70.25).
+     // A DEEP halt (arm parked near the singularity by a planned move) blocks
+     // every direction \\u2014 only a planned move (RViz) gets out. Pads stay enabled:
+     // Servo arbitrates which direction may leave, we can't know it client-side.
+     msg="\\u26D4 singularity \\u2014 jog halted; reverse to back out"
+       +" (if stuck: planned move in RViz)";cls="halt";}
+   else if(s.qdLatch){
+     // Host-side runaway latch: joint speed blew past the amplification
+     // allowance (workspace boundary / deep singularity) \\u2014 jog is zero-held.
+     msg="\\u26D4 joint-speed runaway \\u2014 jog stopped; release all keys, then jog"
+       +" AWAY from the boundary";cls="halt";}
+   else if(s.qdBlockAxis){
+     // Post-latch directional block: only the inward cone is dead; the
+     // opposite direction escapes with a relaxed guard, lateral moves pass.
+     const dir=axLabel[s.qdBlockAxis]||s.qdBlockAxis;
+     const baseMode=document.getElementById("basef").checked;
+     const h=escHint(s.qdBlockAxis);
+     const hint=h?(baseMode?h+" to back out":"switch to <b>Base frame</b> and "+h+" to back out"):null;
+     msg="\\u26A0 singularity boundary \\u2014 "+dir+" blocked"
+       +(hint?"; "+hint:"")+" (clears after 5 cm of travel)";cls="warn";}
    else if((held.size>0||wasMoving)&&s.servoGate!=null&&s.servoGate<1.0){
-     // wasMoving covers tilt jog (analog, not in `held`). servoCode picks the
+     // wasMoving covers the just-stopped frame. servoCode picks the
      // honest reason: 4=collision decel (scene OR self), 1/3=singularity, 6=bound.
      cls="warn";
      if(s.servoCode===4)
        msg="\\u26A0 collision slow-down"+(s.nearWall?" \\u2014 near "+fmtWall(s.nearWall):"")
          +" \\u00d7"+s.servoGate.toFixed(2);
      else if(s.servoCode===6)msg="\\u26A0 jog slowed \\u2014 joint limit";
-     else msg="\\u26A0 jog slowed \\u2014 near singularity";}
+     else if(s.servoCode===3)msg="\\u26A0 leaving singularity \\u2014 crawl \\u00d70.25";
+     else msg="\\u26A0 jog slowed \\u2014 approaching singularity (reverse to clear)";}
+   // Escape directions are LINEAR — drop the pads out of rotate mode so the
+   // escape pad actually exists on screen.
+   if(escKey&&rotOn){const r=document.getElementById("rotf");
+     r.checked=false;r.dispatchEvent(new Event("change"));}
    setPadBlock(escKey);
    for(const id of["collAlert","fsCollAlert"]){
      const el=document.getElementById(id);
      if(msg){el.className=cls;el.innerHTML=msg;}
      else{el.className="";el.textContent="";}}}
- const hints={tool:"<b>W/S</b> forward/back along the tool \\u00b7 <b>A/D</b> across \\u00b7 <b>Q/E</b> across (tool frame). Hold to move, release to stop.",
-   base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z (robot BASE frame). Hold to move, release to stop."};
+ const hints={tool:"<b>W/S</b> forward/back along the tool \\u00b7 <b>A/D</b> across \\u00b7 <b>Q/E</b> across (tool frame). Rotate: <b>I/K</b> tilt \\u00b7 <b>J/L</b> pan \\u00b7 <b>U/O</b> roll. Hold to move, release to stop.",
+   base:"<b>A/D</b> \\u00b1X \\u00b7 <b>Q/E</b> \\u00b1Y \\u00b7 <b>W/S</b> \\u00b1Z \\u00b7 rotate <b>I/K</b> \\u00b1RX \\u00b7 <b>J/L</b> \\u00b1RY \\u00b7 <b>U/O</b> \\u00b1RZ (robot BASE frame). Hold to move, release to stop."};
  function showHint(){const b=document.getElementById("basef").checked;
    document.getElementById("joghint").innerHTML=hints[b?"base":"tool"];
    const fb=document.getElementById("fsframe");
@@ -670,12 +771,16 @@ _WEB_PAGE = """<!doctype html>
  // throttle background timers to ~1 Hz, which would poison the estimate.
  let jogOn=false; const held=new Set(); let stream=null, ws=null;
  // tool frame: Z = along the tool (forward/back), X/Y = across the flange.
- // Keys give ±1; the tilt pad adds analog values — the sum is clamped to [-1,1]
- // (the server clamps again; never trust the client).
+ // Keys give ±1, clamped (the server clamps again; never trust the client).
+ // ax/ay/az are the ROTATION axes (I/K tilt, J/L pan, U/O roll — or the pads
+ // with "rot" on).
  function jogVec(){const c=v=>Math.max(-1,Math.min(1,v));
-   return {lx:c((held.has("a")?1:0)-(held.has("d")?1:0)+tilt.x),
-     ly:c((held.has("q")?1:0)-(held.has("e")?1:0)+tilt.y),
-     lz:c((held.has("w")?1:0)-(held.has("s")?1:0))};}
+   return {lx:c((held.has("a")?1:0)-(held.has("d")?1:0)),
+     ly:c((held.has("q")?1:0)-(held.has("e")?1:0)),
+     lz:c((held.has("w")?1:0)-(held.has("s")?1:0)),
+     ax:c((held.has("i")?1:0)-(held.has("k")?1:0)),
+     ay:c((held.has("j")?1:0)-(held.has("l")?1:0)),
+     az:c((held.has("u")?1:0)-(held.has("o")?1:0))};}
  function wsOpen(){ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
    ws.onclose=()=>{ws=null;setTimeout(wsOpen,1000);};}
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
@@ -684,86 +789,70 @@ _WEB_PAGE = """<!doctype html>
  function cborNum(n){if(Number.isInteger(n))return cborInt(n);   // analog → float32
    const d=new DataView(new ArrayBuffer(4));d.setFloat32(0,n);
    return [0xfa,d.getUint8(0),d.getUint8(1),d.getUint8(2),d.getUint8(3)];}
- function cborJog(v){return new Uint8Array([0x83].concat(cborNum(v.lx),cborNum(v.ly),cborNum(v.lz)));}
+ function cborJog(v){return new Uint8Array([0x86].concat(cborNum(v.lx),cborNum(v.ly),cborNum(v.lz),
+   cborNum(v.ax),cborNum(v.ay),cborNum(v.az)));}
  // Idle ticks send a 1-byte KEEPALIVE (CBOR empty array): it feeds the server's
  // link-jitter estimator but never the jog command — so a second open tab can't
  // fight the active tab's jog with a 30 Hz stream of zeros (= choppy motion).
  // A real [0,0,0] is still sent on the moving->stopped transition (instant stop).
  const KEEPALIVE=new Uint8Array([0x80]); let wasMoving=false;
  function sendJog(){if(!ws||ws.readyState!==1)return;
-   const v=jogVec(),m=!!(v.lx||v.ly||v.lz);
+   const v=jogVec(),m=!!(v.lx||v.ly||v.lz||v.ax||v.ay||v.az);
    ws.send(m||wasMoving?cborJog(v):KEEPALIVE);wasMoving=m;}
  function startStream(){if(!stream&&!document.hidden)stream=setInterval(sendJog,33);}   // ~30 Hz
  function stopStream(){if(stream){clearInterval(stream);stream=null;}}
- function stopAll(){held.clear();clearPads();tiltStop();stopStream();sendJog();}  // sends zero
+ function stopAll(){held.clear();clearPads();stopStream();sendJog();}  // sends zero
  document.getElementById("jogon").addEventListener("change",e=>{jogOn=e.target.checked;
    document.getElementById("pads").classList.toggle("off",!jogOn);
    document.getElementById("fsjog").classList.toggle("on",jogOn);
    document.getElementById("fsjoghint").classList.toggle("show",!jogOn);
    fetch("/api/jogmode?on="+(jogOn?1:0),{method:"POST"});if(jogOn)startStream();else stopAll();});
  document.addEventListener("keydown",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
-   if("wasdqe".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
+   if("wasdqeikjluo".includes(k)&&!held.has(k)){held.add(k);e.preventDefault();sendJog();startStream();}});
  document.addEventListener("keyup",e=>{if(!jogOn)return;const k=e.key.toLowerCase();
    if(held.has(k)){held.delete(k);sendJog();}});
- window.addEventListener("blur",()=>{if(jogOn){held.clear();clearPads();tiltStop();sendJog();}});
+ window.addEventListener("blur",()=>{if(jogOn){held.clear();clearPads();sendJog();}});
  document.addEventListener("visibilitychange",()=>{if(document.hidden){held.clear();clearPads();
-   tiltStop();sendJog();stopStream();}else if(jogOn)startStream();});
+   sendJog();stopStream();}else if(jogOn)startStream();});
  // Touch jog pads (mobile): hold-to-jog buttons feeding the SAME `held` set and
  // 30 Hz stream as the keyboard, so every fail-safe (lease, keepalive isolation,
  // blur/hidden clearing) applies unchanged.
- const padLabels={tool:{w:"\\u25b2 fwd",s:"\\u25bc back",a:"\\u25c0",d:"\\u25b6",q:"\\u2191 up",e:"\\u2193 down",t:"tilt"},
-   base:{w:"+Z \\u25b2",s:"\\u2212Z \\u25bc",a:"+X",d:"\\u2212X",q:"+Y",e:"\\u2212Y",t:"tilt"}};
+ const padLabels={tool:{w:"\\u25b2 fwd",s:"\\u25bc back",a:"\\u25c0",d:"\\u25b6",q:"\\u2191 up",e:"\\u2193 down"},
+   base:{w:"+Z \\u25b2",s:"\\u2212Z \\u25bc",a:"+X",d:"\\u2212X",q:"+Y",e:"\\u2212Y"},
+   rtool:{w:"\\u27f2 roll",s:"\\u27f3 roll",a:"\\u25c0 pan",d:"pan \\u25b6",q:"tilt \\u25b2",e:"tilt \\u25bc"},
+   rbase:{w:"+RZ",s:"\\u2212RZ",a:"+RY",d:"\\u2212RY",q:"+RX",e:"\\u2212RX"}};
+ // Rotate mode: the SAME pads (and the same `held`/stream path) drive the angular
+ // axes — each pad's key is remapped to its rotation twin.
+ const rotMap={q:"i",e:"k",a:"j",d:"l",w:"u",s:"o"};
+ let rotOn=false;
+ function padKey(k){return rotOn&&rotMap[k]?rotMap[k]:k;}
  // Desktop (mouse-primary): the keyboard key rides above the label so the pads
- // double as a WASD legend — the fullscreen layout is the default view there too.
- function padRelabel(){const L=padLabels[document.getElementById("basef").checked?"base":"tool"];
+ // double as a WASD/IJKL legend — the fullscreen layout is the default view there too.
+ function padRelabel(){const base=document.getElementById("basef").checked;
+   const L=padLabels[(rotOn?"r":"")+(base?"base":"tool")];
    document.querySelectorAll("#pads .jb").forEach(b=>{const k=b.dataset.k;
-     b.innerHTML=(!isMobile&&k!=="t"?"<small style='opacity:.55'>"+k.toUpperCase()+"</small><br>":"")+L[k];});}
+     b.innerHTML=(!isMobile?"<small style='opacity:.55'>"+padKey(k).toUpperCase()+"</small><br>":"")+L[k];});}
  function clearPads(){document.querySelectorAll("#pads .jb.on").forEach(b=>b.classList.remove("on"));}
  function press(k,on){if(!jogOn)return;
    if(on&&!held.has(k)){held.add(k);sendJog();startStream();}
    else if(!on&&held.has(k)){held.delete(k);sendJog();}}
  document.querySelectorAll("#pads .jb").forEach(b=>{const k=b.dataset.k;
-   if(k==="t")return;                                  // tilt pad wired below
    b.addEventListener("pointerdown",e=>{e.preventDefault();
      try{b.setPointerCapture(e.pointerId);}catch(err){}
-     b.classList.add("on");press(k,true);});
-   const up=()=>{b.classList.remove("on");press(k,false);};
-   b.addEventListener("pointerup",up);b.addEventListener("pointercancel",up);
-   b.addEventListener("contextmenu",e=>e.preventDefault());});
+     b.classList.add("on");b._k=padKey(k);press(b._k,true);});   // remember the SENT
+   const up=()=>{b.classList.remove("on");if(b._k)press(b._k,false);};  // key: a mode
+   b.addEventListener("pointerup",up);b.addEventListener("pointercancel",up);  // flip
+   b.addEventListener("contextmenu",e=>e.preventDefault());});  // mid-press must still
+                                                                // release the same key
+ document.getElementById("rotf").addEventListener("change",e=>{rotOn=e.target.checked;
+   document.getElementById("pads").classList.toggle("rot",rotOn);
+   document.getElementById("fsrot").classList.toggle("on",rotOn);
+   held.clear();clearPads();sendJog();              // never carry motion across a remap
+   padRelabel();});
  padRelabel();
- // Tilt-to-jog: HOLD the round center pad and tilt the phone — a dead-man
- // control. Orientation deltas from the pose AT PRESS map to lx/ly in [-1,1]
- // (4\\u00b0 deadzone, 25\\u00b0 full scale) and ride the same 30 Hz stream as the keys,
- // so every fail-safe (lease, scaling, blur/hidden clearing) applies. Modern
- // mobile browsers only deliver orientation events on HTTPS (use e.g.
- // `tailscale serve` to front this UI); iOS additionally asks permission.
- const tilt={x:0,y:0}; let tiltOn=false,tiltZero=null,tiltSeen=false;
- const tiltBtn=document.getElementById("jb-t");
- function tiltHint(m){const h=document.getElementById("joghint");
-   h.textContent=m;h.style.color="#e3b341";}
- function tiltStop(){if(!tiltOn)return;
-   tiltOn=false;tiltZero=null;tilt.x=tilt.y=0;tiltBtn.classList.remove("on");sendJog();}
- window.addEventListener("deviceorientation",e=>{tiltSeen=true;
-   if(!tiltOn||e.beta==null||e.gamma==null)return;
-   if(!tiltZero){tiltZero={b:e.beta,g:e.gamma};return;}  // hold pose = neutral
-   const map=d=>{const a=Math.abs(d);return a<4?0:Math.sign(d)*Math.min(1,(a-4)/21);};
-   tilt.x=map(-(e.beta-tiltZero.b));   // tilt away from you = forward (+lx)
-   tilt.y=map(-(e.gamma-tiltZero.g));  // tilt right = -ly; verify at LOW speed
-   sendJog();});
- tiltBtn.addEventListener("pointerdown",async e=>{e.preventDefault();
-   if(!jogOn)return;
-   try{tiltBtn.setPointerCapture(e.pointerId);}catch(err){}
-   if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission){
-     try{if(await DeviceOrientationEvent.requestPermission()!=="granted")
-       return tiltHint("motion permission denied");}
-     catch(err){return tiltHint("motion permission: "+err.message);}}
-   tiltOn=true;tiltSeen=false;tiltBtn.classList.add("on");startStream();
-   setTimeout(()=>{if(tiltOn&&!tiltSeen)
-     tiltHint(window.isSecureContext?"no tilt sensor data on this device"
-       :"tilt needs HTTPS \\u2014 front the UI with `tailscale serve` and open the https:// URL");},900);});
- tiltBtn.addEventListener("pointerup",tiltStop);
- tiltBtn.addEventListener("pointercancel",tiltStop);
- tiltBtn.addEventListener("contextmenu",e=>e.preventDefault());
+ // (Tilt-to-jog — hold the center pad and tilt the phone — was removed 2026-06-12;
+ // the server still accepts analog float axes in the CBOR frame, so an analog
+ // input source can come back without a protocol change.)
  // 3D twin: loaded lazily on first enable (the three.js stack is ~1.4 MB once,
  // then browser-cached) — slider-only sessions never pay for it.
  let twin=null;
@@ -799,7 +888,7 @@ _WEB_PAGE = """<!doctype html>
  const fsProxy=(btn,box)=>document.getElementById(btn).addEventListener("click",()=>{
    const c=document.getElementById(box);c.checked=!c.checked;
    c.dispatchEvent(new Event("change"));});
- fsProxy("fsjog","jogon");fsProxy("fsframe","basef");
+ fsProxy("fsjog","jogon");fsProxy("fsframe","basef");fsProxy("fsrot","rotf");
  // Tuning panel (bottom sheet): keeps the screen for the 3D view + jog pads.
  const panel=document.getElementById("panel");
  document.getElementById("panelbtn").addEventListener("click",()=>panel.classList.toggle("open"));
@@ -919,7 +1008,7 @@ def _quat_angle_deg(a, b):
 
 def _cbor_decode(buf, i=0):
     """Minimal RFC 8949 decoder for the jog frame: ints, arrays, and floats
-    (major types 0, 1, 4, 7) — floats carry the analog tilt-jog axes.
+    (major types 0, 1, 4, 7) — floats carry analog jog axes.
     Returns (value, next_index)."""
     head = buf[i]; major, minor = head >> 5, head & 0x1f; i += 1
     if minor < 24:
@@ -982,6 +1071,10 @@ class URServoController(Node):
             description="WASD jog Cartesian start/stop ramp m/s^2; lower = gentler (live)",
             floating_point_range=[FloatingPointRange(
                 from_value=JOG_ACCEL_MIN, to_value=JOG_ACCEL_MAX, step=0.1)]))
+        self.declare_parameter("jog_rot_speed", JOG_ROT_SPEED_DEF, ParameterDescriptor(
+            description="rotational jog speed rad/s (pan/tilt/roll, live)",
+            floating_point_range=[FloatingPointRange(
+                from_value=JOG_ROT_SPEED_MIN, to_value=JOG_ROT_SPEED_MAX, step=0.01)]))
         self.declare_parameter("step_t", STEP_T, ParameterDescriptor(
             description="speedl/servoj duration per cycle s; higher = better speed "
                         "tracking, lower update rate (live)",
@@ -1018,6 +1111,7 @@ class URServoController(Node):
         self._speed     = g("speed_scale").get_parameter_value().double_value
         self._jog_speed = g("jog_speed").get_parameter_value().double_value
         self._jog_accel = g("jog_accel").get_parameter_value().double_value
+        self._jog_rot_speed = g("jog_rot_speed").get_parameter_value().double_value
         self._step_t    = g("step_t").get_parameter_value().double_value
         self._orient_kp = g("orient_lock_kp").get_parameter_value().double_value
         self._path_kp   = g("path_lock_kp").get_parameter_value().double_value
@@ -1086,11 +1180,12 @@ class URServoController(Node):
             self._tcp_csv.write("t_mono,moving,cmd_mm_s,x_mm,y_mm,z_mm,qx,qy,qz,qw\n")
         except Exception as exc:
             self.get_logger().warn(f"[log] TCP path csv disabled: {exc}")
-        # Cartesian start/stop ramp: the linear jog velocity (in the selected jog
-        # frame) actually commanded, ramped toward the target self._jog at jog_accel
-        # m/s² in _jog_loop. Ramping the TWIST magnitude preserves the commanded
+        # Cartesian start/stop ramp: the jog twist (linear + angular, in the
+        # selected jog frame) actually commanded, ramped toward the target
+        # self._jog at jog_accel m/s² (× JOG_ROT_RAMP for the angular axes) in
+        # _jog_loop. Ramping the TWIST magnitude preserves the commanded
         # DIRECTION (a per-joint ramp would distort it and bend the path).
-        self._jog_cmd = [0.0, 0.0, 0.0]
+        self._jog_cmd = [0.0] * 6
 
         # Orientation hold for the jog: TF gives the live tool0 pose in base_link;
         # _orient_target is the (x,y,z,w) orientation captured when a jog starts and
@@ -1145,6 +1240,18 @@ class URServoController(Node):
         self._servo_gate = 1.0
         self._qd_gate = 1.0          # smooth singularity-amplification gate [0,1]
         self._qd_guard_t = 0.0
+        # Amplification-guard state: the post-gate twist magnitudes actually SENT
+        # last cycle (the allowance baseline) and the runaway latch (see the
+        # QD_LATCH_* block). A spurious latch (e.g. jogging the instant a planned
+        # move's joints are still settling) errs SAFE and self-clears on release.
+        self._sent_lin = 0.0
+        self._sent_rot = 0.0
+        self._qd_latched = False
+        self._qd_block_dir = None    # inward (base-frame unit) direction captured
+        self._qd_block_pos = None    # at the runaway latch + the TCP point — the
+                                     # post-latch directional block (QD_BLOCK_*)
+        self._qd_block_log_t = 0.0
+        self._code_log_t = 0.0       # throttle for same-gate status-code changes
         # Collision-halt escape state: the base_link-frame jog linear command last
         # streamed (pre-gate) + its time, the captured approach direction while
         # halted-for-collision (None = no escape allowed), and a log throttle.
@@ -1224,25 +1331,28 @@ class URServoController(Node):
             f"[jog] collision distances → self {self._self_coll:.2f} m, "
             f"scene {self._scene_coll:.2f} m (pushed to servo)")
 
-    def _apply_jog(self, lx: float, ly: float, lz: float) -> None:
-        # Axes in [-1,1] (tool frame), decoded from the CBOR jog frame.
+    def _apply_jog(self, lx: float, ly: float, lz: float,
+                   ax: float = 0.0, ay: float = 0.0, az: float = 0.0) -> None:
+        # Linear + angular axes in [-1,1] (selected jog frame), decoded from the
+        # CBOR jog frame (legacy 3-element frames leave the rotation at zero).
         # Lease model: each message renews the twist for the (link-adaptive) lease;
         # a zero msg (key release) stops instantly, and a stalled/closed socket
         # lets the lease expire so the robot stops on its own.
         # SERVER-side jog-mode gate: the browser also checks its toggle, but any
         # WS client can send frames — without this, jog would move the robot with
         # the sentinel feed off (no fresh Servo status). Never trust the client.
-        if not self._jog_mode:
-            lx = ly = lz = 0.0
-        # Floats can arrive from the wire now (analog tilt): a NaN would slip
-        # THROUGH _clamp (NaN comparisons are false → full speed) — drop to zero.
-        if not (math.isfinite(lx) and math.isfinite(ly) and math.isfinite(lz)):
-            lx = ly = lz = 0.0
+        axes = (lx, ly, lz, ax, ay, az)
+        # Floats can arrive from the wire (analog axes): a NaN would slip THROUGH
+        # _clamp (NaN comparisons are false → full speed) — drop to zero.
+        if not self._jog_mode or not all(map(math.isfinite, axes)):
+            axes = (0.0,) * 6
         now = self._link_tick()
-        sp = self._jog_speed * self._link_scale
-        self._jog = [sp * _clamp(-1.0, 1.0, lx),
-                     sp * _clamp(-1.0, 1.0, ly),
-                     sp * _clamp(-1.0, 1.0, lz), 0.0, 0.0, 0.0]
+        sp  = self._jog_speed * self._link_scale
+        rsp = self._jog_rot_speed * self._link_scale   # same scale → the blind-
+                                                       # travel invariant holds for
+                                                       # rotation too
+        self._jog = [s * _clamp(-1.0, 1.0, v)
+                     for s, v in zip((sp, sp, sp, rsp, rsp, rsp), axes)]
         self._jog_lease = now + self._link_lease
         self._publish_twist()                       # publish NOW, don't wait for the loop
 
@@ -1308,7 +1418,9 @@ class URServoController(Node):
     def _set_path_baseline(self, pose, jog_vec) -> None:
         """Anchor the straight-line hold: line = current TCP position along the
         commanded jog direction (expressed in base frame; tool-frame jogs are rotated
-        via the current orientation). Cleared (None) if TF is unavailable or zero."""
+        via the current orientation). Cleared (None) if TF is unavailable. A ZERO
+        linear vector (pure rotation jog) keeps the start point with no direction —
+        _path_lock_linear then acts as a position hold pinning the pivoting TCP."""
         self._path_i = [0.0, 0.0, 0.0]     # new line → forget the learned disturbance
         self._path_i_t = time.monotonic()
         if pose is None:
@@ -1328,13 +1440,20 @@ class URServoController(Node):
         Only the PERPENDICULAR error is fed back — along-track motion (the jog itself)
         is untouched. Returns (0,0,0) if there's no baseline or pose."""
         start, u = self._jog_start_pos, self._jog_dir
-        if start is None or u is None or pose is None:
+        if start is None or pose is None:
             return (0.0, 0.0, 0.0)
         pos, q = pose
         disp = (pos[0] - start[0], pos[1] - start[1], pos[2] - start[2])
-        along = disp[0] * u[0] + disp[1] * u[1] + disp[2] * u[2]
-        # Lateral error = displacement minus its along-line component (base frame).
-        e = (disp[0] - along * u[0], disp[1] - along * u[1], disp[2] - along * u[2])
+        if u is None:
+            # No commanded direction = pure ROTATION jog: the line degenerates to a
+            # point and the full displacement is error — a position hold that keeps
+            # the TCP pivoting in place (even if the pendant TCP, which UR speedl
+            # rotates about, is set away from tool0).
+            e = disp
+        else:
+            along = disp[0] * u[0] + disp[1] * u[1] + disp[2] * u[2]
+            # Lateral error = displacement minus its along-line component (base frame).
+            e = (disp[0] - along * u[0], disp[1] - along * u[1], disp[2] - along * u[2])
         kp = self._path_kp
         # Integrate the error (base frame). dt from a real clock so the two publisher
         # threads (50 Hz loop + ~30 Hz websocket) integrate correctly between them;
@@ -1374,7 +1493,8 @@ class URServoController(Node):
         m = TwistStamped()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = BASE_FRAME if self._jog_base else JOG_FRAME
-        m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog_cmd
+        m.twist.linear.x, m.twist.linear.y, m.twist.linear.z = self._jog_cmd[0:3]
+        m.twist.angular.x, m.twist.angular.y, m.twist.angular.z = self._jog_cmd[3:6]
         with self._pub_lock:
             self._twist_pub.publish(m)
 
@@ -1410,13 +1530,16 @@ class URServoController(Node):
         last_orient_log = 0.0
         last_ramp = time.monotonic()
         prev_intent = False
-        jog_ref = (False, (0.0, 0.0, 0.0))  # last (frame, jog vector) — change detect
+        jog_ref = (False, (0.0,) * 3, (0.0,) * 3)  # (frame, lin, ang) — change detect
         while rclpy.ok():
             time.sleep(0.02)                                  # 50 Hz
             now = time.monotonic()
             if now >= self._jog_lease:                        # lease expired → stop
                 self._jog = _ZERO6
-            intent = any(self._jog[0:3])                      # user is holding a jog key
+            jog_vec = tuple(self._jog[0:3])
+            ang_vec = tuple(self._jog[3:6])
+            rotating = any(ang_vec)
+            intent = any(jog_vec) or rotating                 # user is holding a jog key
             # Capture / re-capture the locked orientation on the RISING edge of jog
             # intent. Re-capture only after a real pause (REORIENT_IDLE) so you can
             # hand-reposition / planned-move between jogs and re-lock, while rapid taps
@@ -1424,12 +1547,17 @@ class URServoController(Node):
             # The idle clock starts on release (falling edge).
             # Re-anchor key includes the jog FRAME: toggling Base/Tool mid-jog changes
             # what the same key vector means, so it must re-anchor like a key switch.
-            jog_vec = tuple(self._jog[0:3])
-            jog_key = (self._jog_base, jog_vec)
+            # ROTATION jog: while any angular axis is commanded the user OWNS the
+            # orientation — the hold stands down (target None) and re-locks at the
+            # NEW orientation the moment the rotation stops (deliberate reorientation
+            # must never be "corrected" back).
+            jog_key = (self._jog_base, jog_vec, ang_vec)
             if intent and not prev_intent:
                 pose = self._tcp_pose()
                 o = pose[1] if pose else None
-                if self._orient_target is None or now - self._jog_stop_t > REORIENT_IDLE:
+                if rotating:
+                    self._orient_target = None
+                elif self._orient_target is None or now - self._jog_stop_t > REORIENT_IDLE:
                     self._orient_target = o
                 self._jog_start_orient = self._orient_target
                 self._set_path_baseline(pose, jog_vec)
@@ -1437,20 +1565,28 @@ class URServoController(Node):
                 # Commanded direction changed MID-jog (key switch / slider / frame):
                 # re-anchor the line at the current pose along the new direction, or
                 # the path lock would fight the new motion as "lateral error".
-                self._set_path_baseline(self._tcp_pose(), jog_vec)
+                pose = self._tcp_pose()
+                if rotating:
+                    self._orient_target = None
+                elif self._orient_target is None:
+                    # rotation released mid-jog → lock the NEW orientation
+                    self._orient_target = pose[1] if pose else None
+                self._set_path_baseline(pose, jog_vec)
             elif not intent and prev_intent:
                 self._jog_stop_t = now
             jog_ref = jog_key
             prev_intent = intent
 
-            # Cartesian linear-velocity ramp toward the target. Ramping the TWIST
-            # magnitude — never per-joint — keeps the commanded direction intact
-            # through both ramp-up and ramp-down (smooth start/stop feel; jog_accel
-            # is the single knob).
+            # Cartesian twist ramp toward the target. Ramping the TWIST magnitude —
+            # never per-joint — keeps the commanded direction intact through both
+            # ramp-up and ramp-down (smooth start/stop feel; jog_accel is the single
+            # knob, scaled by JOG_ROT_RAMP for the angular axes).
             acc = self._jog_accel * min(now - last_ramp, 0.05)
+            racc = acc * JOG_ROT_RAMP
             last_ramp = now
-            self._jog_cmd = [c + _clamp(-acc, acc, t - c)
-                             for c, t in zip(self._jog_cmd, self._jog[0:3])]
+            self._jog_cmd = [c + _clamp(-a, a, t - c)
+                             for c, t, a in zip(self._jog_cmd, self._jog,
+                                                (acc, acc, acc, racc, racc, racc))]
 
             # Logging tracks ACTUAL command motion (_jog_cmd), so the ramp-down after
             # release is captured too. Periodic trace: orientation as RPY° + drift from
@@ -1568,6 +1704,7 @@ class URServoController(Node):
                     self._send(json.dumps({"speed": round(node._speed, 2), "gain": node._gain,
                         "lookahead": round(node._lookahead, 3),
                         "jspeed": round(node._jog_speed, 3), "jaccel": round(node._jog_accel, 1),
+                        "jrspeed": round(node._jog_rot_speed, 3),
                         "okp": round(node._orient_kp, 1),
                         "pkp": round(node._path_kp, 1),
                         "selfd": round(node._self_coll, 2), "walld": round(node._scene_coll, 2),
@@ -1581,6 +1718,8 @@ class URServoController(Node):
                         "jogon": node._jog_mode,
                         "servoGate": round(node._servo_gate, 2),
                         "servoCode": int(node._servo_code),
+                        "qdLatch": node._qd_latched,
+                        "qdBlockAxis": node._dominant_axis(node._qd_block_dir),
                         "collBlocked": node._servo_code == ServoStatus.HALT_FOR_COLLISION,
                         "collWall": node._coll_near_wall,
                         "collAxis": node._approach_axis(),
@@ -1629,7 +1768,9 @@ class URServoController(Node):
                         if op == 0x2 and not push:         # binary frame = CBOR jog cmd
                             try:
                                 v, _ = _cbor_decode(data)
-                                if len(v) >= 3:            # jog command (incl. stop zero)
+                                if len(v) >= 6:            # linear + rotation axes
+                                    node._apply_jog(*(float(x) for x in v[:6]))
+                                elif len(v) >= 3:          # legacy linear-only frame
                                     node._apply_jog(float(v[0]), float(v[1]), float(v[2]))
                                 else:                      # empty array = idle KEEPALIVE:
                                     node._link_tick()      # estimator only — never the
@@ -1754,7 +1895,7 @@ class URServoController(Node):
             pose = self._tcp_pose()
             if pose:
                 (x, y, z), (qx, qy, qz, qw) = pose
-                cmd = math.sqrt(sum(v * v for v in self._jog_cmd)) * 1000.0
+                cmd = math.sqrt(sum(v * v for v in self._jog_cmd[0:3])) * 1000.0
                 mv = 1 if any(abs(v) > 1e-6 for v in self._jog_cmd) else 0
                 self._tcp_csv.write(
                     f"{time.monotonic():.4f},{mv},{cmd:.1f},"
@@ -1800,7 +1941,11 @@ class URServoController(Node):
 
     def _approach_axis(self) -> str | None:
         """Dominant base-frame axis of the captured collision-approach direction."""
-        bd = self._coll_block_dir
+        return self._dominant_axis(self._coll_block_dir)
+
+    @staticmethod
+    def _dominant_axis(bd) -> str | None:
+        """Dominant base-frame axis ("±X/Y/Z") of a direction vector, or None."""
         if bd is None:
             return None
         x, y, z = bd
@@ -1855,6 +2000,16 @@ class URServoController(Node):
             self._servo_gate = gate
             self.get_logger().warn(
                 f"[jog] servo sentinel code {msg.code} → speed gate ×{gate}")
+        elif msg.code != prev:
+            # Same gate, different verdict (e.g. collision-decel ↔ singularity-
+            # decel, both ×0.25) was invisible in the log — the 2026-06-12
+            # boundary trip could not tell what Servo thought. Throttled: a
+            # jittery feed flaps codes at stream rate.
+            t = time.monotonic()
+            if t - self._code_log_t > 0.25:
+                self._code_log_t = t
+                self.get_logger().info(
+                    f"[jog] servo status code {prev} → {msg.code} (gate ×{gate})")
 
     # ── Reverse server: serves the script on request, then hands the socket to
     #    the control loop (this robot's URCap Custom Port == the reverse port) ───
@@ -2089,7 +2244,61 @@ class URServoController(Node):
                 # kills the old standstill ring from Servo's near-zero residuals).
                 moving = any(abs(v) > 1e-6 for v in self._jog_cmd)
                 pose = self._tcp_pose() if moving else None
-                if pose is not None:
+                # Amplification allowance vs what was actually SENT last cycle
+                # (see the QD_ALLOW/QD_LATCH blocks), evaluated every cycle so the
+                # runaway latch can fire even while another gate has the command
+                # at a crawl — that was exactly the 2026-06-12 trip.
+                allowed = (QD_ALLOW_BASE + QD_ALLOW_SLOPE * self._sent_lin
+                           + QD_ALLOW_ROT_SLOPE * self._sent_rot)
+                # Post-latch block bookkeeping: cleared once the TCP has left the
+                # latch point; while it stands, a command opposing the captured
+                # inward direction is an ESCAPE — raised allowance + latch line
+                # (one press must walk out, not five taps — see QD_BLOCK_*).
+                bd_qd, escaping = self._qd_block_dir, False
+                if bd_qd is not None and pose is not None:
+                    bp = self._qd_block_pos
+                    if (bp is not None and math.dist(pose[0], bp) > QD_BLOCK_CLEAR_M):
+                        bd_qd = self._qd_block_dir = self._qd_block_pos = None
+                        self.get_logger().info(
+                            "[jog] singularity-boundary block cleared "
+                            f"(TCP moved {QD_BLOCK_CLEAR_M*1000:.0f}+ mm away)")
+                # Current commanded direction (base frame) from the jog TARGET —
+                # not the last SENT twist: at the start of a tap nothing was sent
+                # yet, and an escape tap pressed while the joints still ring
+                # (qd elevated) must be recognized as an escape from its very
+                # first cycle or it re-latches instantly ("tap five times").
+                cur_dir = None
+                jt = tuple(self._jog[0:3])
+                if pose is not None and any(jt):
+                    cd = jt if self._jog_base else _quat_rotate(pose[1], jt)
+                    m = math.sqrt(cd[0] * cd[0] + cd[1] * cd[1] + cd[2] * cd[2])
+                    if m > 1e-6:
+                        cur_dir = (cd[0] / m, cd[1] / m, cd[2] / m)
+                if bd_qd is not None and cur_dir is not None:
+                    d = (cur_dir[0] * bd_qd[0] + cur_dir[1] * bd_qd[1]
+                         + cur_dir[2] * bd_qd[2])
+                    escaping = d <= -QD_BLOCK_DOT
+                if escaping:
+                    allowed = max(allowed, QD_ESCAPE_ALLOW)
+                latch_at = QD_LATCH_FACTOR * allowed
+                if escaping:
+                    latch_at = max(latch_at, QD_ESCAPE_LATCH)
+                if (pose is not None and not self._qd_latched
+                        and self._qd_now > latch_at):
+                    self._qd_latched = True
+                    # Remember which way the trouble was — but NEVER from an
+                    # escape (overwriting the inward direction with the outward
+                    # one would invert the block).
+                    if not escaping and cur_dir is not None:
+                        self._qd_block_dir = cur_dir
+                        self._qd_block_pos = pose[0]
+                    self.get_logger().warn(
+                        f"[jog] RUNAWAY LATCH: qd {self._qd_now:.2f} rad/s vs "
+                        f"{allowed:.2f} allowed (sent {self._sent_lin*1000:.0f} mm/s "
+                        f"+ {math.degrees(self._sent_rot):.0f}°/s"
+                        f"{', escaping' if escaping else ''}) — zero-hold "
+                        "until key release + joints settle")
+                if pose is not None and not self._qd_latched:
                     # CARTESIAN jog (speedl): the robot's own controller converts the
                     # twist to joint motion onboard, 125 Hz, zero-staleness — straight
                     # lines like the pendant, by construction. The orientation + line
@@ -2097,25 +2306,29 @@ class URServoController(Node):
                     # the UR-native Base frame (= base_link yawed π in ur_description:
                     # x→−x, y→−y; angular likewise) which speedl expects.
                     q = pose[1]
-                    lin = (tuple(self._jog_cmd) if self._jog_base
-                           else _quat_rotate(q, tuple(self._jog_cmd)))
+                    lin_cmd = tuple(self._jog_cmd[0:3])
+                    ang_cmd = tuple(self._jog_cmd[3:6])
+                    lin = lin_cmd if self._jog_base else _quat_rotate(q, lin_cmd)
+                    ang_jog = ang_cmd if self._jog_base else _quat_rotate(q, ang_cmd)
                     lat = self._path_lock_linear(pose)
-                    ang = _quat_rotate(q, self._orient_lock_angular(q))
+                    hold = _quat_rotate(q, self._orient_lock_angular(q))
+                    ang = (ang_jog[0] + hold[0], ang_jog[1] + hold[1],
+                           ang_jog[2] + hold[2])
                     # SAFETY GATE 1: Servo's kinematic sentinel (singularity/collision).
                     # SAFETY GATE 2: singularity-AMPLIFICATION guard — measured joint
-                    # speed (RTDE actual_qd) vs what the commanded TCP speed justifies.
-                    # Smooth braking (slew-limited gate), never a hard cut: a fixed cap
-                    # bang-banged at full speed (cut → re-ramp → cut = stutter).
-                    cmd_speed = math.sqrt(sum(c * c for c in self._jog_cmd))
-                    allowed = QD_ALLOW_BASE + QD_ALLOW_SLOPE * cmd_speed
+                    # speed (RTDE actual_qd) vs what the SENT TCP speed justifies
+                    # (`allowed`, computed above). Smooth braking (slew-limited gate),
+                    # never a hard cut: a fixed cap bang-banged at full speed (cut →
+                    # re-ramp → cut = stutter). The runaway latch above is the
+                    # backstop for when proportional braking cannot win.
                     tgt = 1.0 if self._qd_now <= allowed else allowed / self._qd_now
                     self._qd_gate += _clamp(-QD_GATE_DOWN, QD_GATE_UP, tgt - self._qd_gate)
                     if self._qd_gate < 0.6 and now - self._qd_guard_t > 1.0:
                         self._qd_guard_t = now
                         self.get_logger().warn(
                             f"[jog] amplification guard: qd {self._qd_now:.2f} rad/s vs "
-                            f"{allowed:.2f} allowed at {cmd_speed*1000:.0f} mm/s — "
-                            f"gate ×{self._qd_gate:.2f}")
+                            f"{allowed:.2f} allowed at sent {self._sent_lin*1000:.0f} mm/s "
+                            f"— gate ×{self._qd_gate:.2f}")
                     # Record the pre-gate commanded direction (base_link) — the
                     # collision-halt escape needs the approach dir even though the
                     # gated output is zero.
@@ -2166,24 +2379,51 @@ class URServoController(Node):
                                     "[jog] collision-halt escape (no dir): "
                                     f"crawl ×{COLL_ESCAPE_GATE} — all axes allowed")
                     g = g_servo * self._qd_gate
+                    # Post-latch INWARD block: re-pressing the key that drove the
+                    # arm into the boundary must not ratchet it deeper. Only the
+                    # inward cone is dead — lateral and escape directions pass
+                    # (collision escape is the inverse shape: all-blocked except
+                    # the escape cone, because a wall surrounds; a singular zone
+                    # is left by ANY other direction).
+                    if bd_qd is not None and lin_mag > 1e-6:
+                        d = (lin[0] * bd_qd[0] + lin[1] * bd_qd[1]
+                             + lin[2] * bd_qd[2]) / lin_mag
+                        if d >= QD_BLOCK_DOT:
+                            g = 0.0
+                            if now - self._qd_block_log_t > 1.0:
+                                self._qd_block_log_t = now
+                                self.get_logger().warn(
+                                    "[jog] singularity-boundary block: inward "
+                                    "command zeroed — jog the other way "
+                                    "(clears after "
+                                    f"{QD_BLOCK_CLEAR_M*1000:.0f} mm of travel)")
                     v6 = [-(lin[0] + lat[0]) * g, -(lin[1] + lat[1]) * g,
                           (lin[2] + lat[2]) * g, -ang[0] * g, -ang[1] * g, ang[2] * g]
                     peak = math.sqrt(v6[0]**2 + v6[1]**2 + v6[2]**2)
-                    if peak > 1e-4:
+                    rot = math.sqrt(v6[3]**2 + v6[4]**2 + v6[5]**2)
+                    self._sent_lin, self._sent_rot = peak, rot
+                    if peak > 1e-4 or rot > 1e-4:
                         self._last_motion_t = now
                         self._last_peak_qd = self._qd_now
-                    if peak > 1e-4 and now - last_diag >= 0.3:
-                        last_diag = now
-                        self.get_logger().info(
-                            f"[jog] speedl cmd={peak*1000:.0f}mm/s act_qd={self._qd_now:.3f} "
-                            f"gate={g:.2f}")
+                        if now - last_diag >= 0.3:
+                            last_diag = now
+                            self.get_logger().info(
+                                f"[jog] speedl cmd={peak*1000:.0f}mm/s "
+                                f"rot={math.degrees(rot):.0f}°/s "
+                                f"act_qd={self._qd_now:.3f} gate={g:.2f}")
                     pkt = _pack(v6, MODE_SPEEDL, int(SPEEDL_ACCEL * 100),
                                 self._lookahead, step_t)
                 else:
-                    # Idle (or a TF gap mid-jog → fail safe to a stop): exact speedj
-                    # zeros = the active self-hold.
+                    # Idle, runaway-latched, or a TF gap mid-jog (fail safe to a
+                    # stop): exact speedj zeros = the active self-hold.
+                    self._sent_lin = self._sent_rot = 0.0
                     if not moving:
                         self._qd_gate = 1.0          # fresh gate for the next jog
+                        if self._qd_latched and self._qd_now < QD_LATCH_SETTLE:
+                            self._qd_latched = False
+                            self.get_logger().info(
+                                f"[jog] runaway latch released "
+                                f"(qd {self._qd_now:.2f} rad/s, jog idle)")
                     pkt = _pack(_ZERO6, MODE_SPEEDJ, int(SPEEDJ_ACCEL * 100),
                                 self._lookahead, step_t)
             try:

@@ -6,6 +6,7 @@
 | Package manager | **Pixi** (RoboStack-Jazzy channel) | `pixi.toml` at repo root |
 | Robot I/O | **custom** (see Motion architecture) | `ur_robot_driver` does NOT work on this CB3 |
 | Motion planning | **MoveIt2** (`moveit`) + **MoveIt Servo** | Jazzy release; Servo drives the WASD jog |
+| IK (planned moves) | **TRAC-IK** (`solve_type: Distance`) | `telamoto_bringup/config/kinematics.yaml`, loaded by the **vendored** `ur_moveit.launch.py` (upstream has no override hook) + `moveit_real`/`moveit_rviz`. ⚠ servo_node keeps upstream KDL — Servo is the jog safety sentinel, don't move it to TRAC-IK |
 | Custom interfaces | `telamoto_msgs` | `msg/`, `srv/` |
 | HW extension | `telamoto_hardware` | C++ pluginlib plugin |
 | Bringup | `telamoto_bringup` | launch files, configs, control scripts |
@@ -31,28 +32,47 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   bends the path), with closed-loop **orientation hold** (proportional, tf2-based) and
   **straight-line hold** (PI, critically damped) riding on the commanded twist as
   trim. Jog axes are tool- or base-frame (web toggle).
-- **Web tuning UI** on `http://<pc>:8080` — live sliders (speed/stiffness/jog
-  speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision &
-  wall distance — pushed to `/servo_node` params), Base/Tool frame toggle, WASD
-  jog over a WebSocket (CBOR frames), and an **embedded 3D twin** (three.js +
-  urdf-loader vendored in `web/static/`, lazy-loaded; deep link `/#3d`).
-  **Mobile-first layout**: big 3D view up top, **touch jog pads** (hold-to-jog
-  buttons feeding the same `held` set + 30 Hz stream as the keyboard, so every
-  jog fail-safe applies unchanged; labels follow the Base/Tool toggle), and all
-  sliders live in a bottom-sheet **tuning panel** (floating ⚙ button; deep link
-  `/#tune`). Twin: URDF from latched `/robot_description` via `/api/urdf`, meshes via
-  `/pkg/<package>/<path>` (traversal-guarded), robot + planning-scene walls + TCP
-  trail driven by a ~25 Hz binary stream on `/ws3d` (send-only — never touches
-  the jog path or the link-jitter estimator); boxes with a side >1.5 m render
-  extra-faint (the camera looks at the robot through the cage). **Fullscreen
-  mode** (⛶ on the view / deep link `/#fs`): CSS-fixed (iPhone Safari has no
-  element-fullscreen API), pads + a top bar (status, frame/jog toggles, exit)
-  overlay the view. **Tilt-to-jog**: HOLD the round center pad and tilt the
-  phone — dead-man control; orientation deltas from the hold pose (4° deadzone,
-  25° full scale) become analog lx/ly (CBOR float32 in the same jog frames —
-  the server clamps and rejects non-finite). Browsers only deliver orientation
-  events on HTTPS (front the UI with `tailscale serve`); iOS also asks
-  permission. E2E (incl. headless-Chromium render):
+- **Rotation jog** (pan/tilt/roll of the TCP): keys **I/K** tilt · **J/L** pan ·
+  **U/O** roll (tool frame; ±RX/RY/RZ in base frame), or the touch pads with the
+  **rot** toggle (same `held` set + stream — never a 2nd command path). Three
+  angular axes in the SAME CBOR jog frame (`[lx,ly,lz,ax,ay,az]`; legacy 3-element
+  frames still accepted), through the same lease/ramp/sentinel/amplification-guard
+  machinery (`QD_ALLOW_ROT_SLOPE` extends the qd allowance; link scaling preserves
+  the blind-travel invariant for rotation too). While rotating, the orientation
+  hold stands DOWN (the user owns the orientation; re-locks at the new pose on
+  stop) and the line hold degenerates to a POSITION hold (TCP pivots in place even
+  if the pendant TCP ≠ tool0). Speed via the `jrspeed` slider / `jog_rot_speed`
+  param (default 0.25 rad/s, max 1.0 = servo.yaml rotational cap). ⚠ axis sign
+  conventions not yet verified on the real robot — first jog at LOW speed. E2E:
+  `pixi run python src/telamoto_bringup/test/test_rot_jog_e2e.py`.
+- **Web tuning UI** on `http://<pc>:8080` (IPv6 dual-stack; comes up with the
+  robot OFF too — `_pc_ip()` must never raise) — live sliders (speed/stiffness/
+  jog speed/accel/orientation-hold `okp`/straight-line-hold `pkp`/self-collision
+  & wall distance — pushed to `/servo_node` params), Base/Tool frame toggle,
+  WASD jog over a WebSocket (CBOR frames), and an **embedded 3D twin** (three.js
+  + urdf-loader vendored in `web/static/`; deep link `/#3d`). **Fullscreen
+  layout is the default on EVERY device** (`<body class="fs">`; ✕ exits to the
+  classic scroll page with full diagnostics): full-viewport 3D view, glassy top
+  bar (status dot, ping + auto-slow readout, walls/frame/rot/jog/⚙/exit, inline
+  jog-speed slider, collision-alert chip), **touch jog pads** overlaid bottom
+  (hold-to-jog buttons feeding the same `held` set + 30 Hz stream as the
+  keyboard, so every jog fail-safe applies unchanged; labels follow the
+  Base/Tool toggle; desktop shows the WASD key above each label), sliders in a
+  bottom-sheet **tuning panel** (⚙; deep link `/#tune`). **Collision alerts**:
+  banner driven by `/api/state` (`servoCode`/`collBlocked`/`collWall`/
+  `collAxis`/`nearWall`) — names the wall hit (surface distance + jog-direction
+  cone, never center distance), shows the escape key/pad, disables all pads
+  except the escape direction during a directional halt. Defaults: jog ON, base
+  frame ON, walls hidden. Twin: URDF from latched `/robot_description` via
+  `/api/urdf`, meshes via `/pkg/<package>/<path>` (traversal-guarded), robot +
+  planning-scene walls + TCP trail on a ~25 Hz binary `/ws3d` stream (send-only
+  — never touches the jog path or the link-jitter estimator); boxes with a side
+  >1.5 m render extra-faint. Fullscreen is CSS-fixed (iPhone Safari has no
+  element-fullscreen API; deep link `/#fs`). **Tilt-to-jog: REMOVED 2026-06-12**
+  (the round center pad + deviceorientation handling are gone from the page);
+  the server still accepts analog float axes (CBOR float32, clamped, non-finite
+  rejected) in the jog frame, so an analog input source can return without a
+  protocol change. E2E (incl. headless-Chromium render):
   `pixi run python src/telamoto_bringup/test/test_twin_e2e.py`.
 - **Collision cage**: `scene_wall.py` (launched by both bringups) puts six movable
   walls in the planning scene (`wall_front/back/left/right/top/floor`; defaults
@@ -75,10 +95,16 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   **Collision-halt escape**: the halt is direction-blind (Servo scores state, not
   command), so the controller captures the approach direction at the halt and lets
   roughly-opposite commands (≥60° cone) through at ×0.25 to back out; a halt that
-  appears while idle stays fully blocked (move the wall instead). ⚠ The UR10's own
-  collision model keeps certain wrist links ~2 cm apart at ANY pose, so a
-  self-collision distance above ~2 cm = permanent ×0.25 jog (the 30 cm default
-  slider value does this — lower it to ~1–2 cm for full-speed jogging).
+  appeared while idle (no captured direction) allows crawl in ANY direction —
+  Servo re-halts instantly if the user moves further in. ⚠ **Self-collision
+  threshold must stay < ~0.015 m** (default 0.01): the UR10's forearm↔wrist_2
+  surfaces stand 1.5–2 cm apart at EVERY pose (measured), so any larger value
+  pins Servo in DECELERATE_FOR_COLLISION = jog permanently ×0.25 (the old 0.30
+  default did this — the jog never ran at full speed). Self-collision still
+  hard-halts at model contact. Self-collision E2E (real servo_node, isolated
+  domain 79): `pixi run python src/telamoto_bringup/test/test_selfcoll_e2e.py`
+  — in tests always aggregate `/servo_node/status` over a window, never
+  point-sample (a jittery feed interleaves NO_WARNING between collision codes).
 - **Jog fail-safes** (verified by fake-robot E2E): WS jog frames are ignored
   server-side when jog mode is off; jog is hard-blocked whenever Servo's status is
   >0.5 s stale (servo_node dead/not armed = no sentinel = no motion); web/param
@@ -109,8 +135,43 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
   (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);
   (2) the **amplification guard** (`QD_ALLOW_*`): measured joint speed beyond what
-  the commanded TCP speed justifies shrinks a smooth gate; (3) the URScript
-  miss-watchdog `stopj`; (4) UR's own safety limits.
+  the **SENT (post-gate)** TCP speed justifies shrinks a smooth gate — sent, not
+  the operator target (the 2026-06-12 boundary-stall trip: allowance from the
+  pre-gate 248 mm/s while Servo had the jog at ×0.25/62 mm/s = guard 4× blind,
+  qd hit 3.2 rad/s → UR protective stop). Self-tightening by design: amplified
+  motion spirals to a crawl (slow/deviate, NEVER stop — operator preference),
+  honest motion always recovers; (3) the **runaway latch** (`QD_LATCH_*`): qd >
+  2.5× allowance = proportional braking has lost (boundary/deep-singularity
+  amplification is unbounded) → speedj-zero hold until key release + joints
+  settle — a self-recovering host-side stop instead of UR's pendant-bound
+  protective stop (web banner: "joint-speed runaway"). The latch has
+  **direction memory** (`QD_BLOCK_*`, 2nd on-robot run: re-pressing the inward
+  key ratcheted deeper, escape taps re-latched ~5× before getting out): the
+  inward cone stays HARD-blocked after release (banner names it + the escape
+  key), the opposite cone escapes under a RAISED allowance floor (0.8) and
+  latch line (1.5 rad/s) — direction judged from the live jog TARGET, never
+  the stale sent twist, so an escape pressed while joints still ring counts
+  as an escape from its first cycle; block clears after 5 cm of TCP travel
+  from the latch point (any route incl. planned moves); (4) the URScript
+  miss-watchdog `stopj`; (5) UR's own safety limits. Same-gate Servo status-code
+  changes are now logged too (a code-4↔code-1 flip used to be invisible).
+  Guard E2E (fake robot pulling real packets, synthetic actual_qd):
+  `pixi run python src/telamoto_bringup/test/test_qd_guard_e2e.py`.
+- **Singularity jog semantics** (verified by
+  `pixi run python src/telamoto_bringup/test/test_singularity_e2e.py` — real
+  servo_node, isolated domain 75): approach decel band → gate ×0.25, hard stop
+  → gate ×0. Servo is direction-aware: a halt the JOG caused fires at the
+  boundary, where the reversed twist re-evaluates as DECELERATE_FOR_LEAVING
+  (×0.25) — the escape works because the sentinel feed is PRE-gate. Deep in
+  the singular zone (reachable only by a planned move) EVERY direction halts —
+  deliberate, recover with a planned move; the web banner says all of this
+  (code 2 = halt-class banner, pads stay enabled, Servo arbitrates the way
+  out). ⚠ E2E flake: this host (realtime kernel) intermittently blacks out
+  loopback-UDP delivery into a fresh servo_node for tens of seconds (both
+  RMWs; `grep Udp: /proc/net/snmp` RcvbufErrors climbs; also hits
+  test_selfcoll_e2e.py) — the tests gate/resync on observed tracking and
+  abort with an environmental message, NOT a logic failure. Production is
+  safe regardless: a silent sentinel hard-blocks the jog (0.5 s staleness).
 
 ## Diagnostics
 ```bash

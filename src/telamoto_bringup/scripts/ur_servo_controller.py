@@ -881,8 +881,12 @@ _WEB_PAGE = """<!doctype html>
    const pc=camPc=rtcPc();
    document.getElementById("fscam").classList.add("on");   // instant feedback;
    const tr=pc.addTransceiver("video",{direction:"recvonly"});  // camStop clears
-   try{tr.receiver.jitterBufferTarget=0;}catch(e){}
-   try{tr.receiver.playoutDelayHint=0;}catch(e){}
+   // NO zero jitter-buffer hints (used to set jitterBufferTarget/playoutDelayHint
+   // =0): a zeroed buffer discards every slightly-late frame, so ordinary link
+   // jitter froze the decoder until the next keyframe — and aiortc only emits a
+   // keyframe on a PLI request — which read as "video stops for ~30-60 s then
+   // comes back" (2026-06-16). The browser's adaptive jitter buffer (default)
+   // smooths jitter for a little latency, which a monitoring feed doesn't mind.
    // Every late event guards on camPc===pc: after a quick off→on toggle the
    // OLD connection's ontrack/state events still fire and used to attach a
    // dead stream to the element (black screen). Reveal on the TRACK's unmute
@@ -897,14 +901,16 @@ _WEB_PAGE = """<!doctype html>
        v.style.display="block";v.play().catch(()=>{});}};
      e.track.onunmute=show;
      setTimeout(show,1500);
-     // Frame-stall watchdog: once the feed is on screen and playing, its
-     // currentTime must keep advancing. If it freezes for STALL_S while the
-     // cam is still wanted, the server-side track died (the black-screen
-     // report) — reconnect a fresh PC (the server reopens the v4l2 device).
-     // Skipped during warm-up (not yet shown / still buffering) so a slow
-     // first frame doesn't trip it.
+     // Recovery is TARGETED, not trigger-happy: the remote track ENDING (server
+     // v4l2 source died / PC torn down) is the fast-reconnect trigger. A
+     // transient mute/stall is left to the browser (jitter buffer + its own
+     // keyframe request) — a full PC reconnect costs a multi-second ICE
+     // re-gather, a LONGER black gap than the stall, and an over-eager 4 s
+     // watchdog turned every hiccup into one. The currentTime watchdog is only
+     // a last-resort backstop for a feed frozen long enough to be clearly dead.
+     e.track.onended=()=>{if(camPc===pc)camReconnect();};
      if(camWatch)clearInterval(camWatch);
-     let last=-1, stale=0; const STALL_S=4;
+     let last=-1, stale=0; const STALL_S=8;
      camWatch=setInterval(()=>{
        if(camPc!==pc||!camWant)return;
        if(v.style.display!=="block"||v.paused)return;       // still warming up

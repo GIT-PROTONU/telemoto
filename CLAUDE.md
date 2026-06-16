@@ -73,9 +73,15 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   button → floating overlay, tap = small↔large): the page opens a SEPARATE
   recvonly peer connection through the same `/api/rtc`; the server attaches
   `/dev/video0` (params `cam_device`/`cam_size`/`cam_fps`, default 480p30
-  VP8) as a WebRTC video track — RTP/UDP, `MediaRelay(buffered=False)` +
-  zero receiver jitter-buffer hints, so a slow link drops frames instead of
-  lagging. Camera opens on the FIRST viewer; released only after
+  VP8) as a WebRTC video track — RTP/UDP, `MediaRelay(buffered=False)` so a
+  slow link drops frames server-side instead of queuing them. ⚠ The receiver
+  jitter-buffer hints were ZEROED originally (`jitterBufferTarget`/
+  `playoutDelayHint`=0) for minimum latency — REMOVED 2026-06-16: a zeroed
+  buffer discards every slightly-late frame, so ordinary link jitter froze the
+  decoder until the next keyframe (and aiortc only keyframes on a PLI request),
+  which the user saw as "video stops ~30-60 s then comes back". The browser's
+  default adaptive jitter buffer trades a little latency (fine for a monitoring
+  feed) for smooth playback. Camera opens on the FIRST viewer; released only after
   `CAM_IDLE_CLOSE` (**30 s**, raised from 5 s on 2026-06-16) with no viewers —
   NEVER instantly: an off→on toggle must reuse the open device (v4l2 close is
   async; instant reopen hit EBUSY = the 2026-06-12 black-screen report; open
@@ -87,10 +93,13 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   viewer re-subscribes (`_cam_track`), so the native stop runs only when truly
   idle (both fixes 2026-06-16). **Black-screen recovery** (2026-06-16): if the
   v4l2 source hiccups its track ends (`readyState=="ended"`); `_cam_track`
-  recycles the dead player on the next subscribe, and the client runs a
-  frame-stall watchdog (currentTime frozen ≥4 s while shown) + auto-reconnects
-  on PC failure (keeping `camWant` intent) instead of a permanent black / slow
-  manual re-tap. Client guards every late ontrack/state event on the CURRENT pc
+  recycles the dead player on the next subscribe. Client recovery is TARGETED
+  (keeping `camWant` intent): reconnect on the remote track `ended` event or PC
+  `failed`/`closed` — a transient mute/stall is left to the browser to self-heal
+  (jitter buffer + its own keyframe request) since a reconnect costs a
+  multi-second ICE re-gather; a currentTime-frozen watchdog (≥8 s, raised from a
+  too-eager 4 s that escalated every hiccup into a black reconnect) is only the
+  last-resort backstop. Client guards every late ontrack/state event on the CURRENT pc
   and reveals the overlay on the track's `unmute` (NOT `loadeddata` — Chrome
   won't decode a `display:none` element, which deadlocked the reveal). Cam
   button hidden when the device is absent. RTC E2E (incl. live webcam phase +

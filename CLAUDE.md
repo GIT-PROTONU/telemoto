@@ -68,19 +68,36 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   motion after the keyup zero. Both transports feed ONE `_handle_jog_frame`,
   so every jog fail-safe is transport-agnostic. The web server also sets
   `disable_nagle_algorithm = True` (Nagle + delayed ACK turned the 25 Hz
-  /ws3d push into RTT-paced bursts on remote links). RTC E2E:
+  /ws3d push into RTT-paced bursts on remote links). **Webcam feed** (cam
+  button → floating overlay, tap = small↔large): the page opens a SEPARATE
+  recvonly peer connection through the same `/api/rtc`; the server attaches
+  `/dev/video0` (params `cam_device`/`cam_size`/`cam_fps`, default 480p30
+  VP8) as a WebRTC video track — RTP/UDP, `MediaRelay(buffered=False)` +
+  zero receiver jitter-buffer hints, so a slow link drops frames instead of
+  lagging. Camera opens on the FIRST viewer; released only after
+  `CAM_IDLE_CLOSE` (5 s) with no viewers — NEVER instantly: a quick off→on
+  toggle must reuse the open device (v4l2 close is async; instant reopen hit
+  EBUSY = the 2026-06-12 black-screen report; open also retries on EBUSY).
+  Client guards every late ontrack/state event on the CURRENT pc and shows
+  the overlay only at `loadeddata` (first decoded frame — a cold camera is
+  seconds behind ontrack). Cam button hidden when the device is absent. RTC E2E
+  (incl. live webcam phase):
   `pixi run python src/telamoto_bringup/test/test_rtc_jog_e2e.py`.
   And an **embedded 3D twin** (three.js
-  + urdf-loader vendored in `web/static/`; deep link `/#3d`). **Fullscreen
-  layout is the default on EVERY device** (`<body class="fs">`; ✕ exits to the
-  classic scroll page with full diagnostics): full-viewport 3D view, glassy top
+  + urdf-loader vendored in `web/static/`). **The fullscreen mobile layout is
+  the ONLY interface on EVERY device** (`<body class="fs">` — the classic scroll
+  page and its ✕ exit were REMOVED 2026-06-16; the page never leaves fullscreen):
+  full-viewport 3D view, glassy top
   bar (status dot, ping + udp/tcp transport + auto-slow readout,
-  walls/frame/⚙/exit, collision-alert chip — UI slimmed 2026-06-12: the inline
+  walls/frame/⚙, collision-alert chip — UI slimmed 2026-06-12: the inline
   jog-speed slider is gone, jog speed lives only in the ⚙ tuning panel; the
   **rot** toggle moved to the round CENTER pad of the jog grid (`#rotpad`,
   deliberately NOT class `.jb` so pad handlers/halt-disabling skip it); the
   jog enable button is gone — the page forces jog mode ON at load (always the
-  use case; the SERVER-side jog-mode gate still exists for API/tests)),
+  use case; the SERVER-side jog-mode gate still exists for API/tests); the
+  classic-page diagnostics — pendant speed slider, joint-speed peak, link
+  rtt/gap/lease/scale — now live at the bottom of the ⚙ tuning panel; hidden
+  `viewon`/`basef`/`rotf`/`jogon` checkboxes survive as state holders only),
   **touch jog pads** overlaid bottom
   (hold-to-jog buttons feeding the same `held` set + 30 Hz stream as the
   keyboard, so every jog fail-safe applies unchanged; labels follow the
@@ -98,7 +115,8 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   like the base keep-out column stays at full 0.45 opacity (the old
   any-side rule made the column near-invisible, found 2026-06-12).
   Fullscreen is CSS-fixed (iPhone Safari has no
-  element-fullscreen API; deep link `/#fs`). **Tilt-to-jog: REMOVED 2026-06-12**
+  element-fullscreen API; it is the only layout — no `/#fs`/`/#3d` deep links
+  anymore, the page always boots into it). **Tilt-to-jog: REMOVED 2026-06-12**
   (the round center pad + deviceorientation handling are gone from the page);
   the server still accepts analog float axes (CBOR float32, clamped, non-finite
   rejected) in the jog frame, so an analog input source can return without a

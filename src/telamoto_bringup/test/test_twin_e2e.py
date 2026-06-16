@@ -105,12 +105,13 @@ check("A page embeds viewer",
       st == 200 and b"importmap" in body and b"view3d" in body and b"viewer.js" in body)
 check("A mobile jog pads + tuning panel",
       all(f'data-k="{k}"'.encode() in body for k in "wasdqe")
-      and b'id="pads"' in body and b'id="panelbtn"' in body and b'id="panel"' in body)
-check("A fullscreen bar + deep links (tilt pad removed)",
-      b'id="fsbar"' in body and b'id="fsbtn"' in body and b'id="jb-t"' not in body
-      and b'location.hash==="#fs"' in body and b"deviceorientation" not in body)
-check("A wall-visibility toggles",
-      b'id="wallbtn"' in body and b'id="fswalls"' in body)
+      and b'id="pads"' in body and b'id="fstune"' in body and b'id="panel"' in body)
+check("A fullscreen layout is the only interface (no classic page / exit)",
+      b'id="fsbar"' in body and b'<body class="fs">' in body and b'id="jb-t"' not in body
+      and b'id="fsexit"' not in body and b'id="panelbtn"' not in body
+      and b"deviceorientation" not in body)
+check("A wall-visibility toggle",
+      b'id="wallbtn"' not in body and b'id="fswalls"' in body)
 # The UI is plain-HTTP-only by design: the page must carry the https→http
 # bounce with the REAL configured port injected (8094 here, not the 8080
 # default), every WebSocket must be pinned to ws://, and a TLS handshake
@@ -144,7 +145,7 @@ check("A survives mid-request RST", get("/")[0] == 200)
 
 st, _, body = get("/api/urdf")
 check("B /api/urdf", st == 200 and b"<robot name='t'>" in body, f"status={st}")
-check("B deep link #3d in page", b'location.hash==="#3d"' in get("/")[2])
+check("B deep link #tune in page", b'location.hash==="#tune"' in get("/")[2])
 
 st, h, body = get("/static/viewer.js")
 check("C viewer.js served UNcached", st == 200
@@ -232,7 +233,7 @@ for _ in range(5):
 hz = 5 / (time.monotonic() - t0)
 check("F stream rate ~25 Hz", 15 < hz < 40, f"{hz:.0f} Hz")
 
-# G ── real browser: headless Chromium loads /#3d, runs the ES-module graph
+# G ── real browser: headless Chromium loads the page, runs the ES-module graph
 # (importmap → three/urdf-loader/viewer), fetches URDF + mesh, renders.
 # Success = a <canvas> in the DOM and the "waiting for robot_description"
 # overlay cleared. Skipped (not failed) if no Chromium on this host.
@@ -245,7 +246,7 @@ if chrome:
     # WebGLRenderer constructor throws on headless hosts and no canvas appears.
     cmd = [chrome, "--headless=new", "--no-sandbox", "--enable-unsafe-swiftshader",
            "--virtual-time-budget=10000", "--enable-logging=stderr", "--v=0",
-           "--dump-dom", "http://127.0.0.1:8094/#3d"]
+           "--dump-dom", "http://127.0.0.1:8094/"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=60)
         dom = r.stdout.decode("utf8", "replace")

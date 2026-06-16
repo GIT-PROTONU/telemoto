@@ -91,10 +91,13 @@ from rclpy.parameter import Parameter as RclpyParameter
 try:
     # WebRTC datachannel = the browser's only true-UDP transport (the jog rides
     # an UNORDERED/NO-RETRANSMIT channel so a lossy WAN path drops stale twists
-    # instead of queueing them behind TCP retransmits). Optional: without
-    # aiortc the page's /api/rtc offer gets a 503 and the jog stays on the WS.
+    # instead of queueing them behind TCP retransmits). The same peer machinery
+    # also serves the WEBCAM as a video track (RTP/UDP — lowest-latency feed a
+    # browser can play). Optional: without aiortc the page's /api/rtc offer
+    # gets a 503 and the jog stays on the WS (no webcam).
     from aiortc import (RTCConfiguration, RTCIceServer, RTCPeerConnection,
                         RTCSessionDescription)
+    from aiortc.contrib.media import MediaPlayer, MediaRelay
 except ImportError:
     RTCPeerConnection = None
 
@@ -110,6 +113,14 @@ RTC_STUN     = "stun:stun.l.google.com:19302"  # srflx candidates: the UI is use
                                                # decision 2026-06-12 — no VPN), so
                                                # both ends usually sit behind NAT
 RTC_MAX_PCS  = 16           # refuse offers beyond this many live peer connections
+CAM_DEVICE   = "/dev/video0"   # webcam for the live video track ("" disables)
+CAM_SIZE     = "640x480"       # capture size — 480p30 keeps the VP8 encode cheap
+CAM_FPS      = 30              # on this host and the WAN bitrate well under 1 Mb/s
+CAM_IDLE_CLOSE = 5.0           # s with no viewers before the device is released:
+                               # a quick off→on toggle must REUSE the open camera
+                               # (closing v4l2 is async — instant reopen hits
+                               # EBUSY = black screen) and gets its first frame
+                               # instantly instead of paying the USB open again
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (the idle self-hold: exact zeros)
@@ -454,8 +465,6 @@ _WEB_PAGE = """<!doctype html>
 <style>
  body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:auto;
   padding:1.2rem 1.2rem 5.5rem;max-width:640px}
- h1{font-size:1.25rem;font-weight:600}
- #status{font-size:.85rem;padding:.3rem .6rem;border-radius:.4rem;display:inline-block;margin-bottom:.5rem}
  .ok{background:#13391b;color:#6ee787}.bad{background:#3a1414;color:#ff7b72}
  .row{margin:1.5rem 0}
  .row label{display:flex;justify-content:space-between;font-size:1.05rem;margin-bottom:.45rem}
@@ -489,15 +498,8 @@ _WEB_PAGE = """<!doctype html>
  #view3d{width:100%;height:min(56vh,560px);height:min(56dvh,560px);
   background:#181818;border-radius:.5rem;display:none;overflow:hidden}
  /* Fullscreen 3D (body.fs): the view owns the viewport; a translucent top bar
-    (status + frame/jog toggles + exit) and the jog pads overlay it. CSS-fixed
+    (status + frame/jog toggles) and the jog pads overlay it. CSS-fixed
     rather than the Fullscreen API — iPhone Safari doesn't allow that on divs. */
- #viewwrap{position:relative}
- #fsbtn,#wallbtn{display:none;position:absolute;top:.5rem;z-index:5;margin:0;
-  padding:.45rem .7rem;background:#1c2733cc;border:1px solid #38506a;color:#cfe3ff;
-  border-radius:.6rem;font-size:1rem}
- #fsbtn{right:.5rem}
- #wallbtn{right:3.3rem;font-size:.85rem;padding:.55rem .7rem}
- #wallbtn.on{background:#2d5a8ecc;border-color:#4ea1ff}
  /* Fullscreen top bar: one glassy strip — status dot, ping + transport,
     compact equal buttons, and (when active) the collision chip. */
  #fsbar{display:none;position:fixed;top:0;left:0;right:0;z-index:27;
@@ -509,16 +511,20 @@ _WEB_PAGE = """<!doctype html>
   background:#1c2733;border:1px solid #38506a;color:#cfe3ff;
   border-radius:.55rem;font-size:.85rem;white-space:nowrap}
  #fsbar button.on{background:#2d5a8e;border-color:#4ea1ff}
- #fsexit{flex:0 0 auto!important;width:2.6rem}
  #fsstat{flex:0 0 auto;font-size:.8rem;white-space:nowrap;background:none!important;
   padding:0 .2rem 0 0}
  #fsstat.ok{color:#6ee787}#fsstat.bad{color:#ff7b72}
  #fsping{flex:0 0 auto;font-size:.72rem;color:#9ab;white-space:nowrap;
   font-variant-numeric:tabular-nums;padding-right:.1rem}
+ /* Webcam overlay: floats under the top bar, never over the pads; tap to
+    toggle small ↔ large. Works in both layouts (position:fixed). */
+ #camv{display:none;position:fixed;right:.5rem;z-index:26;background:#000;
+  top:calc(3.6rem + env(safe-area-inset-top));width:min(44vw,340px);
+  border:1px solid #38506a;border-radius:.6rem}
+ #camv.big{width:min(94vw,720px);left:50%;right:auto;transform:translateX(-50%)}
  body.fs{overflow:hidden}
  body.fs #view3d{position:fixed;inset:0;z-index:25;height:100%;border-radius:0}
  body.fs #fsbar{display:flex}
- body.fs #fsbtn,body.fs #wallbtn,body.fs #panelbtn{display:none!important}
  body.fs #pads{position:fixed;left:0;right:0;bottom:0;z-index:27;margin:0;
   justify-content:space-between;
   padding:0 max(1rem,env(safe-area-inset-left)) calc(1rem + env(safe-area-inset-bottom))
@@ -529,11 +535,8 @@ _WEB_PAGE = """<!doctype html>
  body.fs #pads.rot .jb{background:#2b2138e8}
  body.fs #pads.off .jb,body.fs #pads.off #rotpad{pointer-events:none}
  body.fs #panel{z-index:28}
- /* Tuning panel: bottom sheet toggled by the floating button — keeps every
+ /* Tuning panel: bottom sheet toggled by the top-bar gear — keeps every
     slider one tap away while the 3D view + jog pads own the screen. */
- #panelbtn{position:fixed;right:1rem;bottom:1rem;z-index:30;margin:0;
-  background:#2d5a8e;border:1px solid #4ea1ff;color:#fff;border-radius:2rem;
-  padding:.75rem 1.25rem;font-size:1rem;box-shadow:0 2px 12px #000a}
  #panel{position:fixed;left:0;right:0;bottom:0;z-index:20;margin:auto;max-width:640px;
   background:#191f26;border:1px solid #333;border-bottom:none;border-radius:1rem 1rem 0 0;
   padding:0 1.2rem 1.2rem;max-height:75vh;max-height:75dvh;overflow-y:auto;
@@ -543,11 +546,6 @@ _WEB_PAGE = """<!doctype html>
   justify-content:space-between;align-items:center;padding:.8rem 0 .4rem}
  #panelhdr button{margin:0;padding:.35rem .8rem}
  #panel .row{margin:1.1rem 0}
- #collAlert{display:none;border-radius:.4rem;padding:.5rem .8rem;margin-top:.4rem;
-  font-size:.83rem;line-height:1.5}
- #collAlert.warn{display:block;background:#3d3000;border:1px solid #e3b341;color:#e3b341}
- #collAlert.halt{display:block;background:#3d1414;border:1px solid #ff7b72;color:#ff7b72}
- body.fs #collAlert{display:none!important}
  #fsCollAlert{display:none;flex-basis:100%;font-size:.78rem;line-height:1.5;
   padding:.35rem .65rem;border-radius:.45rem;border:1px solid transparent;
   max-width:560px;margin:0 auto;text-align:center}
@@ -555,36 +553,23 @@ _WEB_PAGE = """<!doctype html>
  #fsCollAlert.halt{display:block;background:#3d1414;border-color:#ff7b72;color:#ff7b72}
 </style></head>
 <body class="fs">
- <h1>Telamoto &mdash; motion tuning</h1>
- <div id="status" class="bad">connecting&hellip;</div>
- <div id="collAlert"></div>
- <div id="pendant" class="hint">pendant speed slider: &mdash;</div>
- <div id="qd" class="hint">joint speed: &mdash; &nbsp;|&nbsp; 1.5s peak: &mdash; rad/s</div>
- <div id="link" class="hint">link: &mdash;</div>
- <div class="row"><label>3D view <span><input type="checkbox" id="viewon"> show</span></label>
-   <div id="viewwrap">
-     <button id="fsbtn" title="fullscreen">&#x26F6;</button>
-     <button id="wallbtn" title="show/hide the safety walls (view only)">walls</button>
-     <div id="view3d"></div>
-   </div>
-   <div class="hint">Live twin (drag = orbit, wheel/pinch = zoom). Robot +
-     planning-scene walls + TCP trail; a few kB/s.</div></div>
+ <!-- The fullscreen mobile layout is the ONLY interface — there is no classic
+      scroll page. These hidden checkboxes are state holders: jog mode is forced
+      ON at load (the SERVER-side jog-mode gate still exists for API/tests),
+      Base/Tool + rotate are driven by the top bar + center pad, and the 3D view
+      is always on. Diagnostics moved into the tuning panel. -->
+ <input type="checkbox" id="viewon" style="display:none">
+ <input type="checkbox" id="basef" style="display:none">
+ <input type="checkbox" id="rotf" style="display:none">
+ <input type="checkbox" id="jogon" style="display:none">
+ <div id="view3d"></div>
  <div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
    <button id="fswalls">walls</button>
+   <button id="fscam">cam</button>
    <button id="fsframe">tool</button>
    <button id="fstune">&#9881;</button>
-   <button id="fsexit">&#10005;</button>
    <div id="fsCollAlert"></div></div>
- <div class="row" style="border-top:1px solid #333;padding-top:1.2rem;margin-top:1.2rem">
-   <label>Jog <span>
-     <input type="checkbox" id="rotf"> rotate pads &nbsp;
-     <input type="checkbox" id="basef"> base frame
-     <!-- jog mode has no UI toggle (always-on is the use case, 2026-06-12);
-          the hidden box keeps the state wiring + the server is told ON at
-          load. The SERVER-side jog-mode gate still exists for API/tests. -->
-     <input type="checkbox" id="jogon" style="display:none"></span></label>
-   <div class="hint" id="joghint"></div>
- </div>
+ <video id="camv" autoplay muted playsinline></video>
  <div id="pads" class="off">
    <div id="padgrid">
      <button class="jb" id="jb-q" data-k="q"></button>
@@ -598,9 +583,9 @@ _WEB_PAGE = """<!doctype html>
      <button class="jb" id="jb-s" data-k="s"></button>
    </div>
  </div>
- <button id="panelbtn">&#9881; tuning</button>
  <div id="panel">
  <div id="panelhdr"><b>Tuning</b><button id="panelclose">&#10005; close</button></div>
+ <div class="hint" id="joghint"></div>
  <div class="row"><label>Jog speed <span class="val" id="jspeedv"></span></label>
    <input type="range" id="jspeed" min="0.005" max="0.5" step="0.005">
    <div class="hint">Cartesian jog velocity &mdash; lower for mm-precise work. Live.</div></div>
@@ -638,6 +623,9 @@ _WEB_PAGE = """<!doctype html>
    <input type="range" id="lookahead" min="0.03" max="0.2" step="0.005">
    <div class="hint">Higher = smoother but more lag; raise if it buzzes. Live.</div></div>
  <button onclick="reset()">Reset to defaults</button>
+ <div class="hint" id="pendant" style="border-top:1px solid #333;margin-top:1.1rem;padding-top:.9rem">pendant speed slider: &mdash;</div>
+ <div class="hint" id="qd">joint speed: &mdash; &nbsp;|&nbsp; 1.5s peak: &mdash; rad/s</div>
+ <div class="hint" id="link">link: &mdash;</div>
  </div>
 <script type="importmap">
 {"imports":{"three":"/static/three.module.js",
@@ -664,11 +652,10 @@ _WEB_PAGE = """<!doctype html>
  async function refreshStatus(){try{const t0=performance.now();
    const s=await(await fetch("/api/state")).json();
    const rtt=Math.round(performance.now()-t0);
-   const st=document.getElementById("status");
-   st.textContent=s.connected?"robot connected":"robot not connected \\u2014 press Play on the pendant";
-   st.className=s.connected?"ok":"bad";
    const fst=document.getElementById("fsstat");
-   fst.textContent=s.connected?"\\u25CF":"\\u25CF press Play";fst.className=st.className;
+   fst.textContent=s.connected?"\\u25CF":"\\u25CF press Play";
+   fst.className=s.connected?"ok":"bad";
+   document.getElementById("fscam").style.display=s.cam?"":"none";
    document.getElementById("pendant").textContent="pendant speed slider: "
      +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");
    const qd=document.getElementById("qd");
@@ -783,7 +770,7 @@ _WEB_PAGE = """<!doctype html>
    if(escKey&&rotOn){const r=document.getElementById("rotf");
      r.checked=false;r.dispatchEvent(new Event("change"));}
    setPadBlock(escKey);
-   for(const id of["collAlert","fsCollAlert"]){
+   for(const id of["fsCollAlert"]){
      const el=document.getElementById(id);
      if(msg){el.className=cls;el.innerHTML=msg;}
      else{el.className="";el.textContent="";}}}
@@ -839,11 +826,22 @@ _WEB_PAGE = """<!doctype html>
  // when the server lacks aiortc: /api/rtc answers 503). Same frames, same
  // server-side _handle_jog_frame — a 2nd transport, never a 2nd command path.
  function rtcRetry(){if(!rtcRetryT)rtcRetryT=setTimeout(()=>{rtcRetryT=null;rtcOpen();},5000);}
+ function rtcPc(){return new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});}
+ async function rtcSignal(pc){                 // non-trickle: offer → /api/rtc → answer
+   await pc.setLocalDescription(await pc.createOffer());
+   await new Promise(res=>{                    // wait for the full candidate set,
+     if(pc.iceGatheringState==="complete")return res();
+     const t=setTimeout(res,2000);             // but cap the wait (srflx is slow)
+     pc.addEventListener("icegatheringstatechange",
+       ()=>{if(pc.iceGatheringState==="complete"){clearTimeout(t);res();}});});
+   const r=await fetch("/api/rtc",{method:"POST",
+     body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})});
+   if(!r.ok)throw 0;
+   await pc.setRemoteDescription(await r.json());}
  function rtcOpen(){
    if(!window.RTCPeerConnection)return;        // http page without RTC → WS only
    let pc;
-   try{pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});}
-   catch(e){return;}
+   try{pc=rtcPc();}catch(e){return;}
    const ch=pc.createDataChannel("jog",{ordered:false,maxRetransmits:0});
    ch.binaryType="arraybuffer";
    let down=false;
@@ -853,17 +851,48 @@ _WEB_PAGE = """<!doctype html>
    ch.onclose=fail; ch.onerror=fail;
    pc.onconnectionstatechange=()=>{
      if(pc.connectionState==="failed"||pc.connectionState==="closed")fail();};
-   pc.createOffer().then(o=>pc.setLocalDescription(o))
-     .then(()=>new Promise(res=>{              // non-trickle: wait for the full
-       if(pc.iceGatheringState==="complete")return res();   // candidate set,
-       const t=setTimeout(res,2000);           // but cap the wait (srflx is slow)
-       pc.addEventListener("icegatheringstatechange",
-         ()=>{if(pc.iceGatheringState==="complete"){clearTimeout(t);res();}});}))
-     .then(()=>fetch("/api/rtc",{method:"POST",
-       body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})}))
-     .then(r=>{if(!r.ok)throw 0;return r.json();})
-     .then(a=>pc.setRemoteDescription(a)).catch(fail);}
+   rtcSignal(pc).catch(fail);}
  rtcOpen();
+ // Webcam viewer: a SEPARATE recvonly peer connection (the jog channel is
+ // never renegotiated; video over RTP/UDP = the lowest-latency feed a browser
+ // can play). Zero playout/jitter buffering — the server already drops frames
+ // a slow link can't carry (relay buffered=false), so buffering only adds lag.
+ let camPc=null;
+ function camStop(){const pc=camPc;camPc=null;
+   if(pc){try{pc.close();}catch(e){}}
+   const v=document.getElementById("camv");
+   v.srcObject=null;v.style.display="none";
+   document.getElementById("fscam").classList.remove("on");}
+ async function camStart(){
+   const pc=camPc=rtcPc();
+   document.getElementById("fscam").classList.add("on");   // instant feedback;
+   const tr=pc.addTransceiver("video",{direction:"recvonly"});  // camStop clears
+   try{tr.receiver.jitterBufferTarget=0;}catch(e){}
+   try{tr.receiver.playoutDelayHint=0;}catch(e){}
+   // Every late event guards on camPc===pc: after a quick off→on toggle the
+   // OLD connection's ontrack/state events still fire and used to attach a
+   // dead stream to the element (black screen). Reveal on the TRACK's unmute
+   // (= first RTP packet, fires regardless of element state) with a timed
+   // fallback — NEVER gate on video-element events like loadeddata: Chrome
+   // doesn't decode for a display:none element, so that gating deadlocked
+   // (hidden until a frame, no frame while hidden = "no feed at all").
+   pc.ontrack=e=>{if(camPc!==pc)return;
+     const v=document.getElementById("camv");
+     v.srcObject=e.streams[0];
+     const show=()=>{if(camPc===pc&&v.style.display!=="block"){
+       v.style.display="block";v.play().catch(()=>{});}};
+     e.track.onunmute=show;
+     setTimeout(show,1500);};
+   pc.onconnectionstatechange=()=>{
+     if((pc.connectionState==="failed"||pc.connectionState==="closed")&&camPc===pc)camStop();};
+   try{await rtcSignal(pc);}
+   catch(e){if(camPc===pc)camStop();return;}    // fail of THIS attempt only
+   if(camPc!==pc){try{pc.close();}catch(e){}}   // toggled off mid-signaling
+   }
+ document.getElementById("fscam").addEventListener("click",
+   ()=>{camPc?camStop():camStart();});
+ document.getElementById("camv").addEventListener("click",   // tap: small ↔ large
+   e=>e.target.classList.toggle("big"));
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
  function cborInt(n){n=Math.round(n);const m=n<0?0x20:0x00,u=n<0?-1-n:n;
    if(u<24)return[m|u];if(u<256)return[m|24,u];return[m|25,(u>>8)&0xff,u&0xff];}
@@ -943,9 +972,6 @@ _WEB_PAGE = """<!doctype html>
  let twin=null;
  document.getElementById("viewon").addEventListener("change",async e=>{
    const d=document.getElementById("view3d");
-   for(const b of["fsbtn","wallbtn"])
-     document.getElementById(b).style.display=e.target.checked?"block":"none";
-   if(!e.target.checked)setFS(false);
    if(e.target.checked){d.style.display="block";
      try{if(twin)twin.resume();
        // ?v= busts copies cached before viewer.js became no-cache.
@@ -955,20 +981,17 @@ _WEB_PAGE = """<!doctype html>
        d.innerHTML="<div style='padding:1rem;color:#ff7b72;font-size:.85rem'>3D view failed: "
          +err.message+"</div>";}}
    else{d.style.display="none";if(twin)twin.pause();}});
- // Fullscreen 3D: the view fills the viewport, jog pads + a slim top bar
- // (status, frame/jog toggles that proxy the real checkboxes, exit) overlay it.
+ // The fullscreen layout IS the interface: the 3D view fills the viewport, the
+ // jog pads + a slim top bar (status, frame/jog toggles that proxy the hidden
+ // checkboxes) overlay it. setFS just guarantees the 3D view is on.
  function setFS(on){document.body.classList.toggle("fs",on);
    if(on){const v=document.getElementById("viewon");
      if(!v.checked){v.checked=true;v.dispatchEvent(new Event("change"));}}}
- document.getElementById("fsbtn").addEventListener("click",()=>setFS(true));
- document.getElementById("fsexit").addEventListener("click",()=>setFS(false));
  // Safety-wall visibility (3D view ONLY — collision checking is unaffected).
  let wallsOn=false;
  function setWalls(on){wallsOn=on;
-   document.getElementById("wallbtn").classList.toggle("on",on);
    document.getElementById("fswalls").classList.toggle("on",on);
    if(twin&&twin.walls)twin.walls(on);}   // guard: a cache-stale twin has no walls()
- document.getElementById("wallbtn").addEventListener("click",()=>setWalls(!wallsOn));
  document.getElementById("fswalls").addEventListener("click",()=>setWalls(!wallsOn));
  const fsProxy=(btn,box)=>document.getElementById(btn).addEventListener("click",()=>{
    const c=document.getElementById(box);c.checked=!c.checked;
@@ -976,19 +999,13 @@ _WEB_PAGE = """<!doctype html>
  fsProxy("fsframe","basef");fsProxy("rotpad","rotf");
  // Tuning panel (bottom sheet): keeps the screen for the 3D view + jog pads.
  const panel=document.getElementById("panel");
- document.getElementById("panelbtn").addEventListener("click",()=>panel.classList.toggle("open"));
  document.getElementById("fstune").addEventListener("click",()=>panel.classList.toggle("open"));
  document.getElementById("panelclose").addEventListener("click",()=>panel.classList.remove("open"));
  wsOpen(); init();
- // Deep links: …:8080/#3d opens with the 3D view on; #fs straight into
- // fullscreen; #tune opens the tuning panel.
- if(location.hash==="#3d"){const v=document.getElementById("viewon");
-   v.checked=true;v.dispatchEvent(new Event("change"));}
- if(location.hash==="#fs")setFS(true);
+ // Deep link …:8080/#tune opens with the tuning panel already up.
  if(location.hash==="#tune")panel.classList.add("open");
- // The page boots straight into the fullscreen layout on EVERY device (body
- // ships class="fs" so there's no classic-page flash); this just syncs the 3D
- // view + checkbox. The classic scroll page remains available via ✕.
+ // The fullscreen mobile layout is the only interface on EVERY device (body
+ // ships class="fs"); this turns the 3D view on at boot.
  setFS(true);
 </script>
 </body></html>
@@ -1137,6 +1154,9 @@ class URServoController(Node):
         self.declare_parameter("reverse_port", REVERSE_PORT)
         self.declare_parameter("web_port", WEB_PORT)
         self.declare_parameter("rtc_stun", RTC_STUN)   # "" = host candidates only
+        self.declare_parameter("cam_device", CAM_DEVICE)   # "" = no webcam track
+        self.declare_parameter("cam_size", CAM_SIZE)
+        self.declare_parameter("cam_fps", CAM_FPS)
         # gain/lookahead stream in every packet → tunable live (web UI / params).
         self.declare_parameter("servoj_gain", 300, ParameterDescriptor(
             description="servoj gain / stiffness (live)",
@@ -1191,6 +1211,9 @@ class URServoController(Node):
         self._port     = g("reverse_port").get_parameter_value().integer_value
         self._web_port = g("web_port").get_parameter_value().integer_value
         self._rtc_stun = g("rtc_stun").get_parameter_value().string_value
+        self._cam_device = g("cam_device").get_parameter_value().string_value
+        self._cam_size   = g("cam_size").get_parameter_value().string_value
+        self._cam_fps    = g("cam_fps").get_parameter_value().integer_value
         self._gain      = g("servoj_gain").get_parameter_value().integer_value
         self._lookahead = g("servoj_lookahead").get_parameter_value().double_value
         self._speed     = g("speed_scale").get_parameter_value().double_value
@@ -1363,7 +1386,12 @@ class URServoController(Node):
         # aiortc missing, /api/rtc answers 503 and the page stays on the WS.
         self._rtc_pcs = set()
         self._rtc_loop = None
+        # Webcam: opened lazily on the FIRST video viewer, closed when the
+        # LAST one disconnects — no capture/encode CPU while nobody watches.
+        self._cam_player = None
+        self._cam_pcs = set()
         if RTCPeerConnection is not None:
+            self._cam_relay = MediaRelay()
             self._rtc_loop = asyncio.new_event_loop()
             threading.Thread(target=self._rtc_loop.run_forever,
                              daemon=True, name="ri-rtc").start()
@@ -1809,17 +1837,75 @@ class URServoController(Node):
             # zero the jog, let the lease machinery do the rest.
             if pc.connectionState in ("failed", "closed"):
                 self._rtc_pcs.discard(pc)
+                kind = ("webcam viewer" if pc in self._cam_pcs
+                        else "rtc jog stream")
                 self.get_logger().info(
-                    f"[web] rtc jog stream disconnected from {ip} "
+                    f"[web] {kind} disconnected from {ip} "
                     f"({pc.connectionState})")
-                self._apply_jog(0.0, 0.0, 0.0)
+                if pc not in self._cam_pcs:        # jog peer: stop like a WS
+                    self._apply_jog(0.0, 0.0, 0.0)  # drop would
+                self._cam_release(pc)
                 await pc.close()
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=typ))
+        # An offer with a video m-line is a WEBCAM VIEWER (the page opens a
+        # separate recvonly peer connection for it): attach the live track.
+        if any(t.kind == "video" for t in pc.getTransceivers()):
+            track = await self._cam_track()
+            if track is not None:
+                pc.addTrack(track)
+                self._cam_pcs.add(pc)
+                self.get_logger().info(f"[web] webcam viewer connected from {ip}")
         await pc.setLocalDescription(await pc.createAnswer())
         # aiortc resolves setLocalDescription only after ICE gathering, so the
         # localDescription below already carries the full candidate set.
         return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
+    async def _cam_track(self):
+        """A fresh relay subscription onto the (lazily opened) webcam, or None
+        if there is no camera. buffered=False is the low-latency knob: a
+        viewer that can't keep up gets frames DROPPED, never queued. The open
+        is retried: the fd of a just-stopped player releases asynchronously,
+        so a reopen right after the idle-close can hit EBUSY for a moment."""
+        if not self._cam_device:
+            return None
+        if self._cam_player is None:
+            for attempt in range(4):
+                try:
+                    self._cam_player = MediaPlayer(
+                        self._cam_device, format="v4l2",
+                        options={"framerate": str(self._cam_fps),
+                                 "video_size": self._cam_size})
+                    break
+                except Exception as exc:
+                    err = exc
+                    await asyncio.sleep(0.3)
+            else:
+                self.get_logger().warn(f"[web] webcam open failed: {err}")
+                return None
+            self.get_logger().info(
+                f"[web] webcam opened ({self._cam_device} "
+                f"{self._cam_size}@{self._cam_fps})")
+        return self._cam_relay.subscribe(self._cam_player.video, buffered=False)
+
+    def _cam_release(self, pc) -> None:
+        """Called when a peer closes: release the camera once NOBODY has
+        watched for CAM_IDLE_CLOSE — never instantly, so an off→on toggle
+        keeps the open device (the instant-stop version raced its own v4l2
+        close on reopen = black screen). Piled-up idle tasks are harmless:
+        whichever fires first stops, the rest see player None / new viewers."""
+        self._cam_pcs.discard(pc)
+        if self._cam_pcs or self._cam_player is None:
+            return
+
+        async def stop_if_idle():
+            await asyncio.sleep(CAM_IDLE_CLOSE)
+            if not self._cam_pcs and self._cam_player is not None:
+                self._cam_player.video.stop()
+                self._cam_player = None
+                self.get_logger().info("[web] webcam closed (no viewers)")
+
+        asyncio.ensure_future(stop_if_idle())
 
     def _web_loop(self) -> None:
         node = self
@@ -1940,6 +2026,8 @@ class URServoController(Node):
                         "lease": round(node._link_lease * 1000),
                         "linkscale": round(node._link_scale, 2),
                         "connected": connected,
+                        "cam": bool(node._cam_device
+                                    and os.path.exists(node._cam_device)),
                         "jogon": node._jog_mode,
                         "servoGate": round(node._servo_gate, 2),
                         "servoCode": int(node._servo_code),

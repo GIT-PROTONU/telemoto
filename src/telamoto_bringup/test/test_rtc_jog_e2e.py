@@ -17,6 +17,9 @@ Instantiates the REAL URServoController and connects a REAL aiortc peer
   R5. keepalive (empty array) feeds the link estimator, never the twist
   R6. server-side jog-mode gate applies to the RTC path too
   R7. peer disconnect zeroes the jog and reaps the peer connection
+  R8. webcam: a recvonly video offer gets live frames; the camera is opened
+      on the first viewer and released when the last one disconnects
+      (skipped when the host has no camera)
 """
 import asyncio
 import importlib.util
@@ -177,6 +180,61 @@ check("R7 disconnect zeroes jog", node._jog[0] == 0.0, f"{lat:.0f} ms after clos
 wait(lambda: len(node._rtc_pcs) == 0, 10.0)
 check("R7 peer connection reaped", len(node._rtc_pcs) == 0,
       f"{len(node._rtc_pcs)} pcs left")
+
+# R8 ── webcam track: open on first viewer, released after the last ──────────
+if os.path.exists(node._cam_device or ""):
+    from aiortc.mediastreams import MediaStreamError
+
+    async def cam_connect():
+        pc = RTCPeerConnection()
+        pc.addTransceiver("video", direction="recvonly")
+        frames = asyncio.Queue()
+
+        @pc.on("track")
+        def on_track(track):
+            async def pump():
+                try:
+                    while True:
+                        await frames.put(await track.recv())
+                except MediaStreamError:
+                    pass
+            asyncio.ensure_future(pump())
+
+        await pc.setLocalDescription(await pc.createOffer())
+        body = json.dumps({"sdp": pc.localDescription.sdp,
+                           "type": pc.localDescription.type}).encode()
+        resp = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: post("/api/rtc", body).read())
+        await pc.setRemoteDescription(RTCSessionDescription(**json.loads(resp)))
+        f1 = await asyncio.wait_for(frames.get(), 10)
+        f2 = await asyncio.wait_for(frames.get(), 5)
+        return pc, f1, f2
+
+    t0 = time.perf_counter()
+    campc, f1, f2 = run(cam_connect(), 30)
+    check("R8 webcam frames arrive", f1.width > 0 and f2.width > 0,
+          f"{f1.width}x{f1.height}, first frame {(time.perf_counter()-t0)*1000:.0f} ms"
+          " after offer")
+    check("R8 camera opened on demand", node._cam_player is not None,
+          "player active with a viewer")
+    # Quick off->on toggle (the user-visible "black screen" bug): the NEXT
+    # viewer inside the idle-close grace must inherit the OPEN device and get
+    # frames immediately — the instant-stop version raced its own v4l2 close
+    # on reopen (EBUSY -> answer with a dead track).
+    run(campc.close())
+    player_before = node._cam_player
+    t0 = time.perf_counter()
+    campc2, g1, _ = run(cam_connect(), 30)
+    check("R8 quick re-toggle gets frames", g1.width > 0,
+          f"first frame {(time.perf_counter()-t0)*1000:.0f} ms after re-offer")
+    check("R8 open device reused", node._cam_player is player_before,
+          "no v4l2 reopen inside the grace period")
+    run(campc2.close())
+    wait(lambda: node._cam_player is None, usc.CAM_IDLE_CLOSE + 7.0)
+    check("R8 camera released when idle", node._cam_player is None,
+          f"freed after the {usc.CAM_IDLE_CLOSE:.0f}s no-viewer grace")
+else:
+    print("SKIP  R8 webcam (no camera device)", flush=True)
 
 print("RESULT:", "ALL PASS" if fails == 0 else f"{fails} FAILURES", flush=True)
 sys.stdout.flush()

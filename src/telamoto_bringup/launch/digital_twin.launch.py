@@ -101,23 +101,6 @@ def generate_launch_description():
         condition=IfCondition(use_mock_hardware),
     )
 
-    # MoveIt Servo for the FAKE arm: on real hardware Servo is only the jog
-    # sentinel (motion goes out via URScript speedl, which the fake arm lacks),
-    # so here it ALSO drives the mock arm — its JointTrajectory output is pointed
-    # at the active controller's streaming topic, so a web/keyboard jog moves the
-    # simulated robot in RViz + the 3D twin. ur_servo_controller already publishes
-    # the jog twist on /servo_node/delta_twist_cmds in both modes.
-    ur_servo_mock = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(PathJoinSubstitution([
-            FindPackageShare("telamoto_bringup"), "launch", "moveit_servo_mock.launch.py",
-        ])),
-        launch_arguments={
-            "ur_type": "ur10",
-            "jog_command_topic": [initial_joint_ctrl, "/joint_trajectory"],
-        }.items(),
-        condition=IfCondition(use_mock_hardware),
-    )
-
     # ═══════════════════════════════════════════════════════════════════════
     # REAL MODE
     # ═══════════════════════════════════════════════════════════════════════
@@ -151,10 +134,10 @@ def generate_launch_description():
     # pressing Play on the pendant's External Control program.
     # Runs in BOTH modes: it also serves the :8080 web UI (mobile page + 3D twin
     # + webcam), so the emulated robot has the same UI. In mock mode there's no
-    # robot on 50001 (the speedl path is a no-op), but the jog twist it publishes
-    # on /servo_node/delta_twist_cmds drives the FAKE arm through moveit_servo_mock
-    # (Servo's JointTrajectory output → the active controller's joint_trajectory
-    # topic), so a web/keyboard jog moves the simulated robot in RViz + the twin.
+    # robot on 50001, so jog frames are accepted but don't actuate the fake arm
+    # (planned moves from RViz/MoveIt still move it via scaled_joint_trajectory_
+    # controller); MoveIt-mock drives scaled_jtc, so the controller's unused
+    # joint_trajectory_controller action server doesn't conflict.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",
@@ -210,7 +193,6 @@ def generate_launch_description():
             # dies with "launch configuration 'warehouse_sqlite_path' does not
             # exist" when the handler finally fires.
             ur_moveit_fake,
-            ur_servo_mock,
             # RViz (mock): included DIRECTLY, not via a TimerAction — the timer's
             # deferred include never fired in this launch (no error, just no
             # RViz), while the standalone moveit_rviz path works, so mirror it.

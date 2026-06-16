@@ -235,23 +235,12 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
 - **Emulated/mock mode now serves the web UI too** (2026-06-16): `ur_servo_controller`
   runs in BOTH modes (its `UnlessCondition(use_mock_hardware)` was removed), so
   `pixi run twin` brings up RViz **and** the `:8080` mobile web UI + 3D twin +
-  webcam against the fake robot. In mock the speedl/URScript jog path is a
-  no-op (no robot on 50001), so the **web/keyboard jog moves the fake arm
-  through `moveit_servo_mock.launch.py`** instead (2026-06-16): a `servo_node`
-  reusing the real sentinel `ur_servo.yaml` but with `command_out_topic`
-  overridden to the active controller's `joint_trajectory` streaming topic
-  (`scaled_joint_trajectory_controller/joint_trajectory`), so the jog twist
-  `ur_servo_controller` already publishes on `/servo_node/delta_twist_cmds`
-  (both modes) actuates the sim arm in RViz + the 3D twin. Servo runs as a
-  non-primary PSM alongside the mock move_group (needs it up for robot state)
-  and streams to the SAME controller MoveIt uses for planned moves — jog owns
-  it only while a non-zero twist is commanded, so an idle jog leaves RViz
-  Plan&Execute free. ⚠ NOT yet verified end-to-end on this host: `servo_node`
-  launches + initializes fine but the documented **loopback-UDP blackout into
-  fresh processes** (RcvbufErrors climbing) pins it at "Waiting to receive
-  robot state update" (same flake that freezes the ros2 CLI here) — retest
-  after a reboot or on the robot host. Planned moves from RViz/MoveIt move the
-  fake arm via `scaled_joint_trajectory_controller` regardless.
+  webcam against the fake robot. ⚠ In mock mode jog frames are accepted but
+  DON'T actuate the fake arm (the speedl/jog path streams URScript to the real
+  robot on port 50001, which isn't there) — planned moves from RViz/MoveIt still
+  move it via `scaled_joint_trajectory_controller`, and the 3D twin reflects the
+  mock `/joint_states`. No action-server conflict: MoveIt-mock drives `scaled_jtc`
+  while the controller's `joint_trajectory_controller` action sits unused.
 - ⚠ **SAFETY** (past incident: singularity amplification made the arm shoot) —
   layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
   (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);

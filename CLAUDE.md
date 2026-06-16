@@ -223,6 +223,24 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   the planning scene monitor times out (10 s) and move_group exits FATAL —
   without respawn that permanently killed planned moves AND the ACM fetch
   (floor + base column withheld) for the whole session.
+- ⚠ **Launch gotcha — `launch_rviz` leak (fixed 2026-06-16)**: the mock-mode
+  `ur_control_fake`/`ur_moveit_fake` includes pass `launch_rviz:=false` to their
+  child launches and that value LEAKS back into the parent scope, so the RViz
+  conditions saw `launch_rviz=="false"` and RViz silently never started in
+  `pixi run twin` (no error). Fixed by snapshotting the user's choice into a
+  separate `rviz_enabled` config at the top of the description (the includes
+  never set it) and gating both RViz nodes on `rviz_enabled`. Same class of
+  sub-include-arg-leak to watch for with any LaunchConfiguration also passed to
+  a child launch.
+- **Emulated/mock mode now serves the web UI too** (2026-06-16): `ur_servo_controller`
+  runs in BOTH modes (its `UnlessCondition(use_mock_hardware)` was removed), so
+  `pixi run twin` brings up RViz **and** the `:8080` mobile web UI + 3D twin +
+  webcam against the fake robot. ⚠ In mock mode jog frames are accepted but
+  DON'T actuate the fake arm (the speedl/jog path streams URScript to the real
+  robot on port 50001, which isn't there) — planned moves from RViz/MoveIt still
+  move it via `scaled_joint_trajectory_controller`, and the 3D twin reflects the
+  mock `/joint_states`. No action-server conflict: MoveIt-mock drives `scaled_jtc`
+  while the controller's `joint_trajectory_controller` action sits unused.
 - ⚠ **SAFETY** (past incident: singularity amplification made the arm shoot) —
   layered, all must stay ON: (1) MoveIt Servo runs as a **singularity sentinel**
   (its `~/status` gates the speedl command; thresholds in `config/ur_servo.yaml`);
@@ -288,7 +306,7 @@ pull-loop and logs `PROTECTIVE STOP`, classified MID-MOTION / ON-RELEASE / IDLE.
 ## Common commands
 ```bash
 pixi run build            # colcon build (RelWithDebInfo)
-pixi run twin             # launch with mock hardware, no physical robot
+pixi run twin             # mock hardware (no robot): RViz + :8080 web UI/twin (jog won't move the fake arm)
 pixi run twin-real        # real robot (add launch_rviz:=false when jog-tuning)
 pixi run rviz             # RViz2 + MoveIt2 plugin only
 pixi run tune             # open the :8080 web tuning UI

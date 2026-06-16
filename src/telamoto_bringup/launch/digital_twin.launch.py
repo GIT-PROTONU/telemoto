@@ -25,6 +25,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    SetLaunchConfiguration,
     TimerAction,
 )
 from launch.conditions import IfCondition, UnlessCondition
@@ -131,13 +132,18 @@ def generate_launch_description():
     # External Control URCap driver: serves the servoj script on request_program
     # and streams packets, both on the reverse socket (50001). Start it by
     # pressing Play on the pendant's External Control program.
+    # Runs in BOTH modes: it also serves the :8080 web UI (mobile page + 3D twin
+    # + webcam), so the emulated robot has the same UI. In mock mode there's no
+    # robot on 50001, so jog frames are accepted but don't actuate the fake arm
+    # (planned moves from RViz/MoveIt still move it via scaled_joint_trajectory_
+    # controller); MoveIt-mock drives scaled_jtc, so the controller's unused
+    # joint_trajectory_controller action server doesn't conflict.
     servo_controller = Node(
         package="telamoto_bringup",
         executable="ur_servo_controller.py",
         name="ur_servo_controller",
         output="screen",
         parameters=[{"robot_ip": robot_ip}],
-        condition=UnlessCondition(use_mock_hardware),
     )
 
     ur_moveit_real = IncludeLaunchDescription(
@@ -160,16 +166,23 @@ def generate_launch_description():
     # ═══════════════════════════════════════════════════════════════════════
     # RVIZ2 — separate instances per condition (reusing one object breaks launch)
     # ═══════════════════════════════════════════════════════════════════════
-    def _rviz(fake: bool):
+    def _rviz(fake: bool, condition=None):
         return IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([
                 FindPackageShare("telamoto_bringup"), "launch", "moveit_rviz.launch.py",
             ])),
             launch_arguments={"use_fake_hardware": "true" if fake else "false"}.items(),
+            condition=condition,
         )
 
     return LaunchDescription(
         declared_args + [
+            # Snapshot the user's RViz choice into a config the sub-includes never
+            # touch: ur_control_fake/ur_moveit_fake pass launch_rviz:=false to
+            # their child launches, and that value LEAKS back into the parent
+            # scope — so by the time the RViz conditions below evaluate
+            # `launch_rviz` it has become "false" and RViz silently never starts.
+            SetLaunchConfiguration("rviz_enabled", launch_rviz),
             scene_wall,
             # Fake mode
             ur_control_fake,
@@ -180,8 +193,13 @@ def generate_launch_description():
             # dies with "launch configuration 'warehouse_sqlite_path' does not
             # exist" when the handler finally fires.
             ur_moveit_fake,
-            TimerAction(period=8.0, actions=[_rviz(fake=True)],
-                        condition=IfCondition(AndSubstitution(launch_rviz, use_mock_hardware))),
+            # RViz (mock): included DIRECTLY, not via a TimerAction — the timer's
+            # deferred include never fired in this launch (no error, just no
+            # RViz), while the standalone moveit_rviz path works, so mirror it.
+            # RViz starts immediately and waits on move_group/topics on its own.
+            _rviz(fake=True,
+                  condition=IfCondition(AndSubstitution(
+                      LaunchConfiguration("rviz_enabled"), use_mock_hardware))),
             # Real mode
             ur_rsp_real,
             rtde_joint_pub,
@@ -190,6 +208,7 @@ def generate_launch_description():
             # 15 s gives move_group time to receive /joint_states and publish
             # a populated planning scene so the goal marker starts at the real pose.
             TimerAction(period=15.0, actions=[_rviz(fake=False)],
-                        condition=IfCondition(AndSubstitution(launch_rviz, NotSubstitution(use_mock_hardware)))),
+                        condition=IfCondition(AndSubstitution(
+                            LaunchConfiguration("rviz_enabled"), NotSubstitution(use_mock_hardware)))),
         ]
     )

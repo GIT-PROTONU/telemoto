@@ -42,7 +42,8 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   hold stands DOWN (the user owns the orientation; re-locks at the new pose on
   stop) and the line hold degenerates to a POSITION hold (TCP pivots in place even
   if the pendant TCP ≠ tool0). Speed via the `jrspeed` slider / `jog_rot_speed`
-  param (default 0.5 rad/s ≈ 29°/s, max 1.0 = servo.yaml rotational cap). Axis
+  param (default = the slider max 1.0 rad/s ≈ 57°/s since 2026-06-16, user
+  request; was 0.5; max 1.0 = servo.yaml rotational cap). Axis
   signs VERIFIED on the real robot 2026-06-12 (the "rotation is very slow"
   report was the old 0.50 m wall-distance DEFAULT pinning Servo at ×0.25 for
   the whole session — now defaults to 0.10 m). E2E:
@@ -75,13 +76,25 @@ PolyScope 3.x holds ALL RTDE **input** registers, so `ur_robot_driver` always fa
   VP8) as a WebRTC video track — RTP/UDP, `MediaRelay(buffered=False)` +
   zero receiver jitter-buffer hints, so a slow link drops frames instead of
   lagging. Camera opens on the FIRST viewer; released only after
-  `CAM_IDLE_CLOSE` (5 s) with no viewers — NEVER instantly: a quick off→on
-  toggle must reuse the open device (v4l2 close is async; instant reopen hit
-  EBUSY = the 2026-06-12 black-screen report; open also retries on EBUSY).
-  Client guards every late ontrack/state event on the CURRENT pc and shows
-  the overlay only at `loadeddata` (first decoded frame — a cold camera is
-  seconds behind ontrack). Cam button hidden when the device is absent. RTC E2E
-  (incl. live webcam phase):
+  `CAM_IDLE_CLOSE` (**30 s**, raised from 5 s on 2026-06-16) with no viewers —
+  NEVER instantly: an off→on toggle must reuse the open device (v4l2 close is
+  async; instant reopen hit EBUSY = the 2026-06-12 black-screen report; open
+  also retries on EBUSY). ⚠ The grace must comfortably EXCEED the cold
+  first-frame time: at 5 s the idle-close `video.stop()` (native v4l2 teardown)
+  fired DURING a reconnect that hadn't shown frames yet (cold open ~7.5 s here,
+  ICE-dominated) and the concurrent close+reopen **segfaulted PyAV/ffmpeg** —
+  the single pending idle timer (`_cam_idle_task`) is now CANCELLED the moment a
+  viewer re-subscribes (`_cam_track`), so the native stop runs only when truly
+  idle (both fixes 2026-06-16). **Black-screen recovery** (2026-06-16): if the
+  v4l2 source hiccups its track ends (`readyState=="ended"`); `_cam_track`
+  recycles the dead player on the next subscribe, and the client runs a
+  frame-stall watchdog (currentTime frozen ≥4 s while shown) + auto-reconnects
+  on PC failure (keeping `camWant` intent) instead of a permanent black / slow
+  manual re-tap. Client guards every late ontrack/state event on the CURRENT pc
+  and reveals the overlay on the track's `unmute` (NOT `loadeddata` — Chrome
+  won't decode a `display:none` element, which deadlocked the reveal). Cam
+  button hidden when the device is absent. RTC E2E (incl. live webcam phase +
+  quick re-toggle reuse + idle release):
   `pixi run python src/telamoto_bringup/test/test_rtc_jog_e2e.py`.
   And an **embedded 3D twin** (three.js
   + urdf-loader vendored in `web/static/`). **The fullscreen mobile layout is

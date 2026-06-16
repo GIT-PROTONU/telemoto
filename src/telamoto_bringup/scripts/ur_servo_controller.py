@@ -116,11 +116,15 @@ RTC_MAX_PCS  = 16           # refuse offers beyond this many live peer connectio
 CAM_DEVICE   = "/dev/video0"   # webcam for the live video track ("" disables)
 CAM_SIZE     = "640x480"       # capture size — 480p30 keeps the VP8 encode cheap
 CAM_FPS      = 30              # on this host and the WAN bitrate well under 1 Mb/s
-CAM_IDLE_CLOSE = 5.0           # s with no viewers before the device is released:
-                               # a quick off→on toggle must REUSE the open camera
-                               # (closing v4l2 is async — instant reopen hits
-                               # EBUSY = black screen) and gets its first frame
-                               # instantly instead of paying the USB open again
+CAM_IDLE_CLOSE = 30.0          # s with no viewers before the device is released:
+                               # an off→on toggle REUSES the open camera (closing
+                               # v4l2 is async — instant reopen hits EBUSY = black
+                               # screen) and gets its first frame instantly instead
+                               # of paying the multi-second USB cold open again.
+                               # Generous (was 5 s) so the grace comfortably
+                               # exceeds the cold first-frame time — a shorter
+                               # grace let the idle-close fire DURING a reconnect
+                               # (the pending timer is now cancelled on reuse too).
 MULT         = 1_000_000
 MODE_SERVOJ  = 1            # position control (planned moves, hold)
 MODE_SPEEDJ  = 2            # joint-velocity control (the idle self-hold: exact zeros)
@@ -303,10 +307,11 @@ JOG_ACCEL_MIN,  JOG_ACCEL_MAX  = 0.3,  20.0   # m/s^2 Cartesian ramp (web slider
 # re-locks at the new pose when the rotation stops; the straight-line hold
 # degenerates to a POSITION hold (start point, no direction) so a pure rotation
 # pivots about tool0 even if the pendant TCP is set elsewhere.
-JOG_ROT_SPEED_DEF = 0.5     # rad/s at full axis (~29°/s). Was 0.25 while the
-                            # axis signs were unverified on the robot; verified
-                            # 2026-06-12, raised — the slider still caps at 1.0.
 JOG_ROT_SPEED_MIN, JOG_ROT_SPEED_MAX = 0.01, 1.0  # ≤ ur_servo.yaml rotational cap
+JOG_ROT_SPEED_DEF = JOG_ROT_SPEED_MAX  # default to the slider max (~57°/s). Was
+                            # 0.25 (unverified axis signs), then 0.5; signs
+                            # verified on the robot 2026-06-12, user wants full
+                            # speed by default 2026-06-16. Servo still caps it.
 JOG_ROT_RAMP = 2.0          # rad/s² of rotational ramp per m/s² of jog_accel —
                             # one accel knob drives both ramps
 QD_ALLOW_ROT_SLOPE = 2.0    # rad/s of amplification-guard allowance per rad/s of
@@ -857,13 +862,22 @@ _WEB_PAGE = """<!doctype html>
  // never renegotiated; video over RTP/UDP = the lowest-latency feed a browser
  // can play). Zero playout/jitter buffering — the server already drops frames
  // a slow link can't carry (relay buffered=false), so buffering only adds lag.
- let camPc=null;
- function camStop(){const pc=camPc;camPc=null;
-   if(pc){try{pc.close();}catch(e){}}
+ let camPc=null, camWant=false, camWatch=null;   // camWant = user wants it ON
+ // Teardown WITHOUT changing intent: close the PC + stop the stall watchdog.
+ function camDrop(){const pc=camPc;camPc=null;
+   if(camWatch){clearInterval(camWatch);camWatch=null;}
+   if(pc){try{pc.close();}catch(e){}}}
+ function camStop(){camWant=false;camDrop();
    const v=document.getElementById("camv");
    v.srcObject=null;v.style.display="none";
    document.getElementById("fscam").classList.remove("on");}
+ // Auto-recover a stalled/failed feed WITHOUT turning the cam off: drop the
+ // dead PC and open a fresh one. The server recycles a dead v4l2 player on the
+ // new offer, so a black screen (USB hiccup / source track ended) self-heals
+ // instead of needing a slow manual off→on re-tap.
+ function camReconnect(){if(!camWant)return;camDrop();camStart();}
  async function camStart(){
+   camWant=true;
    const pc=camPc=rtcPc();
    document.getElementById("fscam").classList.add("on");   // instant feedback;
    const tr=pc.addTransceiver("video",{direction:"recvonly"});  // camStop clears
@@ -882,15 +896,30 @@ _WEB_PAGE = """<!doctype html>
      const show=()=>{if(camPc===pc&&v.style.display!=="block"){
        v.style.display="block";v.play().catch(()=>{});}};
      e.track.onunmute=show;
-     setTimeout(show,1500);};
+     setTimeout(show,1500);
+     // Frame-stall watchdog: once the feed is on screen and playing, its
+     // currentTime must keep advancing. If it freezes for STALL_S while the
+     // cam is still wanted, the server-side track died (the black-screen
+     // report) — reconnect a fresh PC (the server reopens the v4l2 device).
+     // Skipped during warm-up (not yet shown / still buffering) so a slow
+     // first frame doesn't trip it.
+     if(camWatch)clearInterval(camWatch);
+     let last=-1, stale=0; const STALL_S=4;
+     camWatch=setInterval(()=>{
+       if(camPc!==pc||!camWant)return;
+       if(v.style.display!=="block"||v.paused)return;       // still warming up
+       if(v.currentTime===last){if(++stale>=STALL_S)camReconnect();}
+       else{stale=0;last=v.currentTime;}},1000);};
+   // PC-level failure: auto-reconnect rather than silently dropping the cam.
    pc.onconnectionstatechange=()=>{
-     if((pc.connectionState==="failed"||pc.connectionState==="closed")&&camPc===pc)camStop();};
+     if((pc.connectionState==="failed"||pc.connectionState==="closed")&&camPc===pc)
+       camReconnect();};
    try{await rtcSignal(pc);}
-   catch(e){if(camPc===pc)camStop();return;}    // fail of THIS attempt only
+   catch(e){if(camPc===pc){if(camWant)setTimeout(camReconnect,2000);else camDrop();}return;}
    if(camPc!==pc){try{pc.close();}catch(e){}}   // toggled off mid-signaling
    }
  document.getElementById("fscam").addEventListener("click",
-   ()=>{camPc?camStop():camStart();});
+   ()=>{camWant?camStop():camStart();});
  document.getElementById("camv").addEventListener("click",   // tap: small ↔ large
    e=>e.target.classList.toggle("big"));
  // Minimal CBOR (RFC 8949): encode [lx,ly,lz] as an array of small signed ints.
@@ -1390,6 +1419,7 @@ class URServoController(Node):
         # LAST one disconnects — no capture/encode CPU while nobody watches.
         self._cam_player = None
         self._cam_pcs = set()
+        self._cam_idle_task = None    # pending idle-close timer (cancelled on reuse)
         if RTCPeerConnection is not None:
             self._cam_relay = MediaRelay()
             self._rtc_loop = asyncio.new_event_loop()
@@ -1869,6 +1899,26 @@ class URServoController(Node):
         so a reopen right after the idle-close can hit EBUSY for a moment."""
         if not self._cam_device:
             return None
+        # A viewer is (re)subscribing: cancel any pending idle-close so its
+        # native v4l2 teardown can NEVER race this reuse. The 5 s grace once
+        # fired its stop() mid-reconnect (cold first-frame > grace) and the
+        # concurrent close+reopen segfaulted PyAV/ffmpeg.
+        if self._cam_idle_task is not None:
+            self._cam_idle_task.cancel()
+            self._cam_idle_task = None
+        # Recycle a DEAD player: if the v4l2 source hiccupped (USB glitch / read
+        # error) its track ends, and a fresh subscribe here would hand the new
+        # viewer a dead (black) track that never recovers while a viewer stays
+        # connected. Drop the corpse so the open below makes a new one — the
+        # client's frame-stall watchdog reconnects straight into this path.
+        if self._cam_player is not None and \
+                self._cam_player.video.readyState == "ended":
+            self.get_logger().warn("[web] webcam source had ended; reopening")
+            try:
+                self._cam_player.video.stop()
+            except Exception:
+                pass
+            self._cam_player = None
         if self._cam_player is None:
             for attempt in range(4):
                 try:
@@ -1892,20 +1942,28 @@ class URServoController(Node):
         """Called when a peer closes: release the camera once NOBODY has
         watched for CAM_IDLE_CLOSE — never instantly, so an off→on toggle
         keeps the open device (the instant-stop version raced its own v4l2
-        close on reopen = black screen). Piled-up idle tasks are harmless:
-        whichever fires first stops, the rest see player None / new viewers."""
+        close on reopen = black screen). The single pending timer is CANCELLED
+        the moment a new viewer subscribes (_cam_track), so the native stop()
+        only ever runs when the camera is genuinely idle — no teardown can
+        overlap a reconnect."""
         self._cam_pcs.discard(pc)
         if self._cam_pcs or self._cam_player is None:
             return
+        if self._cam_idle_task is not None:      # one timer in flight is enough
+            return
 
         async def stop_if_idle():
-            await asyncio.sleep(CAM_IDLE_CLOSE)
+            try:
+                await asyncio.sleep(CAM_IDLE_CLOSE)
+            except asyncio.CancelledError:       # a viewer came back — keep it open
+                return
             if not self._cam_pcs and self._cam_player is not None:
                 self._cam_player.video.stop()
                 self._cam_player = None
                 self.get_logger().info("[web] webcam closed (no viewers)")
+            self._cam_idle_task = None
 
-        asyncio.ensure_future(stop_if_idle())
+        self._cam_idle_task = asyncio.ensure_future(stop_if_idle())
 
     def _web_loop(self) -> None:
         node = self

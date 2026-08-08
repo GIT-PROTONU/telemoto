@@ -45,8 +45,7 @@ ros-jazzy-rviz2              = "*"
 colcon-common-extensions     = "*"
 colcon-mixin                 = "*"
 aiortc                       = "*"   # WebRTC datachannel = the browser's only UDP
-                                     # (jog stream over the public internet; WS is
-                                     # the fallback transport)
+fsspec                       = ">=2023.1.0,<=2026.2.0"   # cap for lerobot[dataset] (hits conda 2026.7.0)
 
 # ---------------------------------------------------------------------------
 # Build tools
@@ -61,6 +60,25 @@ pkg-config   = "*"
 # ---------------------------------------------------------------------------
 pre-commit   = "*"
 clang-format = "*"
+
+# ---------------------------------------------------------------------------
+# LeRobot ML environment (isolated so its PyPI deps never disturb the ROS solve)
+# Runs on: pixi run --environment leerobot <task>   (see [tasks.leerobot-*])
+# ---------------------------------------------------------------------------
+[feature.lerobot.dependencies]
+lerobot                      = "*"   # imitation learning (record/collect, train ACT/Diffusion, deploy)
+
+[feature.lerobot.pypi-dependencies]
+datasets                     = ">=4.7.0,<5.0.0"   # lerobot[dataset] (HF datasets)
+fsspec                       = ">=2023.1.0,<=2026.2.0"   # datasets pin clash with conda 2026.7.0
+torchcodec                   = "*"                  # lerobot[dataset] video encoding
+accelerate                   = "*"                  # lerobot[training]
+
+[workspace.conda-pypi-map]
+conda-forge = { mapping = { compilers = false, "gcc_linux-64" = false, "gxx_linux-64" = false, "pkg-config" = "pkgconfig" }, same-name-heuristic = false }
+
+[environments]
+lerobot = ["lerobot"]
 
 # ---------------------------------------------------------------------------
 # Tasks
@@ -96,3 +114,12 @@ tune = "xdg-open http://localhost:8080"
 
 # List available ROS2 nodes
 nodes = "ros2 node list"
+
+# LeRobot teach node — records teleop demos as a LeRobotDataset (needs the
+# `lerobot` env: lerobot + the full ROS2 stack). Usage:
+#   pixi run record --ros-args -p dataset_root:=~/.ros/teleocorpus -p task:=grab
+#   ros2 service call /lerobot_record/start std_srvs/srv/Trigger   # start ep
+#   ros2 service call /lerobot_record/stop  std_srvs/srv/Trigger   # stop + save
+record = "pixi run --environment lerobot python src/telamoto_bringup/scripts/lerobot_record.py"
+train = "pixi run --environment lerobot python -m lerobot.scripts.train --dataset.repo_id=telamoto/teleocorpus"
+eval = "pixi run --environment lerobot python -m lerobot.scripts.eval --dataset.repo_id=telamoto/teleocorpus"

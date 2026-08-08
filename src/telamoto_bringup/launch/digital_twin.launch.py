@@ -63,12 +63,28 @@ def generate_launch_description():
             "launch_rviz", default_value="true",
             description="false = headless (jog-tuning via the web UI only)",
         ),
+        DeclareLaunchArgument(
+            "use_lerobot", default_value="true",
+            description="launch the LeRobot teach node (lerobot_record.py, "
+                        "runs in the isolated `lerobot` pixi env)",
+        ),
+        DeclareLaunchArgument(
+            "lerobot_root", default_value="~/.lerobot/teleocorpus",
+            description="abs path to the LeRobotDataset corpus dir",
+        ),
+        DeclareLaunchArgument(
+            "lerobot_task", default_value="teleop",
+            description="per-frame `task` string stamped into recorded episodes",
+        ),
     ]
 
     robot_ip           = LaunchConfiguration("robot_ip")
     use_mock_hardware  = LaunchConfiguration("use_mock_hardware")
     initial_joint_ctrl = LaunchConfiguration("initial_joint_controller")
     launch_rviz        = LaunchConfiguration("launch_rviz")
+    use_lerobot        = LaunchConfiguration("use_lerobot")
+    lerobot_root       = LaunchConfiguration("lerobot_root")
+    lerobot_task       = LaunchConfiguration("lerobot_task")
 
     # ═══════════════════════════════════════════════════════════════════════
     # FAKE MODE
@@ -163,6 +179,21 @@ def generate_launch_description():
         output="screen",
     )
 
+    # LeRobot teach node: records teleop demos (see CLAUDE.md §LeRobot teaching).
+    # It imports lerobot lazily at the first `start`, so it needs the isolated
+    # `lerobot` pixi env python — reach it via a pixi prefix instead of a bare
+    # ros2 executable (the default env has no lerobot). Optional: default on
+    # in both modes so the web UI teaches the mock or the real robot.
+    lerobot_record = Node(
+        package="telamoto_bringup",
+        executable="lerobot_record.py",
+        name="lerobot_record",
+        output="screen",
+        prefix="pixi run --environment lerobot python",
+        parameters=[{"dataset_root": lerobot_root, "task": lerobot_task}],
+        condition=IfCondition(use_lerobot),
+    )
+
     # ═══════════════════════════════════════════════════════════════════════
     # RVIZ2 — separate instances per condition (reusing one object breaks launch)
     # ═══════════════════════════════════════════════════════════════════════
@@ -204,6 +235,7 @@ def generate_launch_description():
             ur_rsp_real,
             rtde_joint_pub,
             servo_controller,   # opens port 50001, plays ext.urp, replays on disconnect
+            lerobot_record,
             TimerAction(period=3.0,  actions=[ur_moveit_real],     condition=UnlessCondition(use_mock_hardware)),
             # 15 s gives move_group time to receive /joint_states and publish
             # a populated planning scene so the goal marker starts at the real pose.

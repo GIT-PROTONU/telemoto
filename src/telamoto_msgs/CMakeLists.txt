@@ -9,7 +9,9 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotStatus.msg"
+  "msg/JogAxes.msg"
   "srv/MoveToNamedPose.srv"
+  "srv/SetAutonomous.srv"
   DEPENDENCIES builtin_interfaces std_msgs geometry_msgs
 )
 

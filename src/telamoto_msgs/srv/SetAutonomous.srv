@@ -1,0 +1,4 @@
+bool enable       # enable/disable autonomous policy command intake
+---
+bool ok
+string message

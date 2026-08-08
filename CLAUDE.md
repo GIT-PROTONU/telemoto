@@ -313,6 +313,43 @@ pixi run tune             # open the :8080 web tuning UI
 pixi run shell            # sourced bash shell inside the pixi env
 ```
 
+## LeRobot teaching (record → train → deploy)
+`pixi.toml` isolates LeRobot in a **`lerobot` pixi env** (feature `lerobot` +
+`conda-pypi-map` so the ROS build env never inherits its PyPI-only deps; conda
+`fsspec` is capped for `datasets`). Run ML commands with
+`pixi run --environment lerobot ...` (or the `record`/`train`/`eval` tasks).
+
+**Record** — `src/telamoto_bringup/scripts/lerobot_record.py` (~/joint_states
+125 Hz from `ur_rtde_joint_pub.py`). Start/stop episodes via ROS services:
+```bash
+pixi run record --ros-args -p dataset_root:=~/.ros/teleocorpus -p task:=grab
+ros2 service call /lerobot_record/start std_srvs/srv/Trigger   # begin ep
+ros2 service call /lerobot_record/stop  std_srvs/srv/Trigger   # end + save
+```
+Per frame: `observation.state = action = measured joint_pos` (the jog is
+speedl — there is no joint-position target on the wire; policies learn the
+teleop trajectory and replay positions via `servoj` planned moves). Frames
+decimated to `fps` (default 30). The corpus root is created on first start and
+appended (`LeRobotDataset.resume`) on later runs. ⚠ The writer is
+single-buffer: after `stop`, `self._ds` is dropped so the next `start` opens a
+fresh resumed writer — never reuse a finalized `LeRobotDataset` for writes.
+E2E: `pixi run --environment lerobot python src/telamoto_bringup/test/test_lerobot_record_e2e.py`
+(domain 82; evolves the corpus, reopens it, checks action==state and episode
+append; phase E also boots the REAL controller and drives the web /api/record
+button).
+
+`digital_twin.launch.py` launches the record node by default in both modes
+(`use_lerobot:=false` disables) with `lerobot_root` / `lerobot_task` args. The
+node must run in the `lerobot` pixi env, so the launch Node uses
+`prefix="pixi run --environment lerobot python"` (a single `prefix` string —
+launch concatenates a list WITHOUT spaces). Publish status at 2 Hz on
+`/lerobot_record/status` feeds the web UI's record button (`ur_servo_controller`
+proxies start/stop via Trigger clients; `/api/state` reports recAvail /
+recording / recFrames / recEps).
+
+Train/eval tasks reference `telamoto/teleocorpus` on the HF hub; push datasets
+with `lerobot push-to-hub` first when using the real hub.
+
 ## Workspace layout
 ```
 telamoto/

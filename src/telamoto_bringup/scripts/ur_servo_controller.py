@@ -86,6 +86,7 @@ from rcl_interfaces.msg import (
     FloatingPointRange, IntegerRange, ParameterDescriptor, SetParametersResult,
 )
 from rcl_interfaces.srv import SetParameters
+from std_srvs.srv import Trigger
 from rclpy.parameter import Parameter as RclpyParameter
 
 try:
@@ -512,10 +513,11 @@ _WEB_PAGE = """<!doctype html>
   padding:calc(.55rem + env(safe-area-inset-top)) .65rem .55rem;
   background:#0e131adb;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
   border-bottom:1px solid #ffffff14}
- #fsbar button{flex:1 1 0;max-width:6.5rem;margin:0;padding:.55rem 0;text-align:center;
-  background:#1c2733;border:1px solid #38506a;color:#cfe3ff;
-  border-radius:.55rem;font-size:.85rem;white-space:nowrap}
- #fsbar button.on{background:#2d5a8e;border-color:#4ea1ff}
+#fsbar button{flex:1 1 0;max-width:6.5rem;margin:0;padding:.55rem 0;text-align:center;
+   background:#1c2733;border:1px solid #38506a;color:#cfe3ff;
+   border-radius:.55rem;font-size:.85rem;white-space:nowrap}
+  #fsbar button.on{background:#2d5a8e;border-color:#4ea1ff}
+  #fsbar #fsrec.on{background:#72303a;border-color:#ff6b6b;color:#ffd7d7}
  #fsstat{flex:0 0 auto;font-size:.8rem;white-space:nowrap;background:none!important;
   padding:0 .2rem 0 0}
  #fsstat.ok{color:#6ee787}#fsstat.bad{color:#ff7b72}
@@ -568,12 +570,13 @@ _WEB_PAGE = """<!doctype html>
  <input type="checkbox" id="rotf" style="display:none">
  <input type="checkbox" id="jogon" style="display:none">
  <div id="view3d"></div>
- <div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
-   <button id="fswalls">walls</button>
-   <button id="fscam">cam</button>
-   <button id="fsframe">tool</button>
-   <button id="fstune">&#9881;</button>
-   <div id="fsCollAlert"></div></div>
+<div id="fsbar"><span id="fsstat" class="bad">&#9679;</span><span id="fsping">&mdash;</span>
+  <button id="fswalls">walls</button>
+  <button id="fscam">cam</button>
+  <button id="fsframe">tool</button>
+  <button id="fsrec" style="display:none">&#9632; record</button>
+  <button id="fstune">&#9881;</button>
+  <div id="fsCollAlert"></div></div>
  <video id="camv" autoplay muted playsinline></video>
  <div id="pads" class="off">
    <div id="padgrid">
@@ -661,6 +664,12 @@ _WEB_PAGE = """<!doctype html>
    fst.textContent=s.connected?"\\u25CF":"\\u25CF press Play";
    fst.className=s.connected?"ok":"bad";
    document.getElementById("fscam").style.display=s.cam?"":"none";
+    // LeRobot teach status (button hidden while the record node is down).
+    if(s.recAvail){
+      document.getElementById("fsrec").style.display="";
+      setRecOn(!!s.recording, s.recFrames);
+    } else {
+      document.getElementById("fsrec").style.display="none";}
    document.getElementById("pendant").textContent="pendant speed slider: "
      +(s.speedfrac==null?"\\u2014":Math.round(s.speedfrac*100)+"%");
    const qd=document.getElementById("qd");
@@ -1028,6 +1037,19 @@ _WEB_PAGE = """<!doctype html>
    document.getElementById("fswalls").classList.toggle("on",on);
    if(twin&&twin.walls)twin.walls(on);}   // guard: a cache-stale twin has no walls()
  document.getElementById("fswalls").addEventListener("click",()=>setWalls(!wallsOn));
+  // LeRobot teach: single toggle button. Hidden until the record node reports
+  // (recAvail); shows a live frame count while recording. The click is fully
+  // server-authoritative (POST /api/record) — the local class is just feedback.
+  let recOn=false;
+  function setRecOn(on, frames){
+    recOn=on;
+    const b=document.getElementById("fsrec");
+    b.textContent=(on?"stop ":"\\u25CF  record")+(on?(" "+frames):"");
+    b.classList.toggle("on",on);
+    b.disabled=false;}
+  document.getElementById("fsrec").addEventListener("click",()=>{
+    const b=document.getElementById("fsrec");b.disabled=true;   // double-tap guard
+    fetch("/api/record?on="+(recOn?0:1),{method:"POST"});});
  const fsProxy=(btn,box)=>document.getElementById(btn).addEventListener("click",()=>{
    const c=document.getElementById(box);c.checked=!c.checked;
    c.dispatchEvent(new Event("change"));});
@@ -1436,6 +1458,22 @@ class URServoController(Node):
                 "[web] aiortc not installed — jog runs WS-only (TCP)")
         self.create_subscription(ServoStatus, SERVO_STATUS_TOPIC, self._servo_status_cb, 10)
         self._servo_cli = self.create_client(ServoCommandType, SERVO_TYPE_SRV)
+        # LeRobot teach: the /api/record button proxies to the (optional)
+        # lerobot_record node via its Trigger services. Status is a small JSON
+        # blob on /lerobot_record/status (2 Hz) so the web UI can show a live
+        # frame/episode readout; recAvail reflects the service being up.
+        self._rec_start_cli = self.create_client(Trigger, "/lerobot_record/start")
+        self._rec_stop_cli = self.create_client(Trigger, "/lerobot_record/stop")
+        self._rec_status = {"recording": False, "frames": 0, "episodes": 0}
+        self._rec_avail = False
+        self._rec_busy = False          # start/stop request in flight
+        self._rec_pending = None        # str "start"/"stop" coalesced by timer
+        self._rec_pub_t = time.monotonic()
+        self._rec_sub = self.create_subscription(
+            String, "/lerobot_record/status", self._rec_status_cb, 10)
+        # coalescer: "api/start" sets _rec_pending; a single 0.25 s timer drains
+        # it into ONE call_async, mirroring _push_collision_params.
+        self.create_timer(0.25, self._rec_drain)
         ActionServer(
             self, FollowJointTrajectory,
             "joint_trajectory_controller/follow_joint_trajectory",
@@ -1498,6 +1536,60 @@ class URServoController(Node):
         self.get_logger().info(
             f"[jog] collision distances → self {self._self_coll:.2f} m, "
             f"scene {self._scene_coll:.2f} m (pushed to servo)")
+
+    # ── LeRobot teach status (mirrors lerobot_record, optional node) ───────────
+
+    def _rec_status_cb(self, msg: String) -> None:
+        try:
+            st = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if isinstance(st, dict) and "recording" in st:
+            self._rec_status = st
+            self._rec_avail = True
+
+    def _rec_drain(self) -> None:
+        """Drain one pending start/stop request through the record node's
+        Trigger service. Busy-flag keeps a single call in flight; the page's
+        state poll just shows recAvail/recording, so a dropped request (record
+        node down) simply leaves the button state unchanged."""
+        which = self._rec_pending
+        if which is None:
+            self._rec_avail = (self._rec_start_cli.service_is_ready()
+                               or self._rec_stop_cli.service_is_ready())
+            return
+        cli = self._rec_stop_cli if which == "stop" else self._rec_start_cli
+        if self._rec_busy or not cli.service_is_ready():
+            return        # backpressure: retry next tick / wait for record node
+        self._rec_pending = None            # committed; drain takes it
+        self._rec_busy = True
+
+        def done(fut):
+            try:
+                resp = fut.result()
+                self._rec_avail = True
+                if resp is not None:
+                    self._rec_status = {
+                        "recording": which == "start" and resp.success,
+                        "frames": self._rec_status.get("frames", 0),
+                        "episodes": self._rec_status.get("episodes", 0),
+                    }
+            except Exception:
+                self._rec_avail = False
+            finally:
+                self._rec_busy = False
+        cli.call_async(Trigger.Request()).add_done_callback(done)
+
+    def _web_record(self, q: dict) -> None:
+        """POST /api/record?on=<0|1> — but not while recording; always via the
+        single timer thread (never from the web socket directly)."""
+        on = q.get("on", ["0"])[0]
+        if on not in ("0", "1"):
+            return
+        want = "start" if on == "1" else "stop"
+        if self._rec_pending == want:
+            return                      # same toggle repeated — ignore
+        self._rec_pending = want
 
     def _apply_jog(self, lx: float, ly: float, lz: float,
                    ax: float = 0.0, ay: float = 0.0, az: float = 0.0) -> None:
@@ -2101,7 +2193,11 @@ class URServoController(Node):
                         "collWall": node._coll_near_wall,
                         "collAxis": node._dominant_axis(node._coll_block_dir),
                         "singAxis": node._dominant_axis(node._sing_block_dir),
-                        "nearWall": near_wall}).encode(),
+                        "nearWall": near_wall,
+                        "recAvail": node._rec_avail,
+                        "recording": bool(node._rec_status.get("recording")),
+                        "recFrames": int(node._rec_status.get("frames", 0)),
+                        "recEps": int(node._rec_status.get("episodes", 0))}).encode(),
                         "application/json")
                 else:
                     self._send(_WEB_PAGE.replace(
@@ -2135,6 +2231,8 @@ class URServoController(Node):
                         node._web_jogmode(q)
                     elif self.path.startswith("/api/jogframe"):
                         node._web_jogframe(q)
+                    elif self.path.startswith("/api/record"):
+                        node._web_record(q)
                 except (ValueError, KeyError):
                     pass
                 self._send(b"ok")

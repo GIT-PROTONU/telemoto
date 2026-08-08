@@ -12,6 +12,7 @@ install(PROGRAMS
   scripts/ur_dashboard_autoplay.py
   scripts/ur_servo_controller.py
   scripts/scene_wall.py
+  scripts/lerobot_record.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
